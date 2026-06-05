@@ -31,13 +31,8 @@ class TestDatabaseInit:
         assert parse_db_url("sqlite://./pulse_mq.db") == "./pulse_mq.db"
         assert parse_db_url("./pulse_mq.db") == "./pulse_mq.db"
 
-    def test_default_admin_exists(self, user_repo):
-        admin = user_repo.get_by_api_key_sync("pulse_sk_admin_default") if hasattr(user_repo, 'get_by_api_key_sync') else None
-        # 直接查数据库
-        import asyncio
-        admin = asyncio.get_event_loop().run_until_complete(
-            user_repo.get_by_api_key("pulse_sk_admin_default")
-        )
+    async def test_default_admin_exists(self, user_repo):
+        admin = await user_repo.get_by_api_key("pulse_sk_admin_default")
         assert admin is not None
         assert admin.role == "admin"
         assert admin.username == "admin"

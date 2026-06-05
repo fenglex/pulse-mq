@@ -1,7 +1,7 @@
 """纯内存消息路由器。
 
 包含四个子组件:
-- TopicRegistry: 精确 topic 注册（Phase 1 不含通配符展开）
+- TopicRegistry: 精确 topic 注册 + 通配符订阅展开
 - SubscriptionManager: 订阅关系双向索引
 - ConnectionManager: identity ↔ user 映射
 - MessageBuffer: 每个 topic 的环形缓冲区
@@ -13,6 +13,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from pulsemq.auth.permission import topic_match
+
 from pulsemq.models import AuthUser, BufferedMessage, TopicInfo
 
 
@@ -22,6 +24,11 @@ class MessageRouter:
 
     # Topic 注册表
     _topics: dict[str, TopicInfo] = field(default_factory=dict)
+
+    # 通配符订阅列表（pattern → set of identity）
+    _wildcard_subscriptions: dict[str, set[bytes]] = field(default_factory=dict)
+    # identity → set of wildcard patterns
+    _identity_wildcards: dict[bytes, set[str]] = field(default_factory=dict)
 
     # 订阅关系双向索引
     _topic_subscribers: dict[str, set[bytes]] = field(default_factory=dict)
@@ -73,7 +80,37 @@ class MessageRouter:
             info.subscriber_count = len(self._topic_subscribers[topic])
 
     def unsubscribe(self, identity: bytes, topic: str) -> None:
-        """取消订阅。"""
+        """取消订阅（精确或通配符）。"""
+        # 尝试精确取消
+        subs = self._topic_subscriptions_remove(identity, topic)
+        # 尝试通配符取消
+        self._wildcard_unsubscribe(identity, topic)
+
+    def subscribe_wildcard(self, identity: bytes, pattern: str) -> list[str]:
+        """通配符订阅：匹配已有精确 topic 并展开。
+
+        Returns:
+            展开后匹配到的精确 topic 列表。
+        """
+        # 注册通配符
+        if pattern not in self._wildcard_subscriptions:
+            self._wildcard_subscriptions[pattern] = set()
+        self._wildcard_subscriptions[pattern].add(identity)
+
+        if identity not in self._identity_wildcards:
+            self._identity_wildcards[identity] = set()
+        self._identity_wildcards[identity].add(pattern)
+
+        # 展开匹配已有精确 topic
+        matched = []
+        for name, info in self._topics.items():
+            if not info.is_wildcard and topic_match(pattern, name):
+                self.subscribe(identity, name)
+                matched.append(name)
+        return matched
+
+    def _topic_subscriptions_remove(self, identity: bytes, topic: str) -> None:
+        """精确订阅移除。"""
         subs = self._topic_subscribers.get(topic)
         if subs is not None:
             subs.discard(identity)
@@ -85,21 +122,50 @@ class MessageRouter:
         if id_subs is not None:
             id_subs.discard(topic)
 
+    def _wildcard_unsubscribe(self, identity: bytes, pattern: str) -> None:
+        """通配符订阅移除。"""
+        wc_subs = self._wildcard_subscriptions.get(pattern)
+        if wc_subs is not None:
+            wc_subs.discard(identity)
+            if not wc_subs:
+                del self._wildcard_subscriptions[pattern]
+
+        id_wc = self._identity_wildcards.get(identity)
+        if id_wc is not None:
+            id_wc.discard(pattern)
+
     def get_subscribers(self, topic: str) -> set[bytes]:
-        """获取 topic 的所有订阅者。"""
-        return self._topic_subscribers.get(topic, set())
+        """获取 topic 的所有订阅者（含通配符匹配）。"""
+        result = set(self._topic_subscribers.get(topic, set()))
+        # 检查通配符订阅
+        for pattern, identities in self._wildcard_subscriptions.items():
+            if topic_match(pattern, topic):
+                result.update(identities)
+        return result
 
     def get_subscriptions(self, identity: bytes) -> set[str]:
-        """获取 identity 的所有订阅。"""
-        return self._identity_subscriptions.get(identity, set())
+        """获取 identity 的所有订阅（精确 + 通配符）。"""
+        result = set(self._identity_subscriptions.get(identity, set()))
+        result.update(self._identity_wildcards.get(identity, set()))
+        return result
 
     def remove_identity(self, identity: bytes) -> None:
-        """移除 identity 的所有订阅关系。"""
+        """移除 identity 的所有订阅关系（精确 + 通配符）。"""
+        # 清理精确订阅
         id_subs = self._identity_subscriptions.pop(identity, set())
         for topic in id_subs:
             subs = self._topic_subscribers.get(topic)
             if subs is not None:
                 subs.discard(identity)
+
+        # 清理通配符订阅
+        id_wc = self._identity_wildcards.pop(identity, set())
+        for pattern in id_wc:
+            wc_subs = self._wildcard_subscriptions.get(pattern)
+            if wc_subs is not None:
+                wc_subs.discard(identity)
+                if not wc_subs:
+                    del self._wildcard_subscriptions[pattern]
 
     # ---- 连接管理 ----
 
