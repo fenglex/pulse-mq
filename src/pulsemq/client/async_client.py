@@ -139,7 +139,6 @@ class PulseClient:
 
         # SUB socket 用于接收广播
         self._sub = self._ctx.socket(zmq.SUB)
-        self._xpub_address = self._address.replace("5555", "5556")
         self._sub.connect(self._xpub_address)
 
         self._connected = True
@@ -225,6 +224,9 @@ class PulseClient:
         if self._sub is None:
             raise ConnectionError("未连接")
 
+        # 先注册 ZMQ SUB 订阅（必须在 SUB 请求之前，否则会错过广播）
+        self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+
         # 发送 SUB 请求
         sub_frames = FrameCodec.encode(MsgType.SUB, topic, 0, b"")
         await self._dealer.send_multipart(sub_frames)
@@ -234,12 +236,8 @@ class PulseClient:
             reply = await asyncio.wait_for(
                 self._dealer.recv_multipart(), timeout=self._recv_timeout
             )
-            # reply 是 4 帧: [topic, meta, record_count, payload]
         except asyncio.TimeoutError:
             pass  # 超时不阻塞
-
-        # 注册 ZMQ SUB 订阅
-        self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
 
         # 消息循环
         while self._connected:

@@ -7,6 +7,9 @@ import logging
 import signal
 import sys
 
+import msgpack
+import zmq
+
 from pulsemq.auth.memory_store import AuthMemoryStore
 from pulsemq.auth.permission import PermissionService
 from pulsemq.auth.zap_handler import PulseMQZAPHandler
@@ -15,12 +18,20 @@ from pulsemq.engine.engine import Engine
 from pulsemq.engine.handlers import MessageHandlers
 from pulsemq.engine.pipeline import (
     AuthInterceptor,
+    AuthError,
     InterceptorChain,
     MonitorInterceptor,
     PermissionInterceptor,
+    PermissionError,
+    PipelineContext,
 )
 from pulsemq.engine.router import MessageRouter
 from pulsemq.event_loop import install_event_loop
+from pulsemq.monitoring.api import MetricsHTTPServer
+from pulsemq.monitoring.minute import MinuteAggregator
+from pulsemq.monitoring.realtime import RealtimeMetrics
+from pulsemq.protocol.frames import FrameCodec
+from pulsemq.protocol.msg_type import MsgType
 from pulsemq.storage.database import init_db, parse_db_url
 from pulsemq.storage.sqlite_perm import SqlitePermGroupRepo
 from pulsemq.storage.sqlite_user import SqliteUserRepo
@@ -35,33 +46,43 @@ class PulseServer:
     def __init__(self, config: BrokerConfig | None = None):
         self._config = config or load_config()
         self._router = MessageRouter()
-        self._transport = ZmqTransport(self._config)
-        self._monitor = MonitorInterceptor()
 
-        # 初始化存储
+        # 实时监控指标
+        self._realtime_metrics = RealtimeMetrics()
+        self._monitor = MonitorInterceptor(realtime_metrics=self._realtime_metrics)
+        self._minute_aggregator = MinuteAggregator(retention_days=self._config.stats_retention_days)
+        self._metrics_http = MetricsHTTPServer(
+            bind=self._config.metrics_bind,
+            snapshot_fn=self._realtime_metrics.snapshot,
+        )
+
+        # Transport
+        self._transport = ZmqTransport(self._config)
+
+        # 存储
         db_path = parse_db_url(self._config.db_url)
         self._db_conn = init_db(db_path)
         self._user_repo = SqliteUserRepo(self._db_conn)
         self._perm_repo = SqlitePermGroupRepo(self._db_conn)
 
-        # 初始化认证
+        # 认证
         self._auth_store = AuthMemoryStore()
         self._perm_service = PermissionService(self._perm_repo)
 
-        # 初始化 ZAP Handler
+        # ZAP Handler
         self._zap_handler = PulseMQZAPHandler(
             auth_store=self._auth_store,
             user_lookup_fn=self._user_repo.get_by_api_key,
         )
 
-        # 初始化拦截器链
-        pipeline = InterceptorChain([
-            AuthInterceptor(self._auth_store),
-            PermissionInterceptor(self._perm_service),
-            self._monitor,
-        ])
+        # 拦截器链：Monitor 在最外层，记录所有成功/失败
+        interceptors: list = [self._monitor]                   # 外层：记录延迟和错误
+        if self._config.auth_enabled:
+            interceptors.append(AuthInterceptor(self._auth_store))         # 认证
+            interceptors.append(PermissionInterceptor(self._perm_service)) # 权限
+        pipeline = InterceptorChain(interceptors)
 
-        # 初始化处理器
+        # 处理器
         self._handlers = MessageHandlers(
             router=self._router,
             send_fn=self._transport.send,
@@ -71,7 +92,7 @@ class PulseServer:
             default_comp=self._config.default_compressor,
         )
 
-        # 初始化引擎
+        # Engine
         self._engine = Engine(
             transport=self._transport,
             handlers=self._handlers,
@@ -86,22 +107,136 @@ class PulseServer:
         logger.info("事件循环: %s", loop_type)
 
         await self._transport.start()
+
+        # 注册 ZMQ 事件监听（连接/断开）
+        try:
+            self._transport._router.setsockopt(zmq.ROUTER_NOTIFY, zmq.NOTIFY_DISCONNECT)
+        except (zmq.ZMQError, AttributeError):
+            pass  # 旧版 pyzmq 不支持 ROUTER_NOTIFY
+
+        # 启动监控
+        if self._config.metrics_enabled:
+            await self._metrics_http.start()
+            await self._minute_aggregator.start()
+
         logger.info(
             "PulseMQ Broker 启动: ROUTER=%s, XPUB=%s",
             self._config.bind, self._config.xpub_bind,
         )
 
         self._running = True
-        await self._engine.run()
+
+        # 启动事件监听协程 + 引擎主循环
+        await asyncio.gather(
+            self._event_loop(),
+            self._engine.run(),
+            return_exceptions=True,
+        )
 
     async def stop(self) -> None:
         """停止 Broker。"""
         self._running = False
         await self._engine.stop()
+        if self._config.metrics_enabled:
+            await self._minute_aggregator.stop()
+            await self._metrics_http.stop()
         await self._transport.stop()
         if self._db_conn:
             self._db_conn.close()
         logger.info("PulseMQ Broker 已停止")
+
+    async def _event_loop(self) -> None:
+        """监听 ZMQ 连接/断开事件，管理认证和资源清理。"""
+        monitor_socket = self._transport._router.get_monitor_socket(
+            zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
+        )
+        if monitor_socket is None:
+            # 某些 pyzmq 版本不支持 get_monitor_socket，跳过
+            logger.debug("ZMQ monitor socket 不可用，跳过事件监听")
+            return
+
+        try:
+            while self._running:
+                try:
+                    event = await monitor_socket.recv_multipart()
+                    if len(event) < 2:
+                        continue
+                    # event[0] = 事件类型（2 bytes）, event[1] = 地址
+                    event_type = int.from_bytes(event[0][:2], "little")
+                    address = event[1]
+
+                    if event_type & zmq.EVENT_CONNECTED:
+                        await self._on_connected(address)
+                    elif event_type & zmq.EVENT_DISCONNECTED:
+                        await self._on_disconnected(address)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug("事件监听异常: %s", e)
+                    await asyncio.sleep(0.1)
+        finally:
+            monitor_socket.close()
+
+    async def _on_connected(self, address: bytes) -> None:
+        """连接建立：查找用户信息 → 注入 AuthMemoryStore → 推送 AUTH 元信息。"""
+        # 通过 ZAP handler 查找（ZAP 可能在 IO 线程中已注册）
+        user = self._auth_store.get_user(address)
+        if user is None:
+            # 未通过 ZAP 认证的连接，尝试用默认 api_key 查找
+            # （简化模式：允许默认 admin 连接）
+            if self._config.auth_enabled:
+                return
+            # auth_disabled 模式下注入 admin
+            import asyncio as _aio
+            db_user = await self._user_repo.get_by_api_key(self._config.default_admin_key)
+            if db_user:
+                from pulsemq.models import AuthUser
+                user = AuthUser(
+                    user_id=db_user.id,
+                    role=db_user.role,
+                    groups=[],
+                    api_key=db_user.api_key,
+                    namespace=db_user.namespace,
+                )
+                self._auth_store.register(address, user)
+                self._router.register_connection(address, user)
+
+        if user is not None:
+            # 推送 AUTH 元信息
+            await self._push_auth_info(address, user)
+            # 更新实时监控
+            self._realtime_metrics.active_connections = len(
+                self._auth_store._identity_user
+            )
+            logger.info("连接建立: user_id=%s role=%s", user.user_id, user.role)
+
+    async def _on_disconnected(self, address: bytes) -> None:
+        """连接断开：清理认证 + 订阅 + 连接映射。"""
+        user = self._auth_store.unregister(address)
+        if user is not None:
+            self._router.unregister_connection(address)
+            self._router.remove_identity(address)
+            self._realtime_metrics.active_connections = len(
+                self._auth_store._identity_user
+            )
+            self._realtime_metrics.active_subscriptions = self._router.subscription_count()
+            logger.info("连接断开: user_id=%s", user.user_id)
+
+    async def _push_auth_info(self, identity: bytes, user) -> None:
+        """推送 AUTH 元信息给客户端。"""
+        auth_info = {
+            "user_id": user.user_id,
+            "role": user.role,
+            "namespace": user.namespace,
+            "groups": user.groups,
+            "server_time": asyncio.get_event_loop().time(),
+        }
+        payload = FrameCodec.encode_payload(auth_info, "msgpack", "none")
+        frames = FrameCodec.encode(MsgType.AUTH, "", 0, payload, "msgpack", "none")
+        try:
+            await self._transport.send(identity, frames)
+        except Exception as e:
+            logger.debug("AUTH 推送失败: %s", e)
 
     @property
     def engine(self) -> Engine:
@@ -115,6 +250,10 @@ class PulseServer:
     def monitor(self) -> MonitorInterceptor:
         return self._monitor
 
+    @property
+    def realtime_metrics(self) -> RealtimeMetrics:
+        return self._realtime_metrics
+
 
 def main() -> None:
     """CLI 入口: pulse-mq 命令。"""
@@ -122,6 +261,11 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Windows 下 pyzmq 需要 Selector 事件循环
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     config = load_config()
     server = PulseServer(config)
 
