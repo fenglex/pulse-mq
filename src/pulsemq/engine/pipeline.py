@@ -128,24 +128,43 @@ class PermissionInterceptor(Interceptor):
 
 
 class MonitorInterceptor(Interceptor):
-    """监控拦截器：记录每条消息的处理延迟。"""
+    """监控拦截器：记录每条消息的处理延迟，桥接到 RealtimeMetrics。
 
-    def __init__(self):
+    应放在拦截器链最外层，以捕获所有内部拦截器的错误和延迟。
+    """
+
+    def __init__(self, realtime_metrics=None):
+        self._metrics = realtime_metrics
         self._msg_count = 0
         self._error_count = 0
         self._total_latency_ms = 0.0
+        self._seen_identities: set[bytes] = set()
 
     async def intercept(self, context: PipelineContext, next_fn: Callable[[], Awaitable[None]]) -> None:
+        # 追踪活跃连接数
+        if context.identity not in self._seen_identities:
+            self._seen_identities.add(context.identity)
+            if self._metrics is not None:
+                self._metrics.active_connections = len(self._seen_identities)
+
         start = time.monotonic()
         try:
             await next_fn()
         except Exception:
             self._error_count += 1
+            if self._metrics is not None:
+                self._metrics.inc_error()
             raise
         finally:
             elapsed = (time.monotonic() - start) * 1000
             self._msg_count += 1
             self._total_latency_ms += elapsed
+            # 桥接到 RealtimeMetrics
+            if self._metrics is not None:
+                payload_size = len(context.payload) if context.payload else 0
+                self._metrics.inc_message(context.topic, payload_size, elapsed)
+                if context.record_count > 0:
+                    self._metrics.inc_record(context.record_count)
 
     @property
     def stats(self) -> dict:
