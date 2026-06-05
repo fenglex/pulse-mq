@@ -86,6 +86,10 @@ class MessageHandlers:
             await self._handle_unsub(ctx)
         elif ctx.msg_type == MsgType.PING:
             await self._handle_ping(ctx)
+        elif ctx.msg_type == MsgType.QUERY:
+            await self._handle_query(ctx)
+        elif ctx.msg_type == MsgType.HISTORY_REPLAY:
+            await self._handle_history_replay(ctx)
         # 其他类型暂忽略
 
     async def _handle_pub(self, ctx: PipelineContext) -> None:
@@ -200,6 +204,102 @@ class MessageHandlers:
             self._default_ser, self._default_comp,
         )
         result = self._send(identity, pong_frames)
+        if result is not None:
+            await result
+
+    async def _handle_query(self, ctx: PipelineContext) -> None:
+        """处理 QUERY 消息（V1 仅 system_status）。"""
+        identity = ctx.identity
+        try:
+            query = FrameCodec.decode_payload(
+                ctx.payload, self._default_ser, self._default_comp
+            )
+        except Exception:
+            await self._send_error(identity, 4007, "payload 反序列化失败")
+            return
+
+        action = query.get("action", "")
+        if action == "system_status":
+            await self._query_system_status(identity)
+        else:
+            await self._send_error(identity, 3004, f"未知 action: {action}")
+
+    async def _query_system_status(self, identity: bytes) -> None:
+        """返回系统状态。"""
+        status = {
+            "status": "ok",
+            "timestamp": time.time(),
+            "topic_count": self.router.topic_count(),
+            "subscription_count": self.router.subscription_count(),
+            "connection_count": self.router.connection_count(),
+        }
+        payload = FrameCodec.encode_payload(
+            status, self._default_ser, self._default_comp
+        )
+        frames = FrameCodec.encode(
+            MsgType.QUERY, "", 0, payload,
+            self._default_ser, self._default_comp,
+        )
+        result = self._send(identity, frames)
+        if result is not None:
+            await result
+
+    async def _handle_history_replay(self, ctx: PipelineContext) -> None:
+        """处理 HISTORY_REPLAY：从 MessageBuffer 回放历史消息。"""
+        identity = ctx.identity
+        topic = ctx.topic
+
+        try:
+            req = FrameCodec.decode_payload(
+                ctx.payload, self._default_ser, self._default_comp
+            )
+        except Exception:
+            await self._send_error(identity, 4007, "payload 反序列化失败", topic)
+            return
+
+        from_seq = req.get("from_seq", 0)
+        limit = min(req.get("limit", 100), 500)
+
+        # 回放消息
+        messages = self.router.replay_messages(topic, from_seq, limit)
+
+        # 逐条发送 BROADCAST
+        for msg in messages:
+            replay_payload = FrameCodec.encode_payload(
+                {
+                    "_seq": msg.seq,
+                    "_ts": msg.timestamp,
+                    "_replayed": True,
+                },
+                self._default_ser,
+                self._default_comp,
+            )
+            broadcast_frames = FrameCodec.encode(
+                MsgType.BROADCAST, topic, msg.record_count, msg.payload,
+                self._default_ser, self._default_comp,
+            )
+            result = self._send(identity, broadcast_frames)
+            if result is not None:
+                await result
+
+        # 发送回放结束标记
+        latest = self.router.latest_seq(topic)
+        done_payload = FrameCodec.encode_payload(
+            {
+                "status": "ok",
+                "from_seq": from_seq,
+                "to_seq": messages[-1].seq if messages else from_seq,
+                "count": len(messages),
+                "latest_seq": latest,
+            },
+            self._default_ser,
+            self._default_comp,
+        )
+        done_frames = FrameCodec.encode(
+            MsgType.HISTORY_REPLAY, topic, 0, done_payload,
+            self._default_ser, self._default_comp,
+        )
+        result = self._send(identity, done_frames)
         if result is not None:
             await result
 
