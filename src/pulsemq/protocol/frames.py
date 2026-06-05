@@ -59,27 +59,40 @@ class FrameCodec:
 
     @staticmethod
     def decode_server(frames: list[bytes]) -> DecodedFrame:
-        """解码服务端 ROUTER 收到的 6 帧。
+        """解码服务端 ROUTER 收到的帧。
 
-        Args:
-            frames: [identity, delimiter, topic, meta(2B), record_count(4B), payload]
+        支持两种情况:
+            5 帧: [identity, topic, meta(2B), record_count(4B), payload]
+                  DEALER → ROUTER（无 delimiter）
+            6 帧: [identity, delimiter, topic, meta(2B), record_count(4B), payload]
+                  ROUTER 路由信封（含 delimiter）
 
         Raises:
-            ValueError: 帧数不等于 6。
+            ValueError: 帧数不在 5-6 范围内。
         """
-        if len(frames) != 6:
+        if len(frames) == 6:
+            # 含 delimiter
+            identity = frames[0]
+            # frames[1] = delimiter（空帧，跳过）
+            topic = frames[2].decode("utf-8")
+            meta = frames[3]
+            record_count_raw = frames[4]
+            payload = frames[5]
+        elif len(frames) == 5:
+            # 无 delimiter（DEALER 直连 ROUTER）
+            identity = frames[0]
+            topic = frames[1].decode("utf-8")
+            meta = frames[2]
+            record_count_raw = frames[3]
+            payload = frames[4]
+        else:
             raise ValueError(
-                f"帧数不正确：期望 6 帧，收到 {len(frames)} 帧"
+                f"帧数不正确：期望 5-6 帧，收到 {len(frames)} 帧"
             )
 
-        identity = frames[0]
-        # frames[1] = delimiter（空帧，跳过）
-        topic = frames[2].decode("utf-8")
-        meta = frames[3]
         msg_type = meta[0]
         flags = FrameFlags.decode(meta[1])
-        record_count = _RECORD_COUNT_STRUCT.unpack(frames[4])[0]
-        payload = frames[5]
+        record_count = _RECORD_COUNT_STRUCT.unpack(record_count_raw)[0]
 
         return DecodedFrame(
             identity=identity,

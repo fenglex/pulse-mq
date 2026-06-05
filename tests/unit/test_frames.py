@@ -83,6 +83,26 @@ class TestFrameCodec:
         result = FrameCodec.decode_payload(decoded.payload, decoded.ser_fmt, decoded.comp)
         assert result == original_data
 
+    def test_decode_5_frames_no_delimiter(self):
+        """DEALER→ROUTER 无 delimiter，5 帧解码。"""
+        payload = FrameCodec.encode_payload(
+            {"price": 15.8}, ser_fmt="msgpack", comp="none"
+        )
+        client_frames = FrameCodec.encode(
+            msg_type=MsgType.PUB,
+            topic="team-a.mkt.sh.600000",
+            record_count=1,
+            payload=payload,
+        )
+        # DEALER→ROUTER 只有 5 帧（无 delimiter）
+        server_frames = [b"identity_abc"] + list(client_frames)
+
+        decoded = FrameCodec.decode_server(server_frames)
+        assert decoded.identity == b"identity_abc"
+        assert decoded.topic == "team-a.mkt.sh.600000"
+        assert decoded.msg_type == MsgType.PUB
+        assert decoded.record_count == 1
+
     def test_decode_invalid_frame_count(self):
         """帧数不对时抛出异常。"""
         with pytest.raises(ValueError, match="帧数"):

@@ -61,21 +61,21 @@ class MessageHandlers:
 
         # 零拷贝广播：替换 msg_type 为 BROADCAST
         if subscribers:
-            from pulsemq.protocol.flags import FrameFlags
             broadcast_meta = bytes([MsgType.BROADCAST, decoded.flags.encode()])
             broadcast_frames = [
-                server_frames[2],               # topic
-                broadcast_meta,                 # meta (BROADCAST + original flags)
-                server_frames[4],               # record_count
-                server_frames[5],               # payload
+                decoded.topic.encode("utf-8"),   # topic
+                broadcast_meta,                  # meta (BROADCAST + original flags)
+                server_frames[-2],               # record_count
+                decoded.payload,                 # payload
             ]
             result = self._broadcast(broadcast_frames)
             if result is not None:
                 await result
 
-        # 缓存消息
+        # 缓存消息（使用解码后的 meta 和 payload）
+        meta_bytes = bytes([decoded.msg_type, decoded.flags.encode()])
         self.router.append_message(
-            topic, server_frames[3], record_count, server_frames[5]
+            topic, meta_bytes, record_count, decoded.payload
         )
 
     async def handle_sub(self, server_frames: list[bytes]) -> None:
