@@ -1,0 +1,35 @@
+[project]
+name = "pulsemq"
+version = "0.1.0"
+description = "高性能金融行情消息中间件"
+requires-python = ">=3.10"
+dependencies = [
+    "pyzmq>=26.0",
+    "msgpack>=1.0",
+]
+
+[project.optional-dependencies]
+compress = [
+    "python-snappy>=0.7",
+    "lz4>=4.0",
+    "zstandard>=0.22",
+]
+uvloop = [
+    "uvloop>=0.19",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-timeout>=2.0",
+]
+
+[project.scripts]
+pulse-mq = "pulsemq.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
