@@ -11,6 +11,7 @@ from pulsemq.auth.memory_store import AuthMemoryStore
 from pulsemq.auth.permission import PermissionService
 from pulsemq.auth.zap_handler import PulseMQZAPHandler
 from pulsemq.config import BrokerConfig, load_config
+from pulsemq.engine.engine import Engine
 from pulsemq.engine.handlers import MessageHandlers
 from pulsemq.engine.pipeline import (
     AuthInterceptor,
@@ -69,6 +70,14 @@ class PulseServer:
             default_ser=self._config.default_serializer,
             default_comp=self._config.default_compressor,
         )
+
+        # 初始化引擎
+        self._engine = Engine(
+            transport=self._transport,
+            handlers=self._handlers,
+            config=self._config,
+        )
+
         self._running = False
 
     async def start(self) -> None:
@@ -77,43 +86,34 @@ class PulseServer:
         logger.info("事件循环: %s", loop_type)
 
         await self._transport.start()
-
-        # 启用 ZAP 认证
-        if self._config.auth_enabled:
-            # ZAP 认证在 ZMQ 连接层通过回调处理
-            # Phase 2 简化：连接建立后自动注入 admin 用户
-            # 完整 ZAP 需要 zmq.auth 模块，此处先预留
-            logger.info("认证已启用（简化模式：自动注入连接用户）")
-
         logger.info(
             "PulseMQ Broker 启动: ROUTER=%s, XPUB=%s",
             self._config.bind, self._config.xpub_bind,
         )
 
         self._running = True
-        await self._message_loop()
+        await self._engine.run()
 
     async def stop(self) -> None:
         """停止 Broker。"""
         self._running = False
+        await self._engine.stop()
         await self._transport.stop()
         if self._db_conn:
             self._db_conn.close()
         logger.info("PulseMQ Broker 已停止")
 
-    async def _message_loop(self) -> None:
-        """消息主循环：逐条处理 + 拦截器链。"""
-        while self._running:
-            try:
-                frames = await self._transport.recv()
-                await self._handlers.dispatch(frames)
-            except zmq.ZMQError:
-                if self._running:
-                    logger.exception("ZMQ 错误")
-                break
-            except Exception:
-                logger.exception("消息处理异常")
-                continue
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    @property
+    def router(self) -> MessageRouter:
+        return self._router
+
+    @property
+    def monitor(self) -> MonitorInterceptor:
+        return self._monitor
 
 
 def main() -> None:
