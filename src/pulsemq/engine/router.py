@@ -30,18 +30,22 @@ class MessageRouter:
     # identity → set of wildcard patterns
     _identity_wildcards: dict[bytes, set[str]] = field(default_factory=dict)
 
+    # 通配符匹配缓存（topic → set of identity），订阅变更时失效
+    _wildcard_cache: dict[str, set[bytes]] = field(default_factory=dict)
+    _wildcard_cache_valid: bool = field(default=False)
+
     # 订阅关系双向索引
     _topic_subscribers: dict[str, set[bytes]] = field(default_factory=dict)
     _identity_subscriptions: dict[bytes, set[str]] = field(default_factory=dict)
-
-    # 连接管理
-    _identity_user: dict[bytes, AuthUser] = field(default_factory=dict)
-    _user_identities: dict[int, set[bytes]] = field(default_factory=dict)
 
     # 消息缓冲区
     _buffers: dict[str, deque] = field(default_factory=dict)
     _seq_counter: dict[str, int] = field(default_factory=dict)
     max_buffer_size: int = 1000
+    buffer_enabled: bool = False  # #4 优化：默认关闭缓冲
+
+    # 认证存储引用（用于连接计数）
+    _auth_store: object = field(default=None, repr=False)
 
     # ---- Topic 管理 ----
 
@@ -78,6 +82,9 @@ class MessageRouter:
         info = self._topics.get(topic)
         if info is not None:
             info.subscriber_count = len(self._topic_subscribers[topic])
+
+        # 通配符缓存失效
+        self._wildcard_cache_valid = False
 
     def unsubscribe(self, identity: bytes, topic: str) -> None:
         """取消订阅（精确或通配符）。"""
@@ -122,6 +129,9 @@ class MessageRouter:
         if id_subs is not None:
             id_subs.discard(topic)
 
+        # 通配符缓存失效
+        self._wildcard_cache_valid = False
+
     def _wildcard_unsubscribe(self, identity: bytes, pattern: str) -> None:
         """通配符订阅移除。"""
         wc_subs = self._wildcard_subscriptions.get(pattern)
@@ -135,13 +145,44 @@ class MessageRouter:
             id_wc.discard(pattern)
 
     def get_subscribers(self, topic: str) -> set[bytes]:
-        """获取 topic 的所有订阅者（含通配符匹配）。"""
+        """获取 topic 的所有订阅者（含通配符匹配，带缓存）。"""
+        # 精确订阅始终返回
         result = set(self._topic_subscribers.get(topic, set()))
-        # 检查通配符订阅
-        for pattern, identities in self._wildcard_subscriptions.items():
-            if topic_match(pattern, topic):
-                result.update(identities)
+
+        # 通配符匹配使用缓存
+        if self._wildcard_subscriptions:
+            cached = self._wildcard_cache.get(topic)
+            if cached is not None and self._wildcard_cache_valid:
+                result.update(cached)
+            else:
+                # 重新计算并缓存
+                wc_result: set[bytes] = set()
+                for pattern, identities in self._wildcard_subscriptions.items():
+                    if topic_match(pattern, topic):
+                        wc_result.update(identities)
+                self._wildcard_cache[topic] = wc_result
+                result.update(wc_result)
         return result
+
+    def has_subscribers(self, topic: str) -> bool:
+        """轻量级检查 topic 是否有订阅者（不拷贝 set）。
+
+        用于 PUB 热路径，避免 get_subscribers() 的 set 拷贝开销。
+        """
+        # 精确订阅快速检查
+        subs = self._topic_subscribers.get(topic)
+        if subs:
+            return True
+        # 通配符匹配
+        if self._wildcard_subscriptions:
+            cached = self._wildcard_cache.get(topic)
+            if cached is not None and self._wildcard_cache_valid:
+                return bool(cached)
+            # 重新计算
+            for pattern, identities in self._wildcard_subscriptions.items():
+                if identities and topic_match(pattern, topic):
+                    return True
+        return False
 
     def get_subscriptions(self, identity: bytes) -> set[str]:
         """获取 identity 的所有订阅（精确 + 通配符）。"""
@@ -167,29 +208,67 @@ class MessageRouter:
                 if not wc_subs:
                     del self._wildcard_subscriptions[pattern]
 
-    # ---- 连接管理 ----
+        # 通配符缓存失效
+        if id_wc:
+            self._wildcard_cache_valid = False
+            self._wildcard_cache.clear()
 
-    def register_connection(self, identity: bytes, user: AuthUser) -> None:
-        """注册 identity ↔ user 映射。"""
-        self._identity_user[identity] = user
-        if user.user_id not in self._user_identities:
-            self._user_identities[user.user_id] = set()
-        self._user_identities[user.user_id].add(identity)
+    # ---- 连接管理（已委托给 AuthMemoryStore）----
 
-    def unregister_connection(self, identity: bytes) -> AuthUser | None:
-        """移除映射，返回 user 或 None。"""
-        user = self._identity_user.pop(identity, None)
-        if user is not None:
-            idents = self._user_identities.get(user.user_id)
-            if idents is not None:
-                idents.discard(identity)
-        return user
+    def register_connection(self, identity: bytes, user) -> None:
+        """注册连接（委托给 auth_store 或仅维护计数）。"""
+        if self._auth_store is not None:
+            self._auth_store.register(identity, user)
+        else:
+            # 测试用兼容模式
+            if not hasattr(self, '_test_connections'):
+                self._test_connections = {}
+                self._test_user_identities = {}
+            self._test_connections[identity] = user
+            uid = getattr(user, 'user_id', None)
+            if uid is not None:
+                if uid not in self._test_user_identities:
+                    self._test_user_identities[uid] = set()
+                self._test_user_identities[uid].add(identity)
 
-    def get_user(self, identity: bytes) -> AuthUser | None:
-        return self._identity_user.get(identity)
+    def unregister_connection(self, identity: bytes):
+        """取消注册连接。"""
+        if self._auth_store is not None:
+            return self._auth_store.unregister(identity)
+        # 测试用兼容模式
+        if hasattr(self, '_test_connections'):
+            user = self._test_connections.pop(identity, None)
+            if user is not None:
+                uid = getattr(user, 'user_id', None)
+                if uid is not None and uid in self._test_user_identities:
+                    self._test_user_identities[uid].discard(identity)
+            return user
+        return None
 
-    def get_connections(self, user_id: int) -> set[bytes]:
-        return self._user_identities.get(user_id, set())
+    def get_user(self, identity: bytes):
+        """获取连接对应的用户。"""
+        if self._auth_store is not None:
+            return self._auth_store.get_user(identity)
+        if hasattr(self, '_test_connections'):
+            return self._test_connections.get(identity)
+        return None
+
+    def get_connections(self, user_id: int) -> set:
+        """获取用户的所有连接。"""
+        if self._auth_store is not None:
+            return self._auth_store._user_identities.get(user_id, set())
+        if hasattr(self, '_test_user_identities'):
+            return self._test_user_identities.get(user_id, set())
+        return set()
+
+    def connection_count(self, auth_store=None) -> int:
+        """获取连接数。"""
+        store = auth_store or self._auth_store
+        if store is not None:
+            return len(store._identity_user)
+        if hasattr(self, '_test_connections'):
+            return len(self._test_connections)
+        return 0
 
     # ---- 消息缓冲 ----
 
@@ -238,6 +317,3 @@ class MessageRouter:
 
     def subscription_count(self) -> int:
         return sum(len(s) for s in self._topic_subscribers.values())
-
-    def connection_count(self) -> int:
-        return len(self._identity_user)

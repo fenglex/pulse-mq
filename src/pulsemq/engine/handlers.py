@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import struct
 import time
 from collections.abc import Awaitable, Callable
 
@@ -16,9 +18,11 @@ from pulsemq.engine.pipeline import (
     PipelineContext,
     PermissionError,
 )
+from pulsemq.engine.pool import PipelineContextPool
 from pulsemq.engine.router import MessageRouter
 from pulsemq.models import TopicInfo
-from pulsemq.protocol.frames import FrameCodec
+from pulsemq.protocol.flags import FrameFlags
+from pulsemq.protocol.frames import FrameCodec, _RECORD_COUNT_STRUCT
 from pulsemq.protocol.msg_type import MsgType
 
 logger = logging.getLogger(__name__)
@@ -42,14 +46,32 @@ class MessageHandlers:
         self._pipeline = pipeline
         self._default_ser = default_ser
         self._default_comp = default_comp
+        self._ctx_pool = PipelineContextPool(size=4096)
+
+        # 预计算 broadcast 帧的固定部分（#1 优化）
+        _flags = FrameFlags(ser_fmt=default_ser, comp=default_comp, has_topic=True)
+        self._broadcast_meta = bytes([MsgType.BROADCAST, _flags.encode()])
+        self._broadcast_meta_no_topic = bytes(
+            [MsgType.BROADCAST,
+             FrameFlags(ser_fmt=default_ser, comp=default_comp, has_topic=False).encode()]
+        )
+        # topic_bytes 缓存（topic → bytes）
+        self._topic_bytes_cache: dict[str, bytes] = {}
+
+        # #7 优化：broadcast 解耦队列（由 Engine.run() 注入）
+        self._broadcast_queue: asyncio.Queue | None = None
+
+    def set_broadcast_queue(self, queue: asyncio.Queue) -> None:
+        """注入 broadcast 解耦队列（#7 优化）。"""
+        self._broadcast_queue = queue
 
     async def dispatch(self, server_frames: list[bytes]) -> None:
         """根据 msg_type 分发到对应处理器（含拦截器链）。"""
         decoded = FrameCodec.decode_server(server_frames)
         msg_type = decoded.msg_type
 
-        # 构建上下文
-        ctx = PipelineContext(
+        # 从对象池获取上下文
+        ctx = self._ctx_pool.acquire(
             identity=decoded.identity,
             msg_type=msg_type,
             topic=decoded.topic,
@@ -59,12 +81,11 @@ class MessageHandlers:
         )
 
         try:
-            # 执行拦截器链
+            # 执行拦截器链，handler 作为末端执行器
             if self._pipeline is not None:
                 async def _handle():
                     await self._dispatch_internal(ctx, server_frames)
-                await self._pipeline.execute(ctx)
-                await _handle()
+                await self._pipeline.execute(ctx, terminal_handler=_handle)
             else:
                 await self._dispatch_internal(ctx, server_frames)
 
@@ -75,6 +96,55 @@ class MessageHandlers:
         except Exception as e:
             logger.exception("消息处理异常")
             await self._send_error(decoded.identity, 9001, "内部错误")
+        finally:
+            # 归还上下文到对象池
+            self._ctx_pool.release(ctx)
+
+    async def dispatch_pub_fast(self, frames: list[bytes]) -> None:
+        """PUB 快速路径：跳过 pipeline + ctx_pool，直接处理。
+
+        适用于 auth 关闭或无需鉴权的场景。
+        frames 为 ROUTER 收到的原始帧（5-6 帧）。
+        """
+        # 内联解码，避免 DecodedFrame dataclass 开销
+        if len(frames) == 6:
+            topic = frames[2].decode("utf-8")
+            payload = frames[5]
+            record_count = _RECORD_COUNT_STRUCT.unpack(frames[4])[0]
+        else:  # 5 帧
+            topic = frames[1].decode("utf-8")
+            payload = frames[4]
+            record_count = _RECORD_COUNT_STRUCT.unpack(frames[3])[0]
+
+        # 注册 topic（幂等）
+        self.router.register_topic(topic)
+
+        # 轻量级订阅者检查（#2 优化：不拷贝 set）
+        if self.router.has_subscribers(topic):
+            topic_bytes = self._get_topic_bytes(topic)
+            rc_bytes = _RECORD_COUNT_STRUCT.pack(record_count)
+            broadcast_frames = [topic_bytes, self._broadcast_meta, rc_bytes, payload]
+            # #7 优化：通过解耦队列发送，不阻塞主循环
+            if self._broadcast_queue is not None:
+                self._broadcast_queue.put_nowait(broadcast_frames)
+            else:
+                result = self._broadcast(broadcast_frames)
+                if result is not None:
+                    await result
+
+        # 条件化缓存（#4 优化）
+        if self.router.buffer_enabled:
+            meta = bytes([MsgType.PUB, 0])
+            self.router.append_message(topic, meta, record_count, payload)
+
+    def _get_topic_bytes(self, topic: str) -> bytes:
+        """获取 topic 的 UTF-8 编码（带缓存）。"""
+        cached = self._topic_bytes_cache.get(topic)
+        if cached is not None:
+            return cached
+        b = topic.encode("utf-8")
+        self._topic_bytes_cache[topic] = b
+        return b
 
     async def _dispatch_internal(self, ctx: PipelineContext, server_frames: list[bytes]) -> None:
         """内部分发。"""
@@ -100,33 +170,18 @@ class MessageHandlers:
         # 注册 topic（幂等）
         self.router.register_topic(topic)
 
-        # 获取订阅者（含通配符匹配）
-        subscribers = self.router.get_subscribers(topic)
-
-        # 广播
-        if subscribers:
-            from pulsemq.protocol.flags import FrameFlags
-            flags = FrameFlags(
-                ser_fmt=self._default_ser,
-                comp=self._default_comp,
-                has_topic=bool(topic),
-            )
-            broadcast_meta = bytes([MsgType.BROADCAST, flags.encode()])
-            broadcast_frames = [
-                topic.encode("utf-8"),
-                broadcast_meta,
-                ctx.meta,           # 复用 meta 中的 record_count 不对，用编码后的
-                ctx.payload,
-            ]
-            # 重新编码 record_count
-            import struct
-            broadcast_frames[2] = struct.pack(">I", record_count)
+        # 轻量级订阅者检查（#2 优化）
+        if self.router.has_subscribers(topic):
+            topic_bytes = self._get_topic_bytes(topic)
+            rc_bytes = _RECORD_COUNT_STRUCT.pack(record_count)
+            broadcast_frames = [topic_bytes, self._broadcast_meta, rc_bytes, ctx.payload]
             result = self._broadcast(broadcast_frames)
             if result is not None:
                 await result
 
-        # 缓存消息
-        self.router.append_message(topic, ctx.meta, record_count, ctx.payload)
+        # 条件化缓存（#4 优化）
+        if self.router.buffer_enabled:
+            self.router.append_message(topic, ctx.meta, record_count, ctx.payload)
 
     async def _handle_sub(self, ctx: PipelineContext) -> None:
         """处理 SUB：建立订阅（支持通配符）→ 发送确认。"""

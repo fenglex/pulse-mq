@@ -43,20 +43,16 @@ def _match_parts(pat: list[str], pi: int, topic: list[str], ti: int) -> bool:
         return False
 
     seg = pat[pi]
-    is_last = (pi == len(pat) - 1)
 
     if seg == ">":
-        # > 匹配一个或多个段
+        # > 匹配一个或多个段，循环尝试所有可能的消费位置
         for skip in range(ti + 1, len(topic) + 1):
             if _match_parts(pat, pi + 1, topic, skip):
                 return True
-        # > 在末尾也可以匹配到 topic 末尾
-        if is_last and ti <= len(topic):
-            return _match_parts(pat, pi + 1, topic, len(topic))
         return False
 
     if seg == "*":
-        if is_last:
+        if pi == len(pat) - 1:
             # * 在末尾匹配一个或多个段
             return ti < len(topic) and _match_parts(pat, pi + 1, topic, len(topic))
         else:

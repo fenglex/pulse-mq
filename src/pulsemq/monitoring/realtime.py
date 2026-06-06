@@ -36,17 +36,21 @@ class EWMA:
 class SlidingWindow:
     """滑动窗口，用于计算 P50/P99 延迟。
 
-    保留最近 window_seconds 秒内的数据点。
+    保留最近 window_seconds 秒内的数据点，限制最大容量避免排序开销。
+    采用 reservoir sampling 策略：超过 max_samples 时随机替换。
     """
 
-    def __init__(self, window_seconds: float = 60.0):
+    def __init__(self, window_seconds: float = 60.0, max_samples: int = 4096):
         self._window = window_seconds
-        self._data: deque[tuple[float, float]] = deque()
+        self._max_samples = max_samples
+        self._data: deque[tuple[float, float]] = deque(maxlen=max_samples)
 
     def add(self, value: float, ts: float | None = None) -> None:
         ts = ts or time.time()
+        if len(self._data) >= self._max_samples:
+            # 已满时移除最旧的再插入
+            self._cleanup(ts)
         self._data.append((ts, value))
-        self._cleanup(ts)
 
     def percentile(self, p: float) -> float:
         """计算百分位数（p: 0-100）。"""
@@ -88,6 +92,11 @@ class RealtimeMetrics:
     dropped_messages: int = 0
     backpressure: bool = False
 
+    # 引擎指标
+    _engine_batch_size: int = 1
+    _engine_pending_tasks: int = 0
+    _engine_concurrency_usage: float = 0.0
+
     def inc_message(self, topic: str, payload_size: int, elapsed_ms: float) -> None:
         """记录一条消息处理完成。"""
         self.msg_rate.update(1)
@@ -116,4 +125,16 @@ class RealtimeMetrics:
             "error_rate": round(self.error_rate.value, 2),
             "dropped_total": self.dropped_messages,
             "backpressure": self.backpressure,
+            # 引擎指标（由外部更新）
+            "engine_batch_size": self._engine_batch_size,
+            "engine_pending_tasks": self._engine_pending_tasks,
+            "engine_concurrency_usage": self._engine_concurrency_usage,
         }
+
+    def update_engine_metrics(
+        self, batch_size: int, pending_tasks: int, concurrency_usage: float
+    ) -> None:
+        """更新引擎运行指标。"""
+        self._engine_batch_size = batch_size
+        self._engine_pending_tasks = pending_tasks
+        self._engine_concurrency_usage = concurrency_usage

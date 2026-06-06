@@ -18,34 +18,40 @@ class NoneCompressor(Compressor):
 class SnappyCompressor(Compressor):
     """Google Snappy 极速压缩。"""
 
-    def compress(self, data: bytes) -> bytes:
+    def __init__(self):
         import snappy
-        return snappy.compress(data)
+        self._snappy = snappy
+
+    def compress(self, data: bytes) -> bytes:
+        return self._snappy.compress(data)
 
     def decompress(self, data: bytes) -> bytes:
-        import snappy
-        return snappy.decompress(data)
+        return self._snappy.decompress(data)
 
 
 class Lz4Compressor(Compressor):
     """LZ4 极速压缩/解压。"""
 
-    def compress(self, data: bytes) -> bytes:
+    def __init__(self):
         import lz4.frame
-        return lz4.frame.compress(data)
+        self._lz4_frame = lz4.frame
+
+    def compress(self, data: bytes) -> bytes:
+        return self._lz4_frame.compress(data)
 
     def decompress(self, data: bytes) -> bytes:
-        import lz4.frame
-        return lz4.frame.decompress(data)
+        return self._lz4_frame.decompress(data)
 
 
 class ZstdCompressor(Compressor):
     """Facebook Zstandard 高压缩比。"""
 
-    def compress(self, data: bytes) -> bytes:
+    def __init__(self):
         import zstandard as zstd
-        return zstd.compress(data)
+        self._zstd = zstd
+
+    def compress(self, data: bytes) -> bytes:
+        return self._zstd.compress(data)
 
     def decompress(self, data: bytes) -> bytes:
-        import zstandard as zstd
-        return zstd.decompress(data)
+        return self._zstd.decompress(data)

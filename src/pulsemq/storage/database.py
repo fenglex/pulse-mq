@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 import time
+from functools import partial
 from pathlib import Path
+
+# 全局写入锁，保证 SQLite 写操作线程安全
+_db_write_lock = threading.Lock()
 
 # 建表 DDL
 _SCHEMA_SQL = """
@@ -60,7 +66,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
     Returns:
         sqlite3.Connection (同步连接，用于 Repository)
     """
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
@@ -82,3 +88,18 @@ def parse_db_url(db_url: str) -> str:
     if db_url.startswith("sqlite://"):
         return db_url[len("sqlite://"):]
     return db_url
+
+
+async def run_sync(func, *args):
+    """将同步 IO 操作放入线程池执行，避免阻塞事件循环。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(func, *args))
+
+
+async def run_sync_locked(func, *args):
+    """将同步 IO 操作放入线程池并在锁保护下执行。"""
+    def _locked():
+        with _db_write_lock:
+            return func(*args)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _locked)

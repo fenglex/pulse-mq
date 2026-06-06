@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "pyzmq>=26.0",
     "msgpack>=1.0",
+    "uvloop>=0.19; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -14,8 +15,9 @@ compress = [
     "lz4>=4.0",
     "zstandard>=0.22",
 ]
-uvloop = [
-    "uvloop>=0.19",
+pyarrow = [
+    "pyarrow>=14.0",
+    "pandas>=2.0",
 ]
 dev = [
     "pytest>=8.0",

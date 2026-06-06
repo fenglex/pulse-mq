@@ -6,6 +6,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 import msgpack
 import zmq
@@ -49,8 +50,11 @@ class PulseServer:
 
         # 实时监控指标
         self._realtime_metrics = RealtimeMetrics()
-        self._monitor = MonitorInterceptor(realtime_metrics=self._realtime_metrics)
         self._minute_aggregator = MinuteAggregator(retention_days=self._config.stats_retention_days)
+        self._monitor = MonitorInterceptor(
+            realtime_metrics=self._realtime_metrics,
+            minute_aggregator=self._minute_aggregator,
+        )
         self._metrics_http = MetricsHTTPServer(
             bind=self._config.metrics_bind,
             snapshot_fn=self._realtime_metrics.snapshot,
@@ -68,6 +72,9 @@ class PulseServer:
         # 认证
         self._auth_store = AuthMemoryStore()
         self._perm_service = PermissionService(self._perm_repo)
+
+        # 注入 auth_store 引用到 router（用于连接计数）
+        self._router._auth_store = self._auth_store
 
         # ZAP Handler
         self._zap_handler = PulseMQZAPHandler(
@@ -103,8 +110,7 @@ class PulseServer:
 
     async def start(self) -> None:
         """启动 Broker。"""
-        loop_type = install_event_loop(self._config.use_uvloop)
-        logger.info("事件循环: %s", loop_type)
+        logger.info("事件循环: %s", type(asyncio.get_event_loop()).__name__)
 
         await self._transport.start()
 
@@ -126,21 +132,28 @@ class PulseServer:
 
         self._running = True
 
-        # 启动事件监听协程 + 引擎主循环
+        # 启动事件监听协程 + 引擎主循环 + 指标同步 + topic 清理
         await asyncio.gather(
             self._event_loop(),
             self._engine.run(),
+            self._metrics_sync_loop(),
+            self._topic_cleanup_loop(),
             return_exceptions=True,
         )
 
     async def stop(self) -> None:
-        """停止 Broker。"""
+        """优雅停止 Broker：停止接收 → drain 缓冲 → 关闭传输。"""
         self._running = False
+        # 先停止引擎（等待后台任务完成）
         await self._engine.stop()
+        # drain 双缓冲残余消息
+        drained = await self._engine._drain_buffers()
+        if drained > 0:
+            logger.info("优雅关闭: drain %d 条缓冲消息", drained)
         if self._config.metrics_enabled:
             await self._minute_aggregator.stop()
             await self._metrics_http.stop()
-        await self._transport.stop()
+        await self._transport.stop(linger_ms=2000)
         if self._db_conn:
             self._db_conn.close()
         logger.info("PulseMQ Broker 已停止")
@@ -177,6 +190,55 @@ class PulseServer:
         finally:
             monitor_socket.close()
 
+    async def _metrics_sync_loop(self) -> None:
+        """定期同步引擎和缓冲区指标到 RealtimeMetrics。"""
+        while self._running:
+            try:
+                # 同步 DualBuffer 丢弃计数
+                self._realtime_metrics.dropped_messages = (
+                    self._engine.dual_buffer.dropped_total
+                )
+                # 同步背压状态
+                self._realtime_metrics.backpressure = (
+                    self._engine._pending_tasks
+                    > self._engine._max_concurrency * self._engine._backpressure_threshold
+                )
+                # 同步引擎指标
+                metrics = self._engine.metrics
+                self._realtime_metrics.update_engine_metrics(
+                    batch_size=metrics.effective_batch_size,
+                    pending_tasks=metrics.pending_tasks,
+                    concurrency_usage=metrics.concurrency_usage,
+                )
+            except Exception as e:
+                logger.debug("指标同步异常: %s", e)
+            await asyncio.sleep(1.0)
+
+    async def _topic_cleanup_loop(self) -> None:
+        """定期清理无订阅者且无缓冲消息的空闲 topic。"""
+        while self._running:
+            try:
+                await asyncio.sleep(300)  # 每 5 分钟执行一次
+                topics = list(self._router._topics.keys())
+                cleaned = 0
+                for topic_name in topics:
+                    info = self._router._topics.get(topic_name)
+                    if info is None:
+                        continue
+                    # 无订阅者 + 缓冲已空 → 移除
+                    subs = self._router._topic_subscribers.get(topic_name, set())
+                    buf = self._router._buffers.get(topic_name)
+                    if not subs and (buf is None or len(buf) == 0):
+                        self._router._topics.pop(topic_name, None)
+                        self._router.remove_topic_buffer(topic_name)
+                        cleaned += 1
+                if cleaned > 0:
+                    logger.info("Topic 清理: 移除 %d 个空闲 topic", cleaned)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("Topic 清理异常: %s", e)
+
     async def _on_connected(self, address: bytes) -> None:
         """连接建立：查找用户信息 → 注入 AuthMemoryStore → 推送 AUTH 元信息。"""
         # 通过 ZAP handler 查找（ZAP 可能在 IO 线程中已注册）
@@ -187,7 +249,6 @@ class PulseServer:
             if self._config.auth_enabled:
                 return
             # auth_disabled 模式下注入 admin
-            import asyncio as _aio
             db_user = await self._user_repo.get_by_api_key(self._config.default_admin_key)
             if db_user:
                 from pulsemq.models import AuthUser
@@ -199,7 +260,6 @@ class PulseServer:
                     namespace=db_user.namespace,
                 )
                 self._auth_store.register(address, user)
-                self._router.register_connection(address, user)
 
         if user is not None:
             # 推送 AUTH 元信息
@@ -214,8 +274,8 @@ class PulseServer:
         """连接断开：清理认证 + 订阅 + 连接映射。"""
         user = self._auth_store.unregister(address)
         if user is not None:
-            self._router.unregister_connection(address)
             self._router.remove_identity(address)
+            self._monitor.remove_identity(address)
             self._realtime_metrics.active_connections = len(
                 self._auth_store._identity_user
             )
@@ -229,7 +289,7 @@ class PulseServer:
             "role": user.role,
             "namespace": user.namespace,
             "groups": user.groups,
-            "server_time": asyncio.get_event_loop().time(),
+            "server_time": time.time(),
         }
         payload = FrameCodec.encode_payload(auth_info, "msgpack", "none")
         frames = FrameCodec.encode(MsgType.AUTH, "", 0, payload, "msgpack", "none")
@@ -262,11 +322,13 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    # Windows 下 pyzmq 需要 Selector 事件循环
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     config = load_config()
+
+    # 安装事件循环（必须在 asyncio.new_event_loop 之前）
+    # Windows → SelectorEventLoop; Linux/macOS → uvloop（如已安装）
+    loop_type = install_event_loop(config.use_uvloop)
+    logger.info("事件循环: %s", loop_type)
+
     server = PulseServer(config)
 
     loop = asyncio.new_event_loop()

@@ -134,10 +134,12 @@ async def _run_subscriber(
     client = PulseClient(
         address=addr, xpub_address=xpub_addr,
         serializer=ser, compressor=comp, identity=identity,
-        heartbeat_interval=30.0, recv_timeout=5.0,
+        heartbeat_interval=30.0, recv_timeout=2.0,
         auto_reconnect=False,
     )
     await client.connect()
+    # 提升 SUB socket 缓冲区（默认 RCVHWM=1000 太小）
+    client._sub.setsockopt(zmq.RCVHWM, 5_000_000)
 
     # 清空 DEALER 缓冲区中可能残留的消息
     try:

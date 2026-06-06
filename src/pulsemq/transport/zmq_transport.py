@@ -47,6 +47,9 @@ class ZmqTransport:
         self._xpub = self._ctx.socket(zmq.XPUB)
         self._xpub.setsockopt(zmq.SNDHWM, self._config.zmq_sndhwm)
         self._xpub.setsockopt(zmq.IMMEDIATE, 1)
+        # SNDHWM=0 时不能设置 XPUB_NODROP（会阻塞发送方）
+        if self._config.zmq_sndhwm != 0:
+            self._xpub.setsockopt(zmq.XPUB_NODROP, 1)
         self._xpub.bind(self._config.xpub_bind)
         logger.info("XPUB 绑定到 %s", self._config.xpub_bind)
 
@@ -69,13 +72,17 @@ class ZmqTransport:
             raise RuntimeError("Transport 未启动")
         await self._xpub.send_multipart(frames)
 
-    async def stop(self) -> None:
-        """关闭 ZMQ socket 和 context。"""
+    async def stop(self, linger_ms: int = 2000) -> None:
+        """关闭 ZMQ socket 和 context。
+
+        Args:
+            linger_ms: 关闭前等待在途消息发送的时间（毫秒）
+        """
         if self._router is not None:
-            self._router.close(linger=0)
+            self._router.close(linger=linger_ms)
             self._router = None
         if self._xpub is not None:
-            self._xpub.close(linger=0)
+            self._xpub.close(linger=linger_ms)
             self._xpub = None
         if self._ctx is not None:
             self._ctx.term()

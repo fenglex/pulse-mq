@@ -32,9 +32,9 @@ def setup():
     )
     # 默认注册一个 admin 用户
     user = AuthUser(user_id=1, role="admin", groups=[], api_key="key", namespace="")
-    router.register_connection(b"pub_client", user)
-    router.register_connection(b"sub_client", user)
-    router.register_connection(b"client", user)
+    # 测试场景下开启缓冲，以验证 append_message 逻辑
+    router.buffer_enabled = True
+    # 连接管理已委托给 AuthMemoryStore，此处无 pipeline，无需注册
     return handlers, sent, broadcast_frames
 
 

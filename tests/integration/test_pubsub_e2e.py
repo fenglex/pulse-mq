@@ -38,6 +38,7 @@ async def broker_config():
 async def running_broker(broker_config):
     transport = ZmqTransport(broker_config)
     router = MessageRouter()
+    router.buffer_enabled = True  # 测试场景下开启缓冲
     sent_messages: list[tuple[bytes, list[bytes]]] = []
     broadcast_messages: list[list[bytes]] = []
 
@@ -124,6 +125,7 @@ class TestPubSubE2E:
     async def test_real_zmq_pubsub(self, broker_config):
         transport = ZmqTransport(broker_config)
         router = MessageRouter()
+        router.buffer_enabled = True  # 测试场景下开启缓冲
 
         async def send_fn(identity, frames):
             await transport.send(identity, frames)

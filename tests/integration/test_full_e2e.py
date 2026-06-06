@@ -48,6 +48,7 @@ class TestFullIntegration:
 
         # 组装完整 Server（与 PulseServer 相同逻辑）
         router = MessageRouter()
+        router.buffer_enabled = True  # 测试场景下开启缓冲
         realtime = RealtimeMetrics()
         monitor = MonitorInterceptor(realtime_metrics=realtime)
         auth_store = AuthMemoryStore()
