@@ -83,10 +83,17 @@ await client.publish(topic, bytes_data, format="none", compression=comp)
 
 ### SUB 端解码说明
 
-- SUB 客户端固定用 `msgpack` 序列化器（PulseClient 默认行为）
-- pyarrow/raw 发送的消息在 SUB 端解码可能失败（payload=None）
-- 解码失败不影响吞吐量统计（帧仍然收到，计入接收数）
-- **记录解码失败次数**，作为后续修复依据
+PulseClient 的 `_decode_message` 固定使用 `msgpack+none` 解码（`_DEFAULT_SER / _DEFAULT_COMP`），不从帧 meta 中提取实际 ser/comp。因此：
+
+| 发布组合 | SUB 解码结果 |
+|----------|-------------|
+| msgpack + none | ✅ 成功，payload 为 dict |
+| msgpack + snappy/lz4/zstd | ❌ 失败，未先解压就用 msgpack 反序列化 |
+| pyarrow + * | ❌ 失败，用 msgpack 反序列化 pyarrow IPC |
+| raw + * | ❌ 失败，用 msgpack 反序列化原始 bytes |
+
+- 解码失败不影响吞吐量统计（ZMQ 帧仍然收到，计入接收数）
+- **记录解码失败次数**，作为后续修复依据（PulseClient 应从 frame meta 提取 ser/comp）
 
 ## Broker 配置
 
@@ -114,8 +121,6 @@ BrokerConfig(
 PulseClient(
     address=f"tcp://localhost:{port}",
     xpub_address=f"tcp://localhost:{port + 1}",
-    serializer=...,              # 与测试单元匹配
-    compressor=...,              # 与测试单元匹配
     heartbeat_interval=30.0,     # 长间隔，避免干扰
     recv_timeout=5.0,
     auto_reconnect=False,        # 不重连
@@ -132,14 +137,22 @@ SUB socket 额外设置：`zmq.RCVHWM = 5_000_000`
 | 接收吞吐 (rec/s) | recv_count / recv_elapsed |
 | 丢包率 (%) | 1 - recv_count / send_count |
 | Payload 大小 (B) | 首条消息编码后字节 |
-| 延迟 p50/p99 (μs) | SUB 端采样，每 1000 条采 1 次（通过 `_send_ts` 计算） |
 | 解码失败数 | SUB 端 payload=None 的次数 |
 
 ## 延迟采样
 
-- PUB 端每 1000 条消息，在 payload 中嵌入 `_send_ts = time.time()`
-- SUB 端每收 1000 条，检查 payload 中 `_send_ts`，计算 `(recv_time - _send_ts) * 1_000_000`
-- 最终排序计算 p50 / p99
+SUB 端解码限制导致 `_send_ts` 方案只在 msgpack+none 组合可用。采用**帧级别延迟**方案替代：
+
+- SUB 端直接从 PulseClient 内部 `_sub` socket 收原始帧（绕过 `_decode_message`）
+- 不依赖 payload 解码，帧到达即记录时间戳
+- 使用 **消息序号** 关联 PUB/SUB 端：
+  - PUB 每发送 N 条（N=1000），记录一次 `(seq, monotonic_ts)`
+  - SUB 每收到 N 帧，记录一次 `(seq, monotonic_ts)`
+  - 匹配相同 seq 的 PUB/SUB 时间戳，计算差值即为端到端延迟
+
+该方案适用于所有 20 种组合，不受 ser/comp 影响。
+
+采样频率：每 1000 条（单条/raw）或每 50 批（批量模式 500 批 → 10 个样本）采样一次。
 
 ## 终端输出
 
@@ -153,13 +166,12 @@ SUB socket 额外设置：`zmq.RCVHWM = 5_000_000`
 
 ### 矩阵汇总
 
-跑完全部 20 组后，打印 5 张矩阵表格：
+跑完全部 20 组后，打印 4 张矩阵表格：
 
 1. **发送吞吐 (records/s)**
 2. **接收吞吐 (records/s)**
 3. **丢包率 (%)**
 4. **Payload 大小 (bytes)**
-5. **延迟 P50 / P99 (μs)**
 
 ```
 ■ 发送吞吐 (records/s)
@@ -189,6 +201,6 @@ python scripts/bench_1m.py [--port PORT] [--records N]
 
 ## 已知限制
 
-1. SUB 端默认 msgpack 解码，pyarrow/raw 消息的 payload 会解码失败，记录失败数待后续修复
-2. 批量模式下 500 次发送采样的延迟样本较少（最多 500 个），p99 统计精度有限
+1. SUB 端默认 msgpack+none 解码，非 msgpack+none 组合的 payload 会解码失败（已记录失败数，待 PulseClient 修复从 frame meta 提取 ser/comp）
+2. 批量模式下延迟采样点较少（500 批中每 50 批采样 → 10 个样本），统计精度有限
 3. 20 组测试串行执行，每组约 3-10 分钟（取决于硬件），总时间约 1-3 小时
