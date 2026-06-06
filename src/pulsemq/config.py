@@ -34,8 +34,8 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
 
 
 @dataclass
-class BrokerConfig:
-    """Broker 全部配置项，全部有合理默认值。"""
+class ServerConfig:
+    """服务端全部配置项，全部有合理默认值。"""
 
     # 传输层
     transport: str = "zmq"
@@ -79,13 +79,13 @@ class BrokerConfig:
     metrics_bind: str = "0.0.0.0:9090"
 
 
-def load_config(config_dict: dict | None = None) -> BrokerConfig:
+def load_config(config_dict: dict | None = None) -> ServerConfig:
     """加载配置：环境变量覆盖默认值，config_dict 覆盖环境变量。
 
     Args:
         config_dict: 从 TOML 配置文件解析的字典（Phase 1 暂不实现文件解析）。
     """
-    cfg = BrokerConfig()
+    cfg = ServerConfig()
 
     # 环境变量覆盖默认值
     for env_key, (field_name, type_fn) in _ENV_MAP.items():
@@ -100,7 +100,7 @@ def load_config(config_dict: dict | None = None) -> BrokerConfig:
     return cfg
 
 
-def _apply_dict(cfg: BrokerConfig, d: dict) -> None:
+def _apply_dict(cfg: ServerConfig, d: dict) -> None:
     """递归应用字典到配置对象。"""
     for section_key, section_val in d.items():
         if isinstance(section_val, dict):

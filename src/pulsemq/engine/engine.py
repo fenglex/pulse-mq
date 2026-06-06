@@ -15,7 +15,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from pulsemq.config import BrokerConfig
+from pulsemq.config import ServerConfig
 from pulsemq.engine.handlers import MessageHandlers
 from pulsemq.engine.overload import DualBuffer
 from pulsemq.engine.pipeline import PipelineContext
@@ -48,7 +48,7 @@ class Engine:
         self,
         transport: ZmqTransport,
         handlers: MessageHandlers,
-        config: BrokerConfig,
+        config: ServerConfig,
     ):
         self._transport = transport
         self._handlers = handlers

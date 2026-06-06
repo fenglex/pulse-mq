@@ -55,7 +55,7 @@ class BufferedMessage:
     record_count: int             # 本条消息携带的数据行数（≥1）
     meta: bytes                   # Frame 3 的 2 字节
     payload: bytes                # Frame 5 的序列化+压缩后的 payload
-    timestamp: float              # Broker 接收时间
+    timestamp: float              # 服务端接收时间
 
 
 @dataclass

@@ -12,7 +12,7 @@ from typing import Awaitable, Callable
 import zmq
 import zmq.asyncio
 
-from pulsemq.config import BrokerConfig
+from pulsemq.config import ServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class ZmqTransport:
     """ZMQ 传输层，管理 ROUTER + XPUB 两个 socket。"""
 
-    def __init__(self, config: BrokerConfig):
+    def __init__(self, config: ServerConfig):
         self._config = config
         self._ctx: zmq.asyncio.Context | None = None
         self._router: zmq.asyncio.Socket | None = None

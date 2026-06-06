@@ -18,7 +18,7 @@
   - [3.2 优雅停止](#32-优雅停止)
   - [3.3 运行时属性](#33-运行时属性)
   - [3.4 CLI 入口](#34-cli-入口)
-- [4. 配置 — BrokerConfig](#4-配置--brokerconfig)
+- [4. 配置 — ServerConfig](#4-配置--服务端config)
   - [4.1 配置项一览](#41-配置项一览)
   - [4.2 环境变量覆盖](#42-环境变量覆盖)
   - [4.3 加载配置](#43-加载配置)
@@ -62,7 +62,7 @@ pip install pulsemq
 pip install pulsemq[pyarrow]
 ```
 
-### 启动 Broker
+### 启动 服务端
 
 ```python
 import asyncio
@@ -111,9 +111,9 @@ asyncio.run(main())
 
 ```python
 PulseClient(
-    address: str,                          # Broker ROUTER 地址
+    address: str,                          # 服务端 ROUTER 地址
     api_key: str | None = None,            # API Key（认证用）
-    xpub_address: str | None = None,       # Broker XPUB 地址（默认自动推导）
+    xpub_address: str | None = None,       # 服务端 XPUB 地址（默认自动推导）
     auto_reconnect: bool = True,           # 自动重连
     reconnect_initial_delay: float = 1.0,  # 重连初始延迟（秒）
     reconnect_max_delay: float = 30.0,     # 重连最大延迟（秒）
@@ -129,7 +129,7 @@ PulseClient(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `address` | `str` | 必填 | Broker ROUTER socket 地址，如 `"tcp://localhost:5555"` |
+| `address` | `str` | 必填 | 服务端 ROUTER socket 地址，如 `"tcp://localhost:5555"` |
 | `api_key` | `str \| None` | `None` | 用户 API Key，用于 ZAP 认证 |
 | `xpub_address` | `str \| None` | `None` | XPUB 广播地址，默认将 ROUTER 端口 5555 替换为 5556 |
 | `auto_reconnect` | `bool` | `True` | 连接断开时自动重连（指数退避） |
@@ -138,7 +138,7 @@ PulseClient(
 
 #### `connect() → None`
 
-建立到 Broker 的连接，创建 DEALER + SUB socket。
+建立到 服务端 的连接，创建 DEALER + SUB socket。
 
 ```python
 client = PulseClient("tcp://localhost:5555")
@@ -393,7 +393,7 @@ async for msg in client.subscribe("topic"):
 ### 3.1 启动服务
 
 ```python
-server = PulseServer(config)  # config 为 BrokerConfig 实例
+server = PulseServer(config)  # config 为 ServerConfig 实例
 await server.start()
 ```
 
@@ -437,16 +437,16 @@ main()  # 或命令行 pulse-mq
 
 ---
 
-## 4. 配置 — BrokerConfig
+## 4. 配置 — ServerConfig
 
-> 模块路径: `pulsemq.config.BrokerConfig`
-> 顶层导出: `from pulsemq import BrokerConfig, load_config`
+> 模块路径: `pulsemq.config.ServerConfig`
+> 顶层导出: `from pulsemq import ServerConfig, load_config`
 
 ### 4.1 配置项一览
 
 ```python
 @dataclass
-class BrokerConfig:
+class ServerConfig:
     # 传输层
     transport: str = "zmq"                    # 传输协议（当前仅支持 zmq）
     bind: str = "tcp://*:5555"                # ROUTER 绑定地址
@@ -543,7 +543,7 @@ pulse-mq
 ### 4.3 加载配置
 
 ```python
-from pulsemq.config import load_config, BrokerConfig
+from pulsemq.config import load_config, ServerConfig
 
 # 使用默认值 + 环境变量覆盖
 config = load_config()
@@ -552,7 +552,7 @@ config = load_config()
 config = load_config({"bind": "tcp://*:6000", "max_concurrency": 200})
 
 # 直接构造
-config = BrokerConfig(bind="tcp://*:6000", auth_enabled=False)
+config = ServerConfig(bind="tcp://*:6000", auth_enabled=False)
 ```
 
 ---
@@ -1072,7 +1072,7 @@ class BufferedMessage:
     record_count: int      # 数据行数
     meta: bytes            # Frame 3 的 2 字节
     payload: bytes         # 序列化+压缩后的 payload
-    timestamp: float       # Broker 接收时间
+    timestamp: float       # 服务端 接收时间
 ```
 
 ### ExpandedPermissions

@@ -11,7 +11,7 @@ from pulsemq.client.async_client import (
     PulseTimeoutError,
     PulseServerError,
 )
-from pulsemq.config import BrokerConfig, load_config
+from pulsemq.config import ServerConfig, load_config
 
 __all__ = [
     "PulseServer",
@@ -23,6 +23,6 @@ __all__ = [
     "PulsePermissionError",
     "PulseTimeoutError",
     "PulseServerError",
-    "BrokerConfig",
+    "ServerConfig",
     "load_config",
 ]

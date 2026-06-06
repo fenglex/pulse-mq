@@ -4,7 +4,7 @@
 
 **Goal:** 重写 `scripts/bench_1m.py`，使用 PulseClient 高级 API 覆盖 5 种数据形态 × 4 种压缩 = 20 个测试单元的 PUB 吞吐基准测试。
 
-**Architecture:** 单文件自包含脚本。每测试单元独立启动 Broker → SUB 客户端接收 → PUB 客户端发送 100 万记录 → 采集指标 → 关闭 Broker。终端输出进度 + 4 张矩阵表格。
+**Architecture:** 单文件自包含脚本。每测试单元独立启动 服务端 → SUB 客户端接收 → PUB 客户端发送 100 万记录 → 采集指标 → 关闭 服务端。终端输出进度 + 4 张矩阵表格。
 
 **Tech Stack:** Python 3.12+, asyncio, pyzmq, msgpack, pyarrow, pandas, numpy
 
@@ -50,7 +50,7 @@ import pandas as pd
 import zmq
 
 from pulsemq.client.async_client import PulseClient
-from pulsemq.config import BrokerConfig
+from pulsemq.config import ServerConfig
 from pulsemq.event_loop import install_event_loop
 from pulsemq.protocol.frames import FrameCodec
 from pulsemq.server import PulseServer
@@ -170,13 +170,13 @@ class CellResult:
 
 
 # ---------------------------------------------------------------------------
-# Broker 生命周期
+# 服务端 生命周期
 # ---------------------------------------------------------------------------
 
 
-async def start_broker(port: int) -> tuple[PulseServer, asyncio.Task]:
-    """启动独立 Broker。"""
-    config = BrokerConfig(
+async def start_server(port: int) -> tuple[PulseServer, asyncio.Task]:
+    """启动独立 服务端。"""
+    config = ServerConfig(
         bind=f"tcp://*:{port}",
         xpub_bind=f"tcp://*:{port + 1}",
         auth_enabled=False,
@@ -195,8 +195,8 @@ async def start_broker(port: int) -> tuple[PulseServer, asyncio.Task]:
     return server, task
 
 
-async def stop_broker(server: PulseServer, task: asyncio.Task) -> None:
-    """停止 Broker。"""
+async def stop_server(server: PulseServer, task: asyncio.Task) -> None:
+    """停止 服务端。"""
     try:
         server._engine._running = False
         server._running = False
@@ -270,8 +270,8 @@ async def run_cell(
         n_sends = total_records
     result.send_frames = n_sends
 
-    # 1. 启动 Broker
-    server, broker_task = await start_broker(port)
+    # 1. 启动 服务端
+    server, 服务端_task = await start_server(port)
 
     try:
         # 2. SUB 客户端
@@ -384,8 +384,8 @@ async def run_cell(
     except Exception as e:
         print(f"错误: {e}")
     finally:
-        # 关闭 Broker
-        await stop_broker(server, broker_task)
+        # 关闭 服务端
+        await stop_server(server, 服务端_task)
 
     return result
 

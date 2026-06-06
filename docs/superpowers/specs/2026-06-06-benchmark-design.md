@@ -5,7 +5,7 @@
 ## 概述
 
 - **目标**：100 万条记录为基准，测量 PulseMQ 在所有序列化×压缩×数据形态组合下的 PUB 吞吐性能
-- **方式**：自包含脚本，自动启动/关闭独立 Broker
+- **方式**：自包含脚本，自动启动/关闭独立 服务端
 - **接口**：使用 PulseClient 高级 API（publish/subscribe）
 - **输出**：终端矩阵表格
 
@@ -28,13 +28,13 @@
 
 ## 测试单元流程
 
-每个测试单元独立运行，拥有独立的 Broker 实例：
+每个测试单元独立运行，拥有独立的 服务端 实例：
 
 ```
-1. start_broker(port)                           — 启动独立 Broker
+1. start_server(port)                           — 启动独立 服务端
 2. SUB 客户端连接 → subscribe(topic)            — 异步接收循环启动
 3. sleep(0.5)                                   — 等待订阅生效
-4. PUB 客户端连接                               — 连接同一 Broker
+4. PUB 客户端连接                               — 连接同一 服务端
 5. 发送 1 条诊断消息                             — 确认 SUB 能收到
 6. ─── 计时开始 ───
 7. PUB 循环发送 100 万记录                       — 每 1000 条采样 _send_ts
@@ -42,7 +42,7 @@
 9. 等待 SUB 接收完毕（最多 60s）                  — 或收齐全部消息
 10. 记录 recv_count, recv_elapsed               — SUB 端统计
 11. 关闭 PUB/SUB 客户端
-12. stop_broker()                               — 关闭 Broker
+12. stop_server()                               — 关闭 服务端
 ```
 
 ### 数据模型 — A 股行情快照
@@ -95,10 +95,10 @@ PulseClient 的 `_decode_message` 固定使用 `msgpack+none` 解码（`_DEFAULT
 - 解码失败不影响吞吐量统计（ZMQ 帧仍然收到，计入接收数）
 - **记录解码失败次数**，作为后续修复依据（PulseClient 应从 frame meta 提取 ser/comp）
 
-## Broker 配置
+## 服务端 配置
 
 ```python
-BrokerConfig(
+ServerConfig(
     bind=f"tcp://*:{port}",
     xpub_bind=f"tcp://*:{port + 1}",
     auth_enabled=False,          # 关闭认证，减少干扰

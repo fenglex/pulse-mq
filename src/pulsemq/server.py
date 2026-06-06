@@ -1,4 +1,4 @@
-"""Broker 启动器：组装各层并启动消息主循环。"""
+"""服务端启动器：组装各层并启动消息主循环。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import zmq
 from pulsemq.auth.memory_store import AuthMemoryStore
 from pulsemq.auth.permission import PermissionService
 from pulsemq.auth.zap_handler import PulseMQZAPHandler
-from pulsemq.config import BrokerConfig, load_config
+from pulsemq.config import ServerConfig, load_config
 from pulsemq.engine.engine import Engine
 from pulsemq.engine.handlers import MessageHandlers
 from pulsemq.engine.pipeline import (
@@ -42,9 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 class PulseServer:
-    """PulseMQ Broker 服务器。"""
+    """PulseMQ 服务端。"""
 
-    def __init__(self, config: BrokerConfig | None = None):
+    def __init__(self, config: ServerConfig | None = None):
         self._config = config or load_config()
         self._router = MessageRouter()
 
@@ -109,7 +109,7 @@ class PulseServer:
         self._running = False
 
     async def start(self) -> None:
-        """启动 Broker。"""
+        """启动服务端。"""
         logger.info("事件循环: %s", type(asyncio.get_event_loop()).__name__)
 
         await self._transport.start()
@@ -126,7 +126,7 @@ class PulseServer:
             await self._minute_aggregator.start()
 
         logger.info(
-            "PulseMQ Broker 启动: ROUTER=%s, XPUB=%s",
+            "PulseMQ 服务端启动: ROUTER=%s, XPUB=%s",
             self._config.bind, self._config.xpub_bind,
         )
 
@@ -142,7 +142,7 @@ class PulseServer:
         )
 
     async def stop(self) -> None:
-        """优雅停止 Broker：停止接收 → drain 缓冲 → 关闭传输。"""
+        """优雅停止服务端：停止接收 → drain 缓冲 → 关闭传输。"""
         self._running = False
         # 先停止引擎（等待后台任务完成）
         await self._engine.stop()
@@ -156,7 +156,7 @@ class PulseServer:
         await self._transport.stop(linger_ms=2000)
         if self._db_conn:
             self._db_conn.close()
-        logger.info("PulseMQ Broker 已停止")
+        logger.info("PulseMQ 服务端已停止")
 
     async def _event_loop(self) -> None:
         """监听 ZMQ 连接/断开事件，管理认证和资源清理。"""

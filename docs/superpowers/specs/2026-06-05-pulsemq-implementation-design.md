@@ -83,7 +83,7 @@ pulse-mq/
 
 ### Phase 1: 基础骨架
 
-**目标**: 能跑通 PUB → SUB 端到端的最小 Broker。
+**目标**: 能跑通 PUB → SUB 端到端的最小 服务端。
 
 **包含模块**:
 1. 项目初始化（pyproject.toml、依赖声明）
@@ -99,11 +99,11 @@ pulse-mq/
 
 **不包含**: 认证、权限、通配符、批处理、背压、监控、客户端 SDK。
 
-**验证标准**: 两个测试客户端通过 ZMQ DEALER 连接 Broker，一个 PUB 消息，另一个 SUB 后收到 BROADCAST。
+**验证标准**: 两个测试客户端通过 ZMQ DEALER 连接 服务端，一个 PUB 消息，另一个 SUB 后收到 BROADCAST。
 
 ### Phase 2: 认证与权限
 
-**目标**: 带认证和权限校验的 Broker。
+**目标**: 带认证和权限校验的 服务端。
 
 **包含模块**:
 1. `storage/interfaces.py` — Repository ABC
@@ -136,7 +136,7 @@ pulse-mq/
 
 ### Phase 4: 高级功能
 
-**目标**: 功能完整的 Broker。
+**目标**: 功能完整的 服务端。
 
 **包含模块**:
 1. `engine/message_buffer.py` — 环形缓冲区（1000 条/topic）+ 序列号

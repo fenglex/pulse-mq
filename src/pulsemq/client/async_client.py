@@ -127,7 +127,7 @@ class PulseClient:
     # ---- 连接管理 ----
 
     async def connect(self) -> None:
-        """连接到 Broker。"""
+        """连接到服务端。"""
         self._ctx = zmq.asyncio.Context()
 
         # DEALER socket 用于发送消息

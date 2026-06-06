@@ -22,11 +22,13 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import zmq
+import zmq.asyncio
 
 from pulsemq.client.async_client import PulseClient
-from pulsemq.config import BrokerConfig
+from pulsemq.config import ServerConfig
 from pulsemq.event_loop import install_event_loop
 from pulsemq.protocol.frames import FrameCodec
+from pulsemq.protocol.msg_type import MsgType
 from pulsemq.server import PulseServer
 
 # ---------------------------------------------------------------------------
@@ -110,7 +112,6 @@ class CellResult:
     total_records: int = 0
     send_frames: int = 0
     recv_frames: int = 0
-    decode_fails: int = 0
     send_elapsed: float = 0.0
     recv_elapsed: float = 0.0
     payload_size: int = 0
@@ -144,13 +145,13 @@ class CellResult:
 
 
 # ---------------------------------------------------------------------------
-# Broker 生命周期
+# 服务端生命周期
 # ---------------------------------------------------------------------------
 
 
-async def start_broker(port: int) -> tuple[PulseServer, asyncio.Task]:
-    """启动独立 Broker。"""
-    config = BrokerConfig(
+async def start_server(port: int) -> tuple[PulseServer, asyncio.Task]:
+    """启动独立服务端。"""
+    config = ServerConfig(
         bind=f"tcp://*:{port}",
         xpub_bind=f"tcp://*:{port + 1}",
         auth_enabled=False,
@@ -169,8 +170,8 @@ async def start_broker(port: int) -> tuple[PulseServer, asyncio.Task]:
     return server, task
 
 
-async def stop_broker(server: PulseServer, task: asyncio.Task) -> None:
-    """停止 Broker。"""
+async def stop_server(server: PulseServer, task: asyncio.Task) -> None:
+    """停止服务端。"""
     try:
         server._engine._running = False
         server._running = False
@@ -186,20 +187,6 @@ async def stop_broker(server: PulseServer, task: asyncio.Task) -> None:
     try:
         server._transport._context.term()
     except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# DEALER 排空
-# ---------------------------------------------------------------------------
-
-
-async def drain_dealer(client: PulseClient, timeout: float = 0.05) -> None:
-    """排空 DEALER 残留消息。"""
-    try:
-        while True:
-            await asyncio.wait_for(client._dealer.recv_multipart(), timeout=timeout)
-    except (asyncio.TimeoutError, Exception):
         pass
 
 
@@ -229,7 +216,10 @@ async def run_cell(
     port: int,
     total_records: int,
 ) -> CellResult:
-    """运行单个测试单元。"""
+    """运行单个测试单元。
+
+    PUB 端使用 PulseClient API，SUB 端使用原始 ZMQ SUB socket 避免解码开销。
+    """
     result = CellResult(
         data_shape=data_shape, comp=comp, total_records=total_records,
     )
@@ -244,42 +234,52 @@ async def run_cell(
         n_sends = total_records
     result.send_frames = n_sends
 
-    # 1. 启动 Broker
-    server, broker_task = await start_broker(port)
+    # 1. 启动服务端
+    server, server_task = await start_server(port)
 
     try:
-        # 2. SUB 客户端
-        sub_client = PulseClient(
-            address=f"tcp://localhost:{port}",
-            xpub_address=f"tcp://localhost:{port + 1}",
-            heartbeat_interval=30.0,
-            recv_timeout=5.0,
-            auto_reconnect=False,
-            identity=f"bench_sub_{cell_idx}".encode(),
-        )
-        await sub_client.connect()
-        sub_client._sub.setsockopt(zmq.RCVHWM, 5_000_000)
+        # 2. SUB 端：原始 ZMQ SUB socket + DEALER 注册
+        sub_ctx = zmq.asyncio.Context()
+        sub_sock = sub_ctx.socket(zmq.SUB)
+        sub_sock.setsockopt(zmq.RCVHWM, 5_000_000)
+        sub_sock.connect(f"tcp://localhost:{port + 1}")
+        sub_sock.setsockopt(zmq.SUBSCRIBE, topic.encode())
 
-        # 3. 接收协程
+        # DEALER 用于 SUB 注册（让服务端知道订阅关系）
+        sub_dealer = sub_ctx.socket(zmq.DEALER)
+        sub_dealer.setsockopt(zmq.IDENTITY, f"bench_sub_{cell_idx}".encode())
+        sub_dealer.connect(f"tcp://localhost:{port}")
+        await asyncio.sleep(0.3)
+
+        sub_frames = FrameCodec.encode(MsgType.SUB, topic, 0, b"")
+        await sub_dealer.send_multipart(sub_frames)
+        try:
+            await asyncio.wait_for(sub_dealer.recv_multipart(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(0.3)
+
+        # 3. SUB 接收协程（原始帧计数，不做解码，不用 wait_for 减少开销）
         recv_count = [0]
-        decode_fails = [0]
         recv_start = [0.0]
         recv_done = asyncio.Event()
 
         async def recv_loop():
             recv_start[0] = time.monotonic()
-            async for msg in sub_client.subscribe(topic):
-                recv_count[0] += 1
-                if msg.payload is None:
-                    decode_fails[0] += 1
-                if recv_count[0] >= n_sends:
-                    break
+            try:
+                while recv_count[0] < n_sends:
+                    await sub_sock.recv_multipart()
+                    recv_count[0] += 1
+            except zmq.ZMQError:
+                pass
+            except asyncio.CancelledError:
+                pass
             recv_done.set()
 
         recv_task = asyncio.create_task(recv_loop())
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
 
-        # 4. PUB 客户端
+        # 4. PUB 客户端（PulseClient）
         pub_client = PulseClient(
             address=f"tcp://localhost:{port}",
             xpub_address=f"tcp://localhost:{port + 1}",
@@ -289,7 +289,14 @@ async def run_cell(
             identity=f"bench_pub_{cell_idx}".encode(),
         )
         await pub_client.connect()
-        await drain_dealer(pub_client)
+        # 排空 DEALER 中 服务端推送的 AUTH 消息
+        try:
+            while True:
+                await asyncio.wait_for(
+                    pub_client._dealer.recv_multipart(), timeout=0.05
+                )
+        except (asyncio.TimeoutError, Exception):
+            pass
 
         # 5. 计算 payload 大小
         if data_shape == "single_raw":
@@ -323,18 +330,27 @@ async def run_cell(
 
             await pub_client.publish(topic, data, format=ser, compression=comp)
 
+            # 每 1000 次主动 yield，防止事件循环饥饿
+            if i > 0 and i % 1000 == 0:
+                await asyncio.sleep(0)
+
         result.send_elapsed = time.monotonic() - t0
 
-        # 排空 PUB DEALER（ACK 等）
-        await drain_dealer(pub_client)
+        # 排空 PUB DEALER
+        try:
+            while True:
+                await asyncio.wait_for(
+                    pub_client._dealer.recv_multipart(), timeout=0.05
+                )
+        except (asyncio.TimeoutError, Exception):
+            pass
 
-        # 7. 等待 SUB 接收完成
-        deadline = time.monotonic() + 60
+        # 7. 等待 SUB 接收完成（超时通过 task cancel 处理）
+        deadline = time.monotonic() + 300
         while not recv_done.is_set() and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
 
         result.recv_frames = recv_count[0]
-        result.decode_fails = decode_fails[0]
         result.recv_elapsed = time.monotonic() - recv_start[0]
 
         # 取消未完成的接收协程
@@ -345,21 +361,19 @@ async def run_cell(
             except (asyncio.CancelledError, Exception):
                 pass
 
-        # 8. 断开客户端
+        # 8. 断开
         try:
             await pub_client.disconnect()
         except Exception:
             pass
-        try:
-            await sub_client.disconnect()
-        except Exception:
-            pass
+        sub_dealer.close(linger=0)
+        sub_sock.close(linger=0)
+        sub_ctx.term()
 
     except Exception as e:
         print(f"错误: {e}")
     finally:
-        # 关闭 Broker
-        await stop_broker(server, broker_task)
+        await stop_server(server, server_task)
 
     return result
 

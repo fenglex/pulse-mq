@@ -1,7 +1,7 @@
 """PulseMQ 实时压测脚本。
 
 启动方式:
-    # 终端 1: 启动 Broker
+    # 终端 1: 启动服务端
     pulse-mq
 
     # 终端 2: 运行压测（默认 10w 条，2 个订阅者，全格式矩阵）
@@ -266,7 +266,7 @@ def print_header(args, combos):
     print("=" * 62)
     print("  PulseMQ Live Benchmark")
     print("=" * 62)
-    print(f"  Broker:     {args.addr}")
+    print(f"  服务端:     {args.addr}")
     print(f"  Messages:   {args.msgs:,} per combo")
     print(f"  Clients:    {args.clients} subscribers")
     print(f"  Topic:      {args.topic}.<ser>.<comp>")
