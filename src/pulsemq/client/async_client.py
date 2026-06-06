@@ -29,23 +29,23 @@ class PulseError(Exception):
     pass
 
 
-class ConnectionError(PulseError):
+class PulseConnectionError(PulseError):
     pass
 
 
-class AuthError(PulseError):
+class PulseAuthError(PulseError):
     pass
 
 
-class PermissionError(PulseError):
+class PulsePermissionError(PulseError):
     pass
 
 
-class TimeoutError(PulseError):
+class PulseTimeoutError(PulseError):
     pass
 
 
-class ServerError(PulseError):
+class PulseServerError(PulseError):
     def __init__(self, code: int, message: str):
         self.code = code
         self.message = message
@@ -80,6 +80,10 @@ class PulseClient:
                 print(msg)
     """
 
+    # 内部默认序列化/压缩（subscribe/query/ping 使用）
+    _DEFAULT_SER = "msgpack"
+    _DEFAULT_COMP = "none"
+
     def __init__(
         self,
         address: str,
@@ -92,8 +96,6 @@ class PulseClient:
         heartbeat_interval: float = 10.0,
         recv_timeout: float = 5.0,
         connect_timeout: float = 5.0,
-        serializer: str = "msgpack",
-        compressor: str = "none",
         identity: bytes | None = None,
     ):
         self._address = address
@@ -106,8 +108,6 @@ class PulseClient:
         self._heartbeat_interval = heartbeat_interval
         self._recv_timeout = recv_timeout
         self._connect_timeout = connect_timeout
-        self._serializer = serializer
-        self._compressor = compressor
         self._identity = identity or f"client_{id(self)}".encode()
 
         self._ctx: zmq.asyncio.Context | None = None
@@ -162,7 +162,7 @@ class PulseClient:
     async def _reconnect(self) -> None:
         """自动重连（指数退避）。"""
         if not self._auto_reconnect:
-            raise ConnectionError("连接断开")
+            raise PulseConnectionError("连接断开")
 
         delay = min(
             self._reconnect_initial_delay * (self._reconnect_backoff ** self._reconnect_count),
@@ -181,63 +181,87 @@ class PulseClient:
         self,
         topic: str,
         data: Any,
-        format: str | None = None,
-        record_count: int = 1,
+        format: str = "msgpack",
+        compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
     ) -> None:
-        """发布消息。fire-and-forget（无响应等待）。
+        """发布消息。
 
         Args:
-            topic: topic 路径
-            data: 消息数据
-            format: 序列化格式（默认用构造时的 serializer）
-            record_count: 数据行数
-            retry: 重试次数
-            retry_delay: 重试间隔（指数退避）
+            topic: topic 路径（必填）
+            data: 消息数据，支持 bytes/str/dict/list[dict]/DataFrame
+            format: 序列化格式，none/msgpack/pyarrow
+            compression: 压缩算法，none/lz4/zstd/snappy
+            retry: 重试次数，默认 0
+            retry_delay: 重试间隔（秒），默认 0.1
         """
-        ser = format or self._serializer
-        payload = FrameCodec.encode_payload(data, ser, self._compressor)
+        data = self._prepare_data(data, format)
+        record_count = self._infer_record_count(data)
+        payload = FrameCodec.encode_payload(data, format, compression)
         frames = FrameCodec.encode(
-            MsgType.PUB, topic, record_count, payload, ser, self._compressor
+            MsgType.PUB, topic, record_count, payload, format, compression
         )
         await self._send_with_retry(frames, retry, retry_delay)
 
     async def publish_batch(
         self,
-        messages: list[tuple[str, Any]],
-        format: str | None = None,
+        messages: list[dict],
+        format: str = "msgpack",
+        compression: str = "none",
+        retry: int = 0,
+        retry_delay: float = 0.1,
     ) -> None:
-        """批量发布。"""
-        for topic, data in messages:
-            await self.publish(topic, data, format=format)
+        """批量发布消息。
+
+        Args:
+            messages: 消息列表，每个元素包含 topic(必填) + data(必填)
+                      + 可选的 format/compression 覆盖
+            format: 全局默认序列化格式
+            compression: 全局默认压缩算法
+            retry: 重试次数
+            retry_delay: 重试间隔（秒）
+        """
+        for msg in messages:
+            await self.publish(
+                topic=msg["topic"],
+                data=msg["data"],
+                format=msg.get("format", format),
+                compression=msg.get("compression", compression),
+                retry=retry,
+                retry_delay=retry_delay,
+            )
 
     # ---- 订阅 ----
 
-    async def subscribe(self, topic: str) -> AsyncIterator[PulseMessage]:
-        """订阅 topic，返回异步迭代器。
+    async def subscribe(self, *topics: str) -> AsyncIterator[PulseMessage]:
+        """订阅一个或多个 topic，返回异步迭代器。
 
         用法:
             async for msg in client.subscribe("team-a.mkt.*"):
                 print(msg.topic, msg.payload)
+
+            # 多 topic 订阅
+            async for msg in client.subscribe("topic-a", "topic-b", "team-a.>"):
+                print(msg.topic, msg.payload)
         """
         if self._sub is None:
-            raise ConnectionError("未连接")
+            raise PulseConnectionError("未连接")
 
-        # 先注册 ZMQ SUB 订阅（必须在 SUB 请求之前，否则会错过广播）
-        self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+        # 注册 ZMQ SUB 订阅 + 发送 SUB 请求
+        for topic in topics:
+            self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+            sub_frames = FrameCodec.encode(MsgType.SUB, topic, 0, b"")
+            await self._dealer.send_multipart(sub_frames)
 
-        # 发送 SUB 请求
-        sub_frames = FrameCodec.encode(MsgType.SUB, topic, 0, b"")
-        await self._dealer.send_multipart(sub_frames)
-
-        # 等待 SUB 确认
-        try:
-            reply = await asyncio.wait_for(
-                self._dealer.recv_multipart(), timeout=self._recv_timeout
-            )
-        except asyncio.TimeoutError:
-            pass  # 超时不阻塞
+        # 等待所有 SUB 确认
+        for _ in topics:
+            try:
+                await asyncio.wait_for(
+                    self._dealer.recv_multipart(), timeout=self._recv_timeout
+                )
+            except asyncio.TimeoutError:
+                pass  # 超时不阻塞
 
         # 消息循环
         while self._connected:
@@ -255,7 +279,8 @@ class PulseClient:
             except zmq.ZMQError:
                 if self._auto_reconnect:
                     await self._reconnect()
-                    self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+                    for topic in topics:
+                        self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
                 else:
                     break
 
@@ -269,9 +294,9 @@ class PulseClient:
 
     async def query(self, params: dict) -> dict:
         """发送管理查询。"""
-        payload = FrameCodec.encode_payload(params, self._serializer, self._compressor)
+        payload = FrameCodec.encode_payload(params, self._DEFAULT_SER, self._DEFAULT_COMP)
         frames = FrameCodec.encode(
-            MsgType.QUERY, "", 0, payload, self._serializer, self._compressor
+            MsgType.QUERY, "", 0, payload, self._DEFAULT_SER, self._DEFAULT_COMP
         )
         await self._dealer.send_multipart(frames)
 
@@ -279,7 +304,7 @@ class PulseClient:
             self._dealer.recv_multipart(), timeout=self._recv_timeout
         )
         if len(reply) >= 4:
-            return FrameCodec.decode_payload(reply[3], self._serializer, self._compressor)
+            return FrameCodec.decode_payload(reply[3], self._DEFAULT_SER, self._DEFAULT_COMP)
         return {}
 
     # ---- 心跳 ----
@@ -288,10 +313,10 @@ class PulseClient:
         """发送 PING，返回延迟信息。"""
         ts = time.time()
         payload = FrameCodec.encode_payload(
-            {"client_ts": ts}, self._serializer, self._compressor
+            {"client_ts": ts}, self._DEFAULT_SER, self._DEFAULT_COMP
         )
         frames = FrameCodec.encode(
-            MsgType.PING, "", 0, payload, self._serializer, self._compressor
+            MsgType.PING, "", 0, payload, self._DEFAULT_SER, self._DEFAULT_COMP
         )
         await self._dealer.send_multipart(frames)
 
@@ -299,10 +324,35 @@ class PulseClient:
             self._dealer.recv_multipart(), timeout=self._recv_timeout
         )
         if len(reply) >= 4:
-            return FrameCodec.decode_payload(reply[3], self._serializer, self._compressor)
+            return FrameCodec.decode_payload(reply[3], self._DEFAULT_SER, self._DEFAULT_COMP)
         return {}
 
     # ---- 内部方法 ----
+
+    @staticmethod
+    def _infer_record_count(data: Any) -> int:
+        """根据 data 类型推断 record_count。
+
+        DataFrame 按实际行数，其余都算 1 条。
+        """
+        try:
+            import pandas as pd
+            if isinstance(data, pd.DataFrame):
+                return len(data)
+        except ImportError:
+            pass
+        return 1
+
+    @staticmethod
+    def _prepare_data(data: Any, format: str) -> Any:
+        """预处理 data，处理 str 类型转换和 format 校验。"""
+        if format == "none" and not isinstance(data, bytes):
+            if isinstance(data, str):
+                return data.encode("utf-8")
+            raise TypeError(
+                f"format='none' 只接受 bytes 或 str 类型数据，收到 {type(data).__name__}"
+            )
+        return data
 
     async def _send_with_retry(
         self, frames: list[bytes], retry: int, retry_delay: float
@@ -319,7 +369,7 @@ class PulseClient:
                     if self._auto_reconnect:
                         await self._reconnect()
                 else:
-                    raise ConnectionError("发送失败，重试耗尽")
+                    raise PulseConnectionError("发送失败，重试耗尽")
 
     def _decode_message(self, frames: list[bytes]) -> PulseMessage | None:
         """解码 SUB 收到的广播消息。"""
@@ -332,7 +382,7 @@ class PulseClient:
             # 解码 payload
             try:
                 payload = FrameCodec.decode_payload(
-                    payload_bytes, self._serializer, self._compressor
+                    payload_bytes, self._DEFAULT_SER, self._DEFAULT_COMP
                 )
             except Exception:
                 payload = None
