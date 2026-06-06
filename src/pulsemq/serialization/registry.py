@@ -81,6 +81,13 @@ def _init_builtins() -> None:
 
     SerializationRegistry.register("msgpack", MsgpackSerializer())
     SerializationRegistry.register("raw", RawSerializer())
+    SerializationRegistry.register("none", RawSerializer())  # none 别名，等价 raw
+
+    try:
+        from pulsemq.serialization.pyarrow_ser import PyArrowSerializer
+        SerializationRegistry.register("pyarrow", PyArrowSerializer())
+    except ImportError:
+        pass  # pyarrow 未安装，跳过
 
     from pulsemq.serialization.compressors import (
         NoneCompressor,
