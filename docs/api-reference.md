@@ -121,8 +121,6 @@ PulseClient(
     heartbeat_interval: float = 10.0,      # 心跳间隔（秒）
     recv_timeout: float = 5.0,             # 接收超时（秒）
     connect_timeout: float = 5.0,          # 连接超时（秒）
-    serializer: str = "msgpack",           # 默认序列化格式
-    compressor: str = "none",              # 默认压缩算法
     identity: bytes | None = None,         # ZMQ identity（默认自动生成）
 )
 ```
@@ -135,8 +133,6 @@ PulseClient(
 | `api_key` | `str \| None` | `None` | 用户 API Key，用于 ZAP 认证 |
 | `xpub_address` | `str \| None` | `None` | XPUB 广播地址，默认将 ROUTER 端口 5555 替换为 5556 |
 | `auto_reconnect` | `bool` | `True` | 连接断开时自动重连（指数退避） |
-| `serializer` | `str` | `"msgpack"` | 默认序列化格式: `"msgpack"`, `"raw"`, `"pyarrow"` |
-| `compressor` | `str` | `"none"` | 默认压缩算法: `"none"`, `"snappy"`, `"lz4"`, `"zstd"` |
 
 ### 2.2 连接管理
 
@@ -180,24 +176,30 @@ delay = min(initial_delay * (backoff ^ n), max_delay)
 
 ### 2.3 发布消息
 
-#### `publish(topic, data, format=None, record_count=1, retry=0, retry_delay=0.1) → None`
+#### `publish(topic, data, format="msgpack", compression="none", retry=0, retry_delay=0.1) → None`
 
-发布一条消息（fire-and-forget，不等待响应）。
+发布一条消息（fire-and-forget，不等待响应）。`record_count` 根据 `data` 类型自动推断，无需手动指定。
 
 ```python
 # 发布 dict 数据
 await client.publish("team-a.mkt.sh.600000", {"price": 10.5, "volume": 1000})
 
+# 透传 bytes
+await client.publish("topic", b"\x01\x02\x03", format="none")
+
+# 透传 string
+await client.publish("topic", "hello world", format="none")
+
 # 指定序列化格式和压缩
-await client.publish("topic", data, format="pyarrow", compressor="zstd")
+await client.publish("topic", data, format="pyarrow", compression="lz4")
 
 # 带重试（最多 3 次，指数退避）
 await client.publish("topic", data, retry=3, retry_delay=0.5)
 
-# DataFrame 批量发布（需安装 pyarrow）
+# DataFrame 发布（record_count 自动推断为行数）
 import pandas as pd
 df = pd.DataFrame({"price": [10.5, 11.0], "volume": [100, 200]})
-await client.publish("topic", df, format="pyarrow", record_count=len(df))
+await client.publish("topic", df, format="pyarrow")
 ```
 
 **参数:**
@@ -205,23 +207,60 @@ await client.publish("topic", df, format="pyarrow", record_count=len(df))
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `topic` | `str` | 必填 | Topic 路径，如 `"team-a.mkt.sh.600000"` |
-| `data` | `Any` | 必填 | 消息数据，可以是 dict、DataFrame、bytes 等 |
-| `format` | `str \| None` | `None` | 序列化格式，为 None 时使用构造时的 `serializer` |
-| `record_count` | `int` | `1` | 数据行数 |
+| `data` | `bytes \| str \| dict \| list[dict] \| DataFrame` | 必填 | 消息数据 |
+| `format` | `str` | `"msgpack"` | 序列化格式: `"none"` / `"msgpack"` / `"pyarrow"` |
+| `compression` | `str` | `"none"` | 压缩算法: `"none"` / `"lz4"` / `"zstd"` / `"snappy"` |
 | `retry` | `int` | `0` | 发送失败重试次数 |
-| `retry_delay` | `float` | `0.1` | 重试间隔（指数退避基数） |
+| `retry_delay` | `float` | `0.1` | 重试间隔（指数退避基数，秒） |
 
-#### `publish_batch(messages, format=None) → None`
+**`record_count` 自动推断规则:**
 
-批量发布多条消息。
+| `data` 类型 | `record_count` | 说明 |
+|-------------|----------------|------|
+| `DataFrame` | `len(df)` | 按实际行数 |
+| `dict` | `1` | |
+| `list[dict]` | `1` | 整体作为一条消息 |
+| `str` | `1` | |
+| `bytes` | `1` | |
+
+**`format` 格式说明:**
+
+| format | 说明 |
+|--------|------|
+| `"msgpack"` | 默认格式，支持 dict / list[dict] / str |
+| `"pyarrow"` | Arrow IPC 格式，支持 DataFrame / dict（自动转 1 行表） |
+| `"none"` | 直接透传 bytes，`data` 必须是 `bytes` 或 `str`（自动 encode） |
+
+#### `publish_batch(messages, format="msgpack", compression="none", retry=0, retry_delay=0.1) → None`
+
+批量发布多条消息。每条消息可单独覆盖外层默认参数。
 
 ```python
-await client.publish_batch([
-    ("topic-a", {"price": 10.5}),
-    ("topic-b", {"price": 20.0}),
-    ("topic-c", {"price": 30.0}),
-])
+await client.publish_batch(
+    messages=[
+        {"topic": "topic-a", "data": {"price": 10.5}},
+        {"topic": "topic-b", "data": {"price": 20.0}},
+        {
+            "topic": "topic-c",
+            "data": df,
+            "format": "pyarrow",       # 覆盖外层 format
+            "compression": "lz4",      # 覆盖外层 compression
+        },
+    ],
+    format="msgpack",
+    compression="none",
+)
 ```
+
+**参数:**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `messages` | `list[dict]` | 必填 | 消息列表，每个元素包含 `topic`(必填) + `data`(必填) + 可选的 `format`/`compression` 覆盖 |
+| `format` | `str` | `"msgpack"` | 全局默认序列化格式 |
+| `compression` | `str` | `"none"` | 全局默认压缩算法 |
+| `retry` | `int` | `0` | 重试次数 |
+| `retry_delay` | `float` | `0.1` | 重试间隔（秒） |
 
 ### 2.4 订阅消息
 
@@ -559,6 +598,7 @@ info = get_event_loop_info()
 |------|-----|----------|------|
 | `"msgpack"` | `MsgpackSerializer` | dict, list, str, int, float, bytes | 二进制 JSON 格式，通用性最佳 |
 | `"raw"` | `RawSerializer` | bytes | 纯字节透传，不做任何序列化 |
+| `"none"` | `RawSerializer` | bytes | `"raw"` 的别名，用于 `format="none"` 透传 |
 | `"pyarrow"` | `PyArrowSerializer` | pa.Table, pd.DataFrame, dict | Arrow IPC 流格式，DataFrame 高效传输 |
 
 ### 6.2 SerializationRegistry API
