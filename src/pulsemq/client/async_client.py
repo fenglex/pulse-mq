@@ -75,10 +75,15 @@ class PulseClient:
 
     使用方式:
         async with PulseClient("tcp://localhost:5555", api_key="pulse_sk_xxx") as client:
-            await client.publish("topic", {"data": 1})
+            await client.publish("topic", "hello")
+            await client.publish("topic", df, format="pyarrow")
             async for msg in client.subscribe("topic"):
                 print(msg)
     """
+
+    # 大小限制（压缩前）
+    _MAX_STR_SIZE = 16 * 1024 * 1024     # 16MB
+    _MAX_BYTES_SIZE = 128 * 1024 * 1024  # 128MB
 
     # 内部默认序列化/压缩（subscribe/query/ping 使用）
     _DEFAULT_SER = "msgpack"
@@ -181,33 +186,39 @@ class PulseClient:
         self,
         topic: str,
         data: Any,
-        format: str = "str",
+        format: str = "msgpack",
         compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
     ) -> None:
         """发布消息。
 
+        三种数据类型，自动推断序列化方式：
+          - str       → StringSerializer (UTF-8)，限制 ≤ 16MB
+          - bytes     → BytesSerializer (透传)，限制 ≤ 128MB
+          - DataFrame → msgpack 或 pyarrow（通过 format 指定）
+
         Args:
             topic: topic 路径（必填）
-            data: 消息数据，支持 bytes/str/dict/list[dict]/DataFrame
-            format: 序列化格式，str/msgpack/pyarrow/bytes
-            compression: 压缩算法，none/lz4/zstd/snappy
+            data: 消息数据，支持 str/bytes/DataFrame
+            format: DataFrame 传输格式，"msgpack"（默认）/"pyarrow"
+            compression: 压缩算法，none/snappy/lz4/zstd
             retry: 重试次数，默认 0
             retry_delay: 重试间隔（秒），默认 0.1
         """
-        data = self._prepare_data(data, format)
+        ser_fmt = self._resolve_format(data, format)
+        self._validate_data(data, ser_fmt)
         record_count = self._infer_record_count(data)
-        payload = FrameCodec.encode_payload(data, format, compression)
+        payload = FrameCodec.encode_payload(data, ser_fmt, compression)
         frames = FrameCodec.encode(
-            MsgType.PUB, topic, record_count, payload, format, compression
+            MsgType.PUB, topic, record_count, payload, ser_fmt, compression
         )
         await self._send_with_retry(frames, retry, retry_delay)
 
     async def publish_batch(
         self,
         messages: list[dict],
-        format: str = "str",
+        format: str = "msgpack",
         compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
@@ -217,7 +228,7 @@ class PulseClient:
         Args:
             messages: 消息列表，每个元素包含 topic(必填) + data(必填)
                       + 可选的 format/compression 覆盖
-            format: 全局默认序列化格式
+            format: DataFrame 默认传输格式
             compression: 全局默认压缩算法
             retry: 重试次数
             retry_delay: 重试间隔（秒）
@@ -330,6 +341,31 @@ class PulseClient:
     # ---- 内部方法 ----
 
     @staticmethod
+    def _resolve_format(data: Any, format: str) -> str:
+        """根据 data 类型自动推断序列化格式。
+
+        str → "str"，bytes → "bytes"，DataFrame → format 参数（msgpack/pyarrow）。
+        """
+        if isinstance(data, str):
+            return "str"
+        if isinstance(data, bytes):
+            return "bytes"
+        # DataFrame 检查
+        try:
+            import pandas as pd
+            if isinstance(data, pd.DataFrame):
+                if format not in ("msgpack", "pyarrow"):
+                    raise ValueError(
+                        f"DataFrame 的 format 只支持 msgpack/pyarrow，收到 '{format}'"
+                    )
+                return format
+        except ImportError:
+            pass
+        raise TypeError(
+            f"data 类型不支持: {type(data).__name__}，仅支持 str/bytes/DataFrame"
+        )
+
+    @staticmethod
     def _infer_record_count(data: Any) -> int:
         """根据 data 类型推断 record_count。
 
@@ -343,16 +379,19 @@ class PulseClient:
             pass
         return 1
 
-    @staticmethod
-    def _prepare_data(data: Any, format: str) -> Any:
-        """预处理 data，处理 str 类型转换和 format 校验。"""
-        if format == "bytes" and not isinstance(data, bytes):
-            if isinstance(data, str):
-                return data.encode("utf-8")
-            raise TypeError(
-                f"format='bytes' 只接受 bytes 或 str 类型数据，收到 {type(data).__name__}"
-            )
-        return data
+    @classmethod
+    def _validate_data(cls, data: Any, ser_fmt: str) -> None:
+        """校验数据大小限制（压缩前）。"""
+        if ser_fmt == "str":
+            if isinstance(data, str) and len(data.encode("utf-8")) > cls._MAX_STR_SIZE:
+                raise ValueError(
+                    f"str 消息超过大小限制: {len(data.encode('utf-8')):,} > {cls._MAX_STR_SIZE:,} bytes"
+                )
+        elif ser_fmt == "bytes":
+            if isinstance(data, bytes) and len(data) > cls._MAX_BYTES_SIZE:
+                raise ValueError(
+                    f"bytes 消息超过大小限制: {len(data):,} > {cls._MAX_BYTES_SIZE:,} bytes"
+                )
 
     async def _send_with_retry(
         self, frames: list[bytes], retry: int, retry_delay: float

@@ -2,7 +2,6 @@
 """PulseMQ 全参数 PUB 基准测试 — 数据形态 × 序列化 × 压缩。
 
 20 个测试单元（5 data_shape × 4 compression）:
-  single_msgpack, batch_msgpack, single_pyarrow, batch_pyarrow, single_bytes
   × none, snappy, lz4, zstd
 
 每组 100 万条记录为基准，批量模式每批 2000 条。
@@ -40,7 +39,6 @@ DATA_SHAPES = [
     "batch_msgpack",
     "single_pyarrow",
     "batch_pyarrow",
-    "single_bytes",
 ]
 COMPS = ["none", "snappy", "lz4", "zstd"]
 BATCH_SIZE = 2000
@@ -299,11 +297,13 @@ async def run_cell(
             pass
 
         # 5. 计算 payload 大小
-        if data_shape == "single_bytes":
             sample_data = _RAW_BYTES
-        elif is_batch:
+        elif data_shape == "single_bytes":
+                data = _RAW_BYTES
+                _fmt = "bytes"
+            elif is_batch:
             sample_df = gen_batch_df(0, BATCH_SIZE)
-            if ser == "msgpack":
+            if True:
                 sample_data = sample_df.to_dict(orient="records")
             else:
                 sample_data = sample_df
@@ -319,16 +319,19 @@ async def run_cell(
         for i in range(n_sends):
             if data_shape == "single_bytes":
                 data = _RAW_BYTES
+                _fmt = "bytes"
             elif is_batch:
                 df = gen_batch_df(i * BATCH_SIZE, BATCH_SIZE)
                 if ser == "msgpack":
                     data = df.to_dict(orient="records")
                 else:
                     data = df
+                _fmt = ser
             else:
                 data = gen_single_dict(i)
+                _fmt = "msgpack"
 
-            await pub_client.publish(topic, data, format=ser, compression=comp)
+            await pub_client.publish(topic, data, format=_fmt, compression=comp)
 
             # 每 1000 次主动 yield，防止事件循环饥饿
             if i > 0 and i % 1000 == 0:
