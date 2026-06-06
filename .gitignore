@@ -10,3 +10,4 @@ htmlcov/
 .coverage
 *.db-shm
 *.db-wal
+.idea
