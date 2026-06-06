@@ -16,6 +16,7 @@ _SER_MAP: dict[str, int] = {
     "bytes": 0b001,
     "pyarrow": 0b010,
     "protobuf": 0b011,
+    "str": 0b100,
 }
 _SER_MAP_REV: dict[int, str] = {v: k for k, v in _SER_MAP.items()}
 

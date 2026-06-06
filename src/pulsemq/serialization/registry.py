@@ -1,6 +1,6 @@
 """序列化与压缩：注册表 + 内置实现。
 
-序列化器：MsgpackSerializer、PyArrowSerializer、BytesSerializer
+序列化器：StringSerializer、MsgpackSerializer、PyArrowSerializer、BytesSerializer
 压缩器：NoneCompressor、SnappyCompressor、Lz4Compressor、ZstdCompressor
 """
 
@@ -38,6 +38,23 @@ class Compressor(ABC):
 # ---------------------------------------------------------------------------
 # 序列化器实现
 # ---------------------------------------------------------------------------
+
+
+class StringSerializer(Serializer):
+    """字符串序列化：str ↔ UTF-8 bytes 互转。
+
+    默认序列化格式，适用于文本消息、JSON 字符串等场景。
+    """
+
+    def serialize(self, obj: Any) -> bytes:
+        if isinstance(obj, str):
+            return obj.encode("utf-8")
+        if isinstance(obj, bytes):
+            return obj
+        raise TypeError(f"str 序列化只接受 str 或 bytes，收到 {type(obj).__name__}")
+
+    def deserialize(self, data: bytes) -> str:
+        return data.decode("utf-8")
 
 
 class MsgpackSerializer(Serializer):
@@ -219,6 +236,7 @@ class CompressionRegistry:
 
 def _init_builtins() -> None:
     """注册内置序列化器和压缩器。"""
+    SerializationRegistry.register("str", StringSerializer())
     SerializationRegistry.register("msgpack", MsgpackSerializer())
     SerializationRegistry.register("bytes", BytesSerializer())
     SerializationRegistry.register("none", BytesSerializer())  # none 别名，等价 bytes

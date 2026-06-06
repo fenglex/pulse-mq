@@ -181,7 +181,7 @@ class PulseClient:
         self,
         topic: str,
         data: Any,
-        format: str = "msgpack",
+        format: str = "str",
         compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
@@ -191,7 +191,7 @@ class PulseClient:
         Args:
             topic: topic 路径（必填）
             data: 消息数据，支持 bytes/str/dict/list[dict]/DataFrame
-            format: 序列化格式，none/msgpack/pyarrow
+            format: 序列化格式，str/msgpack/pyarrow/bytes
             compression: 压缩算法，none/lz4/zstd/snappy
             retry: 重试次数，默认 0
             retry_delay: 重试间隔（秒），默认 0.1
@@ -207,7 +207,7 @@ class PulseClient:
     async def publish_batch(
         self,
         messages: list[dict],
-        format: str = "msgpack",
+        format: str = "str",
         compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
