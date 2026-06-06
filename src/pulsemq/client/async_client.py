@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
 import msgpack
+import pandas as pd
 import zmq
 import zmq.asyncio
 
@@ -185,8 +186,8 @@ class PulseClient:
     async def publish(
         self,
         topic: str,
-        data: Any,
-        format: str = "msgpack",
+        data: str | bytes | pd.DataFrame,
+        format: str | None = None,
         compression: str = "none",
         retry: int = 0,
         retry_delay: float = 0.1,
@@ -196,12 +197,13 @@ class PulseClient:
         三种数据类型，自动推断序列化方式：
           - str       → StringSerializer (UTF-8)，限制 ≤ 16MB
           - bytes     → BytesSerializer (透传)，限制 ≤ 128MB
-          - DataFrame → msgpack 或 pyarrow（通过 format 指定）
+          - DataFrame → msgpack 或 pyarrow（通过 format 指定，默认 msgpack）
 
         Args:
             topic: topic 路径（必填）
-            data: 消息数据，支持 str/bytes/DataFrame
-            format: DataFrame 传输格式，"msgpack"（默认）/"pyarrow"
+            data: 消息数据，支持 str / bytes / pandas.DataFrame
+            format: 仅 DataFrame 时生效，"msgpack"（默认）/"pyarrow"；
+                    传 str 或 bytes 时必须为 None
             compression: 压缩算法，none/snappy/lz4/zstd
             retry: 重试次数，默认 0
             retry_delay: 重试间隔（秒），默认 0.1
@@ -214,34 +216,6 @@ class PulseClient:
             MsgType.PUB, topic, record_count, payload, ser_fmt, compression
         )
         await self._send_with_retry(frames, retry, retry_delay)
-
-    async def publish_batch(
-        self,
-        messages: list[dict],
-        format: str = "msgpack",
-        compression: str = "none",
-        retry: int = 0,
-        retry_delay: float = 0.1,
-    ) -> None:
-        """批量发布消息。
-
-        Args:
-            messages: 消息列表，每个元素包含 topic(必填) + data(必填)
-                      + 可选的 format/compression 覆盖
-            format: DataFrame 默认传输格式
-            compression: 全局默认压缩算法
-            retry: 重试次数
-            retry_delay: 重试间隔（秒）
-        """
-        for msg in messages:
-            await self.publish(
-                topic=msg["topic"],
-                data=msg["data"],
-                format=msg.get("format", format),
-                compression=msg.get("compression", compression),
-                retry=retry,
-                retry_delay=retry_delay,
-            )
 
     # ---- 订阅 ----
 
@@ -341,26 +315,26 @@ class PulseClient:
     # ---- 内部方法 ----
 
     @staticmethod
-    def _resolve_format(data: Any, format: str) -> str:
+    def _resolve_format(data: Any, format: str | None) -> str:
         """根据 data 类型自动推断序列化格式。
 
-        str → "str"，bytes → "bytes"，DataFrame → format 参数（msgpack/pyarrow）。
+        str → "str"，bytes → "bytes"，DataFrame → format 参数（默认 msgpack）。
         """
         if isinstance(data, str):
+            if format is not None:
+                raise ValueError("data 为 str 时 format 必须为 None")
             return "str"
         if isinstance(data, bytes):
+            if format is not None:
+                raise ValueError("data 为 bytes 时 format 必须为 None")
             return "bytes"
-        # DataFrame 检查
-        try:
-            import pandas as pd
-            if isinstance(data, pd.DataFrame):
-                if format not in ("msgpack", "pyarrow"):
-                    raise ValueError(
-                        f"DataFrame 的 format 只支持 msgpack/pyarrow，收到 '{format}'"
-                    )
-                return format
-        except ImportError:
-            pass
+        if isinstance(data, pd.DataFrame):
+            _fmt = format or "msgpack"
+            if _fmt not in ("msgpack", "pyarrow"):
+                raise ValueError(
+                    f"DataFrame 的 format 只支持 msgpack/pyarrow，收到 '{_fmt}'"
+                )
+            return _fmt
         raise TypeError(
             f"data 类型不支持: {type(data).__name__}，仅支持 str/bytes/DataFrame"
         )
@@ -371,12 +345,8 @@ class PulseClient:
 
         DataFrame 按实际行数，其余都算 1 条。
         """
-        try:
-            import pandas as pd
-            if isinstance(data, pd.DataFrame):
-                return len(data)
-        except ImportError:
-            pass
+        if isinstance(data, pd.DataFrame):
+            return len(data)
         return 1
 
     @classmethod

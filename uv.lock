@@ -663,46 +663,42 @@ wheels = [
 
 [[package]]
 name = "pulse-mq"
-version = "0.1.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
+    { name = "lz4" },
     { name = "msgpack" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyarrow" },
+    { name = "python-snappy" },
     { name = "pyzmq" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
+    { name = "zstandard" },
 ]
 
 [package.optional-dependencies]
-compress = [
-    { name = "lz4" },
-    { name = "python-snappy" },
-    { name = "zstandard" },
-]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
 ]
-pyarrow = [
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pyarrow" },
-]
 
 [package.metadata]
 requires-dist = [
-    { name = "lz4", marker = "extra == 'compress'", specifier = ">=4.0" },
+    { name = "lz4", specifier = ">=4.0" },
     { name = "msgpack", specifier = ">=1.0" },
-    { name = "pandas", marker = "extra == 'pyarrow'", specifier = ">=2.0" },
-    { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=14.0" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "pyarrow", specifier = ">=14.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.0" },
-    { name = "python-snappy", marker = "extra == 'compress'", specifier = ">=0.7" },
+    { name = "python-snappy", specifier = ">=0.7" },
     { name = "pyzmq", specifier = ">=26.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.19" },
-    { name = "zstandard", marker = "extra == 'compress'", specifier = ">=0.22" },
+    { name = "zstandard", specifier = ">=0.22" },
 ]
-provides-extras = ["compress", "pyarrow", "dev"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "pyarrow"
