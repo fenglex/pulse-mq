@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **高性能** — 基于 ZeroMQ 异步 I/O，支持 uvloop 加速（Linux/macOS）
+- **高性能** — 基于 ZeroMQ 异步 I/O
 - **Pub/Sub 模式** — 支持 topic 通配符匹配（`*` 单段、`>` 多段）
 - **三层消息模型** — `str`（文本/JSON）、`bytes`（二进制透传）、`DataFrame`（结构化数据）
 - **多种序列化** — String、Msgpack、PyArrow IPC、Bytes
@@ -17,22 +17,13 @@
 
 ## 安装
 
+> 要求 Python >= 3.13
+
 ```bash
 pip install pulsemq
 ```
 
-可选依赖：
-
-```bash
-# 压缩支持（Snappy / LZ4 / Zstandard）
-pip install pulsemq[compress]
-
-# PyArrow + Pandas 支持（DataFrame 序列化）
-pip install pulsemq[pyarrow]
-
-# 开发工具（pytest）
-pip install pulsemq[dev]
-```
+包含全部依赖：压缩（Snappy / LZ4 / Zstandard）、序列化（Msgpack / PyArrow / Pandas）均开箱即用。
 
 ## 快速开始
 
