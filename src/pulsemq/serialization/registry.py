@@ -1,9 +1,18 @@
-"""序列化和压缩的注册表模式。"""
+"""序列化与压缩：注册表 + 内置实现。
+
+序列化器：MsgpackSerializer、PyArrowSerializer、BytesSerializer
+压缩器：NoneCompressor、SnappyCompressor、Lz4Compressor、ZstdCompressor
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from io import BytesIO
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# 抽象接口
+# ---------------------------------------------------------------------------
 
 
 class Serializer(ABC):
@@ -24,6 +33,135 @@ class Compressor(ABC):
 
     @abstractmethod
     def decompress(self, data: bytes) -> bytes: ...
+
+
+# ---------------------------------------------------------------------------
+# 序列化器实现
+# ---------------------------------------------------------------------------
+
+
+class MsgpackSerializer(Serializer):
+    """msgpack 二进制序列化。"""
+
+    def serialize(self, obj: Any) -> bytes:
+        import msgpack
+        return msgpack.packb(obj, use_bin_type=True)
+
+    def deserialize(self, data: bytes) -> Any:
+        import msgpack
+        return msgpack.unpackb(data, raw=False)
+
+
+class PyArrowSerializer(Serializer):
+    """PyArrow IPC 流式序列化。
+
+    支持输入类型:
+      - pa.Table / pd.DataFrame → 序列化为 Arrow IPC stream
+      - dict (单条) → 自动转为 1 行 pa.Table 再序列化
+    """
+
+    def serialize(self, obj: Any) -> bytes:
+        import pyarrow as pa
+
+        if isinstance(obj, pa.Table):
+            table = obj
+        else:
+            import pandas as pd
+
+            if isinstance(obj, pd.DataFrame):
+                table = pa.Table.from_pandas(obj, preserve_index=False)
+            elif isinstance(obj, dict):
+                df = pd.DataFrame([obj])
+                table = pa.Table.from_pandas(df, preserve_index=False)
+            else:
+                import msgpack
+                return msgpack.packb(obj, use_bin_type=True)
+
+        sink = BytesIO()
+        writer = pa.ipc.new_stream(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+        return sink.getvalue()
+
+    def deserialize(self, data: bytes) -> Any:
+        import pyarrow as pa
+        reader = pa.ipc.open_stream(BytesIO(data))
+        table = reader.read_all()
+        return table
+
+
+class BytesSerializer(Serializer):
+    """纯字节透传，不做任何序列化。仅接受 bytes 类型。"""
+
+    def serialize(self, obj: Any) -> bytes:
+        if not isinstance(obj, bytes):
+            raise TypeError(f"bytes 序列化只接受 bytes，收到 {type(obj).__name__}")
+        return obj
+
+    def deserialize(self, data: bytes) -> bytes:
+        return data
+
+
+# ---------------------------------------------------------------------------
+# 压缩器实现
+# ---------------------------------------------------------------------------
+
+
+class NoneCompressor(Compressor):
+    """不压缩，直接透传。"""
+
+    def compress(self, data: bytes) -> bytes:
+        return data
+
+    def decompress(self, data: bytes) -> bytes:
+        return data
+
+
+class SnappyCompressor(Compressor):
+    """Google Snappy 极速压缩。"""
+
+    def __init__(self):
+        import snappy
+        self._snappy = snappy
+
+    def compress(self, data: bytes) -> bytes:
+        return self._snappy.compress(data)
+
+    def decompress(self, data: bytes) -> bytes:
+        return self._snappy.decompress(data)
+
+
+class Lz4Compressor(Compressor):
+    """LZ4 极速压缩/解压。"""
+
+    def __init__(self):
+        import lz4.frame
+        self._lz4_frame = lz4.frame
+
+    def compress(self, data: bytes) -> bytes:
+        return self._lz4_frame.compress(data)
+
+    def decompress(self, data: bytes) -> bytes:
+        return self._lz4_frame.decompress(data)
+
+
+class ZstdCompressor(Compressor):
+    """Facebook Zstandard 高压缩比。"""
+
+    def __init__(self):
+        import zstandard as zstd
+        self._zstd = zstd
+
+    def compress(self, data: bytes) -> bytes:
+        return self._zstd.compress(data)
+
+    def decompress(self, data: bytes) -> bytes:
+        return self._zstd.decompress(data)
+
+
+# ---------------------------------------------------------------------------
+# 注册表
+# ---------------------------------------------------------------------------
 
 
 class SerializationRegistry:
@@ -74,27 +212,21 @@ class CompressionRegistry:
         return name in cls._compressors
 
 
+# ---------------------------------------------------------------------------
+# 自动注册内置实现
+# ---------------------------------------------------------------------------
+
+
 def _init_builtins() -> None:
     """注册内置序列化器和压缩器。"""
-    from pulsemq.serialization.msgpack_ser import MsgpackSerializer
-    from pulsemq.serialization.raw_ser import RawSerializer
-
     SerializationRegistry.register("msgpack", MsgpackSerializer())
-    SerializationRegistry.register("raw", RawSerializer())
-    SerializationRegistry.register("none", RawSerializer())  # none 别名，等价 raw
+    SerializationRegistry.register("bytes", BytesSerializer())
+    SerializationRegistry.register("none", BytesSerializer())  # none 别名，等价 bytes
 
     try:
-        from pulsemq.serialization.pyarrow_ser import PyArrowSerializer
         SerializationRegistry.register("pyarrow", PyArrowSerializer())
     except ImportError:
         pass  # pyarrow 未安装，跳过
-
-    from pulsemq.serialization.compressors import (
-        NoneCompressor,
-        SnappyCompressor,
-        Lz4Compressor,
-        ZstdCompressor,
-    )
 
     CompressionRegistry.register("none", NoneCompressor())
     CompressionRegistry.register("snappy", SnappyCompressor())

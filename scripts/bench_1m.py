@@ -2,7 +2,7 @@
 """PulseMQ 全参数 PUB 基准测试 — 数据形态 × 序列化 × 压缩。
 
 20 个测试单元（5 data_shape × 4 compression）:
-  single_msgpack, batch_msgpack, single_pyarrow, batch_pyarrow, single_raw
+  single_msgpack, batch_msgpack, single_pyarrow, batch_pyarrow, single_bytes
   × none, snappy, lz4, zstd
 
 每组 100 万条记录为基准，批量模式每批 2000 条。
@@ -40,7 +40,7 @@ DATA_SHAPES = [
     "batch_msgpack",
     "single_pyarrow",
     "batch_pyarrow",
-    "single_raw",
+    "single_bytes",
 ]
 COMPS = ["none", "snappy", "lz4", "zstd"]
 BATCH_SIZE = 2000
@@ -199,8 +199,8 @@ def _ser_fmt(data_shape: str) -> str:
     """根据 data_shape 返回序列化格式参数。"""
     if "pyarrow" in data_shape:
         return "pyarrow"
-    if "raw" in data_shape:
-        return "none"
+    if "bytes" in data_shape:
+        return "bytes"
     return "msgpack"
 
 
@@ -299,7 +299,7 @@ async def run_cell(
             pass
 
         # 5. 计算 payload 大小
-        if data_shape == "single_raw":
+        if data_shape == "single_bytes":
             sample_data = _RAW_BYTES
         elif is_batch:
             sample_df = gen_batch_df(0, BATCH_SIZE)
@@ -317,7 +317,7 @@ async def run_cell(
         # 6. 发送并计时
         t0 = time.monotonic()
         for i in range(n_sends):
-            if data_shape == "single_raw":
+            if data_shape == "single_bytes":
                 data = _RAW_BYTES
             elif is_batch:
                 df = gen_batch_df(i * BATCH_SIZE, BATCH_SIZE)

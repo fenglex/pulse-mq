@@ -238,7 +238,7 @@ def _ser_fmt(data_shape: str) -> str:
     """根据 data_shape 返回序列化格式参数。"""
     if "pyarrow" in data_shape:
         return "pyarrow"
-    if "raw" in data_shape:
+    if "bytes" in data_shape:
         return "none"
     return "msgpack"
 

@@ -346,11 +346,11 @@ class PulseClient:
     @staticmethod
     def _prepare_data(data: Any, format: str) -> Any:
         """预处理 data，处理 str 类型转换和 format 校验。"""
-        if format == "none" and not isinstance(data, bytes):
+        if format == "bytes" and not isinstance(data, bytes):
             if isinstance(data, str):
                 return data.encode("utf-8")
             raise TypeError(
-                f"format='none' 只接受 bytes 或 str 类型数据，收到 {type(data).__name__}"
+                f"format='bytes' 只接受 bytes 或 str 类型数据，收到 {type(data).__name__}"
             )
         return data
 

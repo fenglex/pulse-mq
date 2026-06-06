@@ -597,8 +597,8 @@ info = get_event_loop_info()
 | 名称 | 类 | 输入类型 | 说明 |
 |------|-----|----------|------|
 | `"msgpack"` | `MsgpackSerializer` | dict, list, str, int, float, bytes | 二进制 JSON 格式，通用性最佳 |
-| `"raw"` | `RawSerializer` | bytes | 纯字节透传，不做任何序列化 |
-| `"none"` | `RawSerializer` | bytes | `"raw"` 的别名，用于 `format="none"` 透传 |
+| `"bytes"` | `BytesSerializer` | bytes | 纯字节透传，不做任何序列化 |
+| `"none"` | `BytesSerializer` | bytes | `"bytes"` 的别名，用于 `format="none"` 透传 |
 | `"pyarrow"` | `PyArrowSerializer` | pa.Table, pd.DataFrame, dict | Arrow IPC 流格式，DataFrame 高效传输 |
 
 ### 6.2 SerializationRegistry API
@@ -607,7 +607,7 @@ info = get_event_loop_info()
 from pulsemq.serialization.registry import SerializationRegistry
 
 # 查询已注册的序列化器
-names = SerializationRegistry.list()       # ["msgpack", "raw", "pyarrow"]
+names = SerializationRegistry.list()       # ["msgpack", "bytes", "pyarrow"]
 has = SerializationRegistry.has("msgpack") # True
 
 # 获取序列化器实例

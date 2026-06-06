@@ -34,7 +34,7 @@ pulse-mq/
 │       │   ├── __init__.py
 │       │   ├── registry.py        # Serializer/Compressor 注册表
 │       │   ├── msgpack_ser.py     # msgpack 序列化器
-│       │   ├── raw_ser.py         # raw 序列化器
+│       │   ├── raw_ser.py         # bytes 序列化器
 │       │   └── compressors.py     # none/snappy/lz4/zstd
 │       ├── transport/
 │       │   ├── __init__.py

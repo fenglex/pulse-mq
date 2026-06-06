@@ -101,7 +101,7 @@ await client.publish_batch(
 | 文件 | 变更 |
 |---|---|
 | `src/pulsemq/client/async_client.py` | 重写 `publish` / `publish_batch`，移除构造函数 `serializer`/`compressor` 参数 |
-| `src/pulsemq/serialization/registry.py` | 注册 `"none"` → `RawSerializer`（别名） |
+| `src/pulsemq/serialization/registry.py` | 注册 `"none"` → `BytesSerializer`（别名） |
 | `tests/unit/test_client.py` | 更新初始化测试，新增 publish 参数推断测试 |
 
 ## 不涉及

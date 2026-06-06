@@ -1,6 +1,6 @@
 """Frame 3 Byte 1 flags bitfield 编解码。
 
-bit[0:2] = 序列化格式 (000=msgpack, 001=raw, 010=pyarrow, 011=protobuf)
+bit[0:2] = 序列化格式 (000=msgpack, 001=bytes, 010=pyarrow, 011=protobuf)
 bit[3:4] = 压缩算法   (00=none, 01=snappy, 10=lz4, 11=zstd)
 bit[5]   = has_topic  (0=无topic, 1=有topic)
 bit[6:7] = reserved
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 # 序列化格式名 → bit[0:2] 编码
 _SER_MAP: dict[str, int] = {
     "msgpack": 0b000,
-    "raw": 0b001,
+    "bytes": 0b001,
     "pyarrow": 0b010,
     "protobuf": 0b011,
 }

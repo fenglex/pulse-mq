@@ -78,7 +78,7 @@ FORMAT_MATRIX: list[tuple[str, str]] = [
     ("msgpack", "snappy"),
     ("msgpack", "lz4"),
     ("msgpack", "zstd"),
-    ("raw", "none"),
+    ("bytes", "none"),
 ]
 
 
@@ -191,7 +191,7 @@ async def _run_publisher(
     try:
         start = time.monotonic()
         for i in range(n_msgs):
-            if ser == "raw":
+            if ser == "bytes":
                 data = b"market_binary_snapshot_data" * 10
             else:
                 snap = _gen_snapshot()
@@ -322,7 +322,7 @@ def parse_args():
     parser.add_argument("--msgs", type=int, default=100_000)
     parser.add_argument("--clients", type=int, default=2)
     parser.add_argument("--topic", default="bench")
-    parser.add_argument("--ser", default="all", choices=["msgpack", "raw", "all"])
+    parser.add_argument("--ser", default="all", choices=["msgpack", "bytes", "all"])
     parser.add_argument("--comp", default="all",
                         choices=["none", "snappy", "lz4", "zstd", "all"])
     parser.add_argument("--timeout", type=float, default=60)

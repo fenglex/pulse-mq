@@ -17,25 +17,25 @@
 
 - [ ] **Step 1: 在 `_init_builtins()` 中注册 `"none"` 别名**
 
-在 `src/pulsemq/serialization/registry.py` 的 `_init_builtins()` 函数中，在注册 `"raw"` 之后添加 `"none"` 别名：
+在 `src/pulsemq/serialization/registry.py` 的 `_init_builtins()` 函数中，在注册 `"bytes"` 之后添加 `"none"` 别名：
 
 ```python
 def _init_builtins() -> None:
     """注册内置序列化器和压缩器。"""
-    from pulsemq.serialization.msgpack_ser import MsgpackSerializer
-    from pulsemq.serialization.raw_ser import RawSerializer
+    from pulsemq.serialization.registry import MsgpackSerializer
+    from pulsemq.serialization.registry import BytesSerializer
 
     SerializationRegistry.register("msgpack", MsgpackSerializer())
-    SerializationRegistry.register("raw", RawSerializer())
-    SerializationRegistry.register("none", RawSerializer())  # none 别名，等价 raw
+    SerializationRegistry.register("bytes", BytesSerializer())
+    SerializationRegistry.register("none", BytesSerializer())  # none 别名，等价 raw
 
     try:
-        from pulsemq.serialization.pyarrow_ser import PyArrowSerializer
+        from pulsemq.serialization.registry import PyArrowSerializer
         SerializationRegistry.register("pyarrow", PyArrowSerializer())
     except ImportError:
         pass  # pyarrow 未安装，跳过
 
-    from pulsemq.serialization.compressors import (
+    from pulsemq.serialization.registry import (
         NoneCompressor,
         SnappyCompressor,
         Lz4Compressor,

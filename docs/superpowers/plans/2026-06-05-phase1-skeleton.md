@@ -731,7 +731,7 @@ class TestFrameFlags:
         assert byte_val == 0b0010_0000
 
     def test_encode_raw(self):
-        flags = FrameFlags(ser_fmt="raw", comp="none", has_topic=False)
+        flags = FrameFlags(ser_fmt="bytes", comp="none", has_topic=False)
         byte_val = flags.encode()
         assert byte_val == 0b0000_0001
 
@@ -765,7 +765,7 @@ class TestFrameFlags:
 
     @pytest.mark.parametrize("ser,comp", [
         ("msgpack", "none"),
-        ("raw", "none"),
+        ("bytes", "none"),
         ("pyarrow", "snappy"),
         ("msgpack", "lz4"),
         ("msgpack", "zstd"),
@@ -804,7 +804,7 @@ from dataclasses import dataclass
 # 序列化格式名 → bit[0:2] 编码
 _SER_MAP: dict[str, int] = {
     "msgpack": 0b000,
-    "raw": 0b001,
+    "bytes": 0b001,
     "pyarrow": 0b010,
     "protobuf": 0b011,
 }
@@ -912,7 +912,7 @@ class TestSerializationRegistry:
         assert decoded == data
 
     def test_builtin_raw(self):
-        ser = SerializationRegistry.get("raw")
+        ser = SerializationRegistry.get("bytes")
         data = b"hello world"
         encoded = ser.serialize(data)
         assert encoded is data
@@ -926,7 +926,7 @@ class TestSerializationRegistry:
     def test_list(self):
         names = SerializationRegistry.list()
         assert "msgpack" in names
-        assert "raw" in names
+        assert "bytes" in names
 
     def test_get_nonexistent_raises(self):
         with pytest.raises(KeyError):
@@ -1073,13 +1073,13 @@ class CompressionRegistry:
 
 def _init_builtins() -> None:
     """注册内置序列化器和压缩器。"""
-    from pulsemq.serialization.msgpack_ser import MsgpackSerializer
-    from pulsemq.serialization.raw_ser import RawSerializer
+    from pulsemq.serialization.registry import MsgpackSerializer
+    from pulsemq.serialization.registry import BytesSerializer
 
     SerializationRegistry.register("msgpack", MsgpackSerializer())
-    SerializationRegistry.register("raw", RawSerializer())
+    SerializationRegistry.register("bytes", BytesSerializer())
 
-    from pulsemq.serialization.compressors import (
+    from pulsemq.serialization.registry import (
         NoneCompressor,
         SnappyCompressor,
         Lz4Compressor,
@@ -1130,12 +1130,12 @@ from typing import Any
 from pulsemq.serialization.registry import Serializer
 
 
-class RawSerializer(Serializer):
+class BytesSerializer(Serializer):
     """不做任何序列化，直接透传 bytes。"""
 
     def serialize(self, obj: Any) -> bytes:
         if not isinstance(obj, bytes):
-            raise TypeError(f"raw 序列化只接受 bytes，收到 {type(obj).__name__}")
+            raise TypeError(f"bytes 序列化只接受 bytes，收到 {type(obj).__name__}")
         return obj
 
     def deserialize(self, data: bytes) -> bytes:
@@ -1333,10 +1333,10 @@ class TestFrameCodec:
     @pytest.mark.parametrize("ser,comp", [
         ("msgpack", "none"),
         ("msgpack", "snappy"),
-        ("raw", "none"),
+        ("bytes", "none"),
     ])
     def test_full_roundtrip(self, ser, comp):
-        data = b"binary data" if ser == "raw" else {"key": "value", "num": 42}
+        data = b"binary data" if ser == "bytes" else {"key": "value", "num": 42}
         payload = FrameCodec.encode_payload(data, ser, comp)
         frames = FrameCodec.encode(MsgType.PUB, "test.topic", 1, payload, ser, comp)
         server_frames = [b"id", b""] + list(frames)
