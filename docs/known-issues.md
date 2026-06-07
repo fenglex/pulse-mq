@@ -46,3 +46,14 @@
 
 - [P3][日期 2026-06-07] I21: `FrameFlags.decode()` 对未知 comp_bits 的"静默回退到 none"防御性代码实际上不可达 — comp_bits 占 2 bits, 范围 0-3 全部对应合法压缩算法 (none/snappy/lz4/zstd), 任何单字节输入都不可能产生未知 comp_bits (flags.py:55-58)。_COMP_MAP_REV.get(bits, "none") 的 default 参数实际上是死代码。验证: `(0xFF >> 3) & 0b11` = 0b11 = "zstd", 已知; `(0x00 >> 3) & 0b11` = 0b00 = "none", 已知; 中间值同理。结论: 静默回退路径只对 ser_bits (3 bits) 有效, 对 comp_bits 是死代码。Task 2 测试已文档化此事实 (test_protocol_flags.py::test_decode_unknown_comp_defaults_to_none)。
 
+## Task 3 审读（serialization/registry.py）
+
+- [P1][日期 2026-06-07] I22: 文档注释说"5 个 serializer" (`StringSerializer/MsgpackSerializer/PyArrowSerializer/BytesSerializer` + 一个 Protobuf), 实际 `_init_builtins()` 只注册 4 个 (str/msgpack/bytes/pyarrow), **未注册 protobuf** (registry.py:1-5, 237-252)。Task 1 审读 flags 时也提到 "未知 ser_fmt 静默回退 msgpack" 风险 (I7), 两者结合: 客户端若错误传 `ser_fmt="protobuf"`, 会被 `FrameFlags.encode()` 静默映射为 msgpack, 数据按 msgpack 编码发出, 接收端按 msgpack 解码 OK (运气), 但用户实际期望 protobuf 行为时毫无反馈。建议: v0.7 添加 ProtobufSerializer + 严格模式 (I7 修复)。
+- [P3][日期 2026-06-07] I23: `_init_builtins()` 用 try/except 静默吞 ImportError 注册 pyarrow (registry.py:244-247) — 优点: pyarrow 缺时不强依赖; 缺点: 用户配 `ser_fmt="pyarrow"` 但环境未装, 会在首次 publish 时才抛 KeyError, 错误信息不直观 ("未注册")。建议: 在模块 import 时 `logger.warning("pyarrow 未安装, 跳过注册")` 至少给用户一个 hint。
+- [P3][日期 2026-06-07] I24: `SerializationRegistry.register("none", BytesSerializer())` 与 `register("bytes", BytesSerializer())` 创建了**两个独立 BytesSerializer 实例** (registry.py:241-242), 行为等价但实例不同。Task 3 测试 `test_registry_ser_none_is_bytes_alias` 验证语义等价 (产出相同) 而非 `is` 同一对象 — 已通过。备注: 不阻塞。
+- [P2][日期 2026-06-07] I25: `StringSerializer.serialize` 接受 str 和 bytes 两种输入 (registry.py:50-54), 文档未明确说明支持 bytes, 用户可能误以为只能传 str。`BytesSerializer.serialize` 只接受 bytes (registry.py:114-116) — 行为不对称: 同样 `b"hello"`, 用 str 序列化器是 noop, 用 bytes 序列化器是 noop, 行为一致; 但用 str 序列化器传 int 抛 TypeError, 文档类型注解 `obj: Any` 太宽松。建议: `StringSerializer.serialize` 改为只接受 str, 或文档显式说明支持 bytes。
+- [P3][日期 2026-06-07] I26: `PyArrowSerializer.serialize` 接受非 Table/DataFrame/dict 时静默回退到 msgpack (registry.py:94-95) — 优点: 不让客户端崩; 缺点: 错误路径不透明, 用户期望 Arrow 但收到 msgpack 时无反馈。建议: 抛 `TypeError` 显式拒绝未知类型。
+- [P2][日期 2026-06-07] I27: `PyArrowSerializer.deserialize` 返回 `pa.Table` (registry.py:107), 类型签名 `-> Any` 弱类型 — 客户端需 `dec.to_pandas()` 才能用, 强类型用户会撞坑。建议: docstring 加 `# Returns: pa.Table` 明确返回类型 (现已有部分说明但未指明 Table 类型)。
+- [P2][日期 2026-06-07] I28: `MsgpackSerializer.serialize` 用 `use_bin_type=True` (registry.py:65), `deserialize` 用 `raw=False` (registry.py:69) — 不对称语义: serialize 把 str 当 bin (bytes), deserialize 把 bin 解为 str (Python 3 默认)。组合下 roundtrip OK, 但若用户单独调用 serialize 拿到的 bytes 再传给第三方解码器, 行为会变 (第三方按 utf-8 解 str)。建议: docstring 注明这一约定。
+- [P2][日期 2026-06-07] I29: 模块顶部 docstring 列的序列化器有 4 个 (`StringSerializer/MsgpackSerializer/PyArrowSerializer/BytesSerializer`) 但类名实际是 `StringSerializer` (而非 `StrSerializer`) — 与 plan 中提到 `StrSerializer` 不一致 (registry.py:3-4)。已修正测试导入, 不阻塞。
+
