@@ -503,20 +503,18 @@ async def test_regen_api_key(admin_env):
 
 
 @pytest.mark.asyncio
-async def test_get_batch_config(admin_env):
+async def test_get_batch_config_removed(admin_env):
+    """batch_config 端点已随 batcher 策略移除, 应返回 404。"""
     resp = await _http_request(
         admin_env["host"], admin_env["port"], "GET",
         "/api/v1/users/1/batch_config",
     )
-    assert resp.status == 200
-    data = resp.json
-    assert "batch_size" in data
-    assert "batch_interval_ms" in data
-    assert "batch_max_wait_ms" in data
+    assert resp.status == 404
 
 
 @pytest.mark.asyncio
-async def test_put_batch_config(admin_env):
+async def test_put_batch_config_removed(admin_env):
+    """batch_config PUT 端点已移除, 应返回 404。"""
     body = json.dumps({
         "batch_size": 200,
         "batch_interval_ms": 100,
@@ -527,27 +525,19 @@ async def test_put_batch_config(admin_env):
         "/api/v1/users/1/batch_config",
         body=body, headers={"Content-Type": "application/json"},
     )
-    assert resp.status == 200
-    # 验证 GET 返回新值
-    resp2 = await _http_request(
-        admin_env["host"], admin_env["port"], "GET",
-        "/api/v1/users/1/batch_config",
-    )
-    data = resp2.json
-    assert data["batch_size"] == 200
-    assert data["batch_interval_ms"] == 100
-    assert data["batch_max_wait_ms"] == 500
+    assert resp.status == 404
 
 
 @pytest.mark.asyncio
-async def test_put_batch_config_invalid(admin_env):
+async def test_put_batch_config_invalid_removed(admin_env):
+    """batch_config 端点已移除, 任何请求都返回 404。"""
     body = json.dumps({"batch_size": 0}).encode("utf-8")
     resp = await _http_request(
         admin_env["host"], admin_env["port"], "PUT",
         "/api/v1/users/1/batch_config",
         body=body, headers={"Content-Type": "application/json"},
     )
-    assert resp.status == 400
+    assert resp.status == 404
 
 
 # ---- Permissions ----

@@ -516,31 +516,23 @@ async def test_client_tracker_online_count(full_server):
 
 
 @pytest.mark.asyncio
-async def test_batch_config_api_get_put(full_server):
-    """11) batch_config GET/PUT API 端到端."""
+async def test_batch_config_api_removed(full_server):
+    """11) batch_config 端点已随 batcher 策略移除, 应返回 404。"""
     env = full_server
     user = await _create_test_user(env["user_repo"], username="batch_user")
 
-    # GET 默认值
-    status, body = await _http_get(
+    # GET 应 404
+    status, _ = await _http_get(
         env["host"], env["admin_port"], f"/api/v1/users/{user.id}/batch_config",
     )
-    assert status == 200
-    data = json.loads(body)
-    assert "batch_size" in data
+    assert status == 404
 
-    # PUT 新值
-    status, body = await _http_request_json(
+    # PUT 也应 404
+    status, _ = await _http_request_json(
         env["host"], env["admin_port"], "PUT", f"/api/v1/users/{user.id}/batch_config",
         {"batch_size": 25, "batch_interval_ms": 20, "batch_max_wait_ms": 100},
     )
-    assert status == 200, f"PUT batch_config 失败: {status} {body!r}"
-
-    # GET 应看到新值
-    cfg = await env["perm_service"].get_batch_config(user.id)
-    assert cfg["batch_size"] == 25
-    assert cfg["batch_interval_ms"] == 20
-    assert cfg["batch_max_wait_ms"] == 100
+    assert status == 404
 
 
 @pytest.mark.asyncio
