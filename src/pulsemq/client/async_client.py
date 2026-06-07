@@ -17,6 +17,7 @@ import pandas as pd
 import zmq
 import zmq.asyncio
 
+from pulsemq.protocol.flags import FrameFlags
 from pulsemq.protocol.frames import FrameCodec
 from pulsemq.protocol.msg_type import MsgType
 
@@ -381,17 +382,25 @@ class PulseClient:
                     raise PulseConnectionError("发送失败，重试耗尽")
 
     def _decode_message(self, frames: list[bytes]) -> PulseMessage | None:
-        """解码 SUB 收到的广播消息。"""
+        """解码 SUB 收到的广播消息。
+
+        从 frame[1] (meta 字节) 解析出 ser_fmt / comp，再调 FrameCodec 解码。
+        """
         try:
             topic = frames[0].decode("utf-8")
             meta = frames[1]
             msg_type = meta[0]
+            flags = (
+                FrameFlags.decode(meta[1])
+                if len(meta) > 1
+                else FrameFlags(ser_fmt="msgpack", comp="none", has_topic=False)
+            )
             payload_bytes = frames[3] if len(frames) > 3 else b""
 
-            # 解码 payload
+            # 用 wire 上的真实 ser_fmt / comp 解码（不再硬编码 msgpack/none）
             try:
                 payload = FrameCodec.decode_payload(
-                    payload_bytes, self._DEFAULT_SER, self._DEFAULT_COMP
+                    payload_bytes, flags.ser_fmt, flags.comp
                 )
             except Exception:
                 payload = None
