@@ -37,6 +37,7 @@ from pulsemq.protocol.msg_type import MsgType
 from pulsemq.storage.database import init_db, parse_db_url
 from pulsemq.storage.sqlite_perm import SqlitePermGroupRepo
 from pulsemq.storage.sqlite_user import SqliteUserRepo
+from pulsemq.storage.sqlite_stats import SQLiteStatsRepo
 from pulsemq.transport.zmq_transport import ZmqTransport
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,12 @@ class PulseServer:
         self._db_conn = init_db(db_path)
         self._user_repo = SqliteUserRepo(self._db_conn)
         self._perm_repo = SqlitePermGroupRepo(self._db_conn)
+
+        # Phase 6: topic 统计仓库 (独立 DB, 7 天 TTL)
+        stats_db_path = parse_db_url(self._config.stats_db_url)
+        self._stats_repo = SQLiteStatsRepo(
+            stats_db_path, retention_days=self._config.stats_retention_days
+        )
 
         # 认证
         self._auth_store = AuthMemoryStore()
@@ -118,6 +125,9 @@ class PulseServer:
         )
 
         self._running = False
+        # Phase 6: 后台任务引用
+        self._stats_cleanup_task: asyncio.Task | None = None
+        self._stats_minute_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """启动服务端。"""
@@ -135,6 +145,12 @@ class PulseServer:
         if self._config.metrics_enabled:
             await self._metrics_http.start()
             await self._minute_aggregator.start()
+
+        # Phase 6: 启动 topic_stats 后台任务 (清理 + 分钟落库)
+        self._stats_cleanup_task = await self._stats_repo.start_cleanup_task(
+            interval_seconds=300.0,
+        )
+        self._stats_minute_task = asyncio.create_task(self._stats_minute_loop())
 
         logger.info(
             "PulseMQ 服务端启动: ROUTER=%s, XPUB=%s",
@@ -155,6 +171,16 @@ class PulseServer:
     async def stop(self) -> None:
         """优雅停止服务端：停止接收 → drain 缓冲 → 关闭传输。"""
         self._running = False
+        # Phase 6: 停止 stats 后台任务
+        for task in (self._stats_minute_task, self._stats_cleanup_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._stats_minute_task = None
+        self._stats_cleanup_task = None
         # 先停止引擎（等待后台任务完成）
         await self._engine.stop()
         # drain 双缓冲残余消息
@@ -167,6 +193,11 @@ class PulseServer:
         await self._transport.stop(linger_ms=2000)
         if self._db_conn:
             self._db_conn.close()
+        # Phase 6: 关闭 stats 仓库
+        try:
+            self._stats_repo.close()
+        except Exception as e:
+            logger.debug("stats_repo close 异常: %s", e)
         logger.info("PulseMQ 服务端已停止")
 
     async def _event_loop(self) -> None:
@@ -224,6 +255,42 @@ class PulseServer:
             except Exception as e:
                 logger.debug("指标同步异常: %s", e)
             await asyncio.sleep(1.0)
+
+    async def _stats_minute_loop(self) -> None:
+        """每分钟把 TopicMetricsRegistry 当前快照写入 SQLite。
+
+        1) 等到下一个整分钟边界
+        2) 遍历 topic_metrics 所有 topic, 写入 (minute_ts, msg_count, p50, p99, max_lat, peak)
+        3) 落库后 reset_window 让指标重新计数
+        """
+        while self._running:
+            try:
+                # 等到下一分钟边界
+                now = time.time()
+                next_minute = (int(now) // 60 + 1) * 60
+                await asyncio.sleep(max(0.1, next_minute - now))
+
+                minute_ts = int(next_minute)  # 整分钟秒
+                topics = self._topic_metrics.list_topics()
+                for m in topics:
+                    if m.msg_count_1min == 0:
+                        # 空窗口: 跳过, 不写 (避免噪声)
+                        continue
+                    await self._stats_repo.upsert_minute(
+                        topic=m.topic,
+                        minute_ts=minute_ts,
+                        msg_count=m.msg_count_1min,
+                        p50=m.latency_p50_1min,
+                        p99=m.latency_p99_1min,
+                        max_lat=m.latency_max_1min,
+                        peak_in_flight=self._topic_metrics.peak_in_flight(m.topic),
+                    )
+                    # 落库后重置窗口
+                    self._topic_metrics.reset_window(m.topic)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("stats 分钟落库异常: %s", e)
 
     async def _topic_cleanup_loop(self) -> None:
         """定期清理无订阅者且无缓冲消息的空闲 topic。"""
@@ -336,6 +403,10 @@ class PulseServer:
     @property
     def topic_metrics(self) -> TopicMetricsRegistry:
         return self._topic_metrics
+
+    @property
+    def stats_repo(self) -> SQLiteStatsRepo:
+        return self._stats_repo
 
 
 def main() -> None:
