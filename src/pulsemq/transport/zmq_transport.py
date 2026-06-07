@@ -3,7 +3,8 @@
 架构 (v1):
 - ROUTER socket: ZmqRecvThread 持有 (Python threading), 阻塞 recv
 - XPUB socket:   ZmqBroadcastThread 持有, 阻塞 send
-- asyncio 主循环通过 queue.Queue + asyncio.to_thread 与两个线程通信
+- IO 线程通过 loop.call_soon_threadsafe 把帧推入 asyncio.Queue
+- asyncio 主循环直接 await asyncio.Queue.get() (无线程上下文切换)
 
 外部 API 与原 asyncio 版本保持一致:
 - async start() / stop(linger_ms)
@@ -31,7 +32,8 @@ logger = logging.getLogger(__name__)
 class _ZmqRecvThread(threading.Thread):
     """持有 ROUTER socket 的独立 IO 线程。
 
-    - 死循环阻塞 recv_multipart(), 收到帧就 put 到 recv_queue
+    - 死循环阻塞 recv_multipart(), 收到帧就通过 loop.call_soon_threadsafe
+      推入 asyncio.Queue (主循环 await get() 无线程上下文切换)
     - 同时处理 send_queue (server.py 主动 send, 如 AUTH/ERROR 响应)
     - stop_event 触发后干净退出
     """
@@ -41,17 +43,27 @@ class _ZmqRecvThread(threading.Thread):
     def __init__(
         self,
         socket: zmq.Socket,
-        recv_queue: queue.Queue,
+        recv_asyncio_queue: asyncio.Queue,
         send_queue: queue.Queue,
         stop_event: threading.Event,
+        loop: asyncio.AbstractEventLoop,
     ):
         super().__init__(daemon=True, name="ZmqRecvThread")
         self._socket = socket
-        self._recv_queue = recv_queue
+        self._recv_queue = recv_asyncio_queue
         self._send_queue = send_queue
         self._stop_event = stop_event
+        self._loop = loop
         self._poller = zmq.Poller()
         self._poller.register(socket, zmq.POLLIN)
+
+    def _push_recv(self, frames: list[bytes]) -> None:
+        """线程安全地把帧推入 asyncio.Queue。"""
+        self._loop.call_soon_threadsafe(self._recv_queue.put_nowait, frames)
+
+    def _push_sentinel(self) -> None:
+        """线程退出时放哨兵。"""
+        self._loop.call_soon_threadsafe(self._recv_queue.put_nowait, None)
 
     def run(self) -> None:
         """IO 线程主循环: 同时处理 recv 和 outbound send。"""
@@ -69,12 +81,11 @@ class _ZmqRecvThread(threading.Thread):
                 except zmq.ZMQError as e:
                     logger.debug("recv 异常: %s", e)
                     break
-                self._recv_queue.put(frames)
+                self._push_recv(frames)
 
             # 处理 outbound send (server 主动推送, 不需要 await)
             if self._socket in socks and socks[self._socket] & zmq.POLLOUT:
-                # SNDHWM 满时 socket 不可写, 这里不专门处理 (SNDHWM=0 = 无限)
-                pass
+                pass  # SNDHWM=0 无限
 
             # 排空 send_queue (server 推 AUTH/ERROR)
             while not self._send_queue.empty():
@@ -93,13 +104,13 @@ class _ZmqRecvThread(threading.Thread):
                     break
 
         # 退出时放哨兵
-        self._recv_queue.put(None)
+        self._push_sentinel()
 
 
 class _ZmqBroadcastThread(threading.Thread):
     """持有 XPUB socket 的独立 IO 线程。
 
-    - 死循环从 broadcast_queue 取帧, send_multipart 到 XPUB
+    - 死循环从 broadcast_queue (thread-safe queue.Queue) 取帧, send_multipart
     - 短轮询 + poll XPUB 接收 SUBSCRIBE 确认
     - stop_event 触发后干净退出
     """
@@ -124,9 +135,10 @@ class _ZmqBroadcastThread(threading.Thread):
         while not self._stop_event.is_set():
             # 排空 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认 (避免接收缓冲区满)
             try:
-                while self._socket in dict(self._poller.poll(0)) and \
-                        dict(self._poller.poll(0))[self._socket] & zmq.POLLIN:
+                socks = dict(self._poller.poll(0))
+                while self._socket in socks and socks[self._socket] & zmq.POLLIN:
                     self._socket.recv_multipart()
+                    socks = dict(self._poller.poll(0))
             except zmq.ZMQError:
                 pass
 
@@ -156,9 +168,9 @@ class ZmqTransport:
     """ZMQ 传输层, 持有 ROUTER + XPUB 两个 socket, 通过两个 IO 线程驱动。
 
     asyncio 主循环调用:
-    - await recv()       → to_thread(recv_queue.get)
-    - await broadcast()  → broadcast_queue.put (无 await)
-    - await send()       → send_queue.put (无 await)
+    - await recv()       → await asyncio_queue.get() (无线程上下文切换)
+    - await broadcast()  → broadcast_thread_safe_queue.put (单线程 put)
+    - await send()       → send_thread_safe_queue.put (单线程 put)
     """
 
     def __init__(self, config: ServerConfig):
@@ -166,17 +178,23 @@ class ZmqTransport:
         self._ctx: zmq.Context | None = None
         self._router: zmq.Socket | None = None
         self._xpub: zmq.Socket | None = None
-        # 线程安全队列 (thread ↔ asyncio 通信)
-        self._recv_queue: queue.Queue[list[bytes] | None] = queue.Queue()
+        # asyncio.Queue: IO 线程 push, 主循环 await get
+        # 必须 thread-safe: 使用 loop.call_soon_threadsafe + put_nowait
+        self._recv_queue: asyncio.Queue[list[bytes] | None] | None = None
+        # 线程安全队列 (主循环单写者, broadcast 线程单读者)
         self._broadcast_queue: queue.Queue[list[bytes] | None] = queue.Queue()
         self._send_queue: queue.Queue[tuple[bytes, list[bytes]]] = queue.Queue()
         # 线程
         self._recv_thread: _ZmqRecvThread | None = None
         self._broadcast_thread: _ZmqBroadcastThread | None = None
         self._stop_event = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def start(self) -> None:
         """初始化 ZMQ socket + bind + 启动两个 IO 线程。"""
+        self._loop = asyncio.get_event_loop()
+        self._recv_queue = asyncio.Queue()
+
         self._ctx = zmq.Context()
 
         # ROUTER socket
@@ -201,14 +219,13 @@ class ZmqTransport:
         logger.info("XPUB 绑定到 %s", self._config.xpub_bind)
 
         # 重置队列 (start 可能被调多次)
-        self._recv_queue = queue.Queue()
         self._broadcast_queue = queue.Queue()
         self._send_queue = queue.Queue()
         self._stop_event.clear()
 
         # 启动 IO 线程
         self._recv_thread = _ZmqRecvThread(
-            self._router, self._recv_queue, self._send_queue, self._stop_event,
+            self._router, self._recv_queue, self._send_queue, self._stop_event, self._loop,
         )
         self._recv_thread.start()
         self._broadcast_thread = _ZmqBroadcastThread(
@@ -221,7 +238,6 @@ class ZmqTransport:
         # 1. 让线程退出
         self._stop_event.set()
         # 2. 放哨兵
-        self._recv_queue.put(None)
         self._broadcast_queue.put(None)
 
         # 3. 等线程结束
@@ -245,16 +261,22 @@ class ZmqTransport:
             self._ctx.term()
             self._ctx = None
 
+        # 6. 唤醒可能阻塞的 recv (放 None 到 asyncio queue)
+        if self._recv_queue is not None and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._recv_queue.put_nowait, None)
+
         logger.info("ZMQ Transport 已停止")
 
     async def recv(self) -> list[bytes]:
-        """接收一条 ROUTER 消息。"""
-        return await asyncio.to_thread(self._recv_queue.get)
+        """接收一条 ROUTER 消息 (await asyncio.Queue.get, 无线程上下文切换)。"""
+        if self._recv_queue is None:
+            raise RuntimeError("Transport 未启动")
+        return await self._recv_queue.get()
 
     async def send(self, identity: bytes, frames: list[bytes]) -> None:
-        """通过 ROUTER 发送消息给特定客户端 (入 send_queue)。"""
+        """通过 ROUTER 发送消息给特定客户端 (入 thread-safe send_queue)。"""
         self._send_queue.put((identity, frames))
 
     async def broadcast(self, frames: list[bytes]) -> None:
-        """通过 XPUB 广播 (入 broadcast_queue)。"""
+        """通过 XPUB 广播 (入 thread-safe broadcast_queue)。"""
         self._broadcast_queue.put(frames)
