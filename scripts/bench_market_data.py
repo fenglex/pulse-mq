@@ -208,7 +208,7 @@ async def main() -> int:
     print(f"  消息数: {args.n_messages:,} / 组合")
     print(f"  组合:   {len(DATA_TYPES)} data_types × {len(COMPRESSIONS)} compressions = {len(DATA_TYPES) * len(COMPRESSIONS)}")
     print(f"  数据:   8 字段 OHLCV 行情, 20 股票池, seed=42")
-    print(f"  Batcher: 关闭 (batch_size=1)")
+    print(f"  直发模式: 单条 PUB, 无 Batcher")
     print()
 
     proc = start_server(args.port)

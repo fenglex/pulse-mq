@@ -154,7 +154,6 @@ async def start_server(port: int) -> tuple[PulseServer, asyncio.Task]:
         xpub_bind=f"tcp://*:{port + 1}",
         auth_enabled=False,
         max_concurrency=200,
-        max_batch_size=256,
         zmq_rcvhwm=0,
         zmq_sndhwm=0,
         data_buffer_size=100_000,
