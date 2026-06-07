@@ -14,8 +14,6 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "PULSEMQ_STATS_DB_URL": ("stats_db_url", str),
     "PULSEMQ_STATS_RETENTION": ("stats_retention_days", int),
     "PULSEMQ_CONCURRENCY": ("max_concurrency", int),
-    "PULSEMQ_BATCH_SIZE": ("max_batch_size", int),
-    "PULSEMQ_DRAIN_TIMEOUT": ("drain_timeout_ms", int),
     "PULSEMQ_USE_UVLOOP": ("use_uvloop", lambda v: v.lower() in ("true", "1", "yes")),
     "PULSEMQ_POOL_SIZE": ("object_pool_size", int),
     "PULSEMQ_ZMQ_RCVHWM": ("zmq_rcvhwm", int),
@@ -52,8 +50,6 @@ class ServerConfig:
 
     # 引擎层
     max_concurrency: int = 100
-    max_batch_size: int = 64
-    drain_timeout_ms: int = 1
     use_uvloop: bool = True
     object_pool_size: int = 4096
 

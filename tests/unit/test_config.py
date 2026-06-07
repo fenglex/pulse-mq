@@ -34,7 +34,6 @@ def test_config_defaults_numeric():
     """数值默认值合理。"""
     c = ServerConfig()
     assert c.max_concurrency > 0
-    assert c.max_batch_size > 0
     assert c.stats_retention_days > 0
     assert c.object_pool_size > 0
     assert c.zmq_rcvhwm > 0
@@ -70,11 +69,9 @@ def test_config_env_override_string(monkeypatch):
 def test_config_env_override_int(monkeypatch):
     """整数环境变量正确转换。"""
     monkeypatch.setenv("PULSEMQ_CONCURRENCY", "200")
-    monkeypatch.setenv("PULSEMQ_BATCH_SIZE", "128")
     monkeypatch.setenv("PULSEMQ_STATS_RETENTION", "30")
     c = load_config()
     assert c.max_concurrency == 200
-    assert c.max_batch_size == 128
     assert c.stats_retention_days == 30
 
 
