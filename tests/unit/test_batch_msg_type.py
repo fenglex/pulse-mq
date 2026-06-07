@@ -70,10 +70,10 @@ def _available_ser_combos():
 ])
 def test_encode_decode_batch_payload_roundtrip(ser_fmt, comp):
     """encode → decode roundtrip。"""
-    payloads = [b"hello", b"world", b"foo", b""]
-    encoded = FrameCodec.encode_batch_payload(payloads, comp=comp)
+    items = [(ser_fmt, b"hello"), (ser_fmt, b"world"), (ser_fmt, b"foo"), (ser_fmt, b"")]
+    encoded = FrameCodec.encode_batch_payload(items, comp=comp)
     decoded = FrameCodec.decode_batch_payload(encoded, comp=comp)
-    assert decoded == payloads
+    assert decoded == items
 
 
 def test_batch_payload_empty_list_roundtrip():
@@ -85,10 +85,18 @@ def test_batch_payload_empty_list_roundtrip():
 
 def test_batch_payload_preserves_binary_data():
     """二进制 bytes 应当原样保留。"""
-    payloads = [b"\x00\x01\x02", b"\xff\xfe\xfd", b"\x80\x90\xa0"]
-    encoded = FrameCodec.encode_batch_payload(payloads, comp="none")
+    items = [("msgpack", b"\x00\x01\x02"), ("msgpack", b"\xff\xfe\xfd"), ("msgpack", b"\x80\x90\xa0")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
     decoded = FrameCodec.decode_batch_payload(encoded, comp="none")
-    assert decoded == payloads
+    assert decoded == items
+
+
+def test_batch_payload_mixed_ser_fmts():
+    """混用不同 ser_fmt 也应正确 roundtrip。"""
+    items = [("str", b"hello"), ("msgpack", b"\x81\xa5hello"), ("bytes", b"\x00\x01")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
+    decoded = FrameCodec.decode_batch_payload(encoded, comp="none")
+    assert decoded == items
 
 
 # ---- _handle_batch 行为 ----
@@ -131,8 +139,8 @@ async def test_handle_batch_splits_into_n_pubs():
     router.subscribe(b"client-1", "t.batch")
     handlers = _CapturingHandlers(router)
 
-    payloads = [b"a", b"b", b"c"]
-    encoded = FrameCodec.encode_batch_payload(payloads, comp="none")
+    items = [("str", b"a"), ("str", b"b"), ("str", b"c")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
     ctx = _make_batch_ctx(encoded)
 
     await handlers._handle_batch(ctx)
@@ -143,13 +151,13 @@ async def test_handle_batch_splits_into_n_pubs():
     for frames in handlers._captured:
         assert len(frames) == 4
         assert frames[0] == b"t.batch"
-        # meta: msg_type=BROADCAST(0x0A), flags 沿用 BATCH 的 flags 字节
+        # meta: msg_type=BROADCAST(0x0A), flags 来自 inner ser_fmt
         assert frames[1][0] == MsgType.BROADCAST
         # record_count=1
         assert struct.unpack(">I", frames[2])[0] == 1
     # payload 内容
     payload_list = [f[3] for f in handlers._captured]
-    assert payload_list == payloads
+    assert payload_list == [b"a", b"b", b"c"]
 
 
 @pytest.mark.asyncio
@@ -173,8 +181,8 @@ async def test_handle_batch_no_subscribers_no_broadcast():
     router = MessageRouter()
     handlers = _CapturingHandlers(router)
 
-    payloads = [b"a", b"b"]
-    encoded = FrameCodec.encode_batch_payload(payloads, comp="none")
+    items = [("str", b"a"), ("str", b"b")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
     ctx = _make_batch_ctx(encoded)
 
     await handlers._handle_batch(ctx)
@@ -189,8 +197,8 @@ async def test_handle_batch_preserves_topic():
     router.subscribe(b"client-1", "team-a.mkt.sh.600000")
     handlers = _CapturingHandlers(router)
 
-    payloads = [b"\x01", b"\x02"]
-    encoded = FrameCodec.encode_batch_payload(payloads, comp="none")
+    items = [("str", b"\x01"), ("str", b"\x02")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
     ctx = _make_batch_ctx(encoded, topic="team-a.mkt.sh.600000")
 
     await handlers._handle_batch(ctx)
@@ -201,17 +209,41 @@ async def test_handle_batch_preserves_topic():
 
 
 @pytest.mark.asyncio
-async def test_handle_batch_uses_flags_byte_for_broadcast_meta():
-    """broadcast meta 应使用 BATCH 帧的 flags 字节（保持 ser/comp 信息）。"""
+async def test_handle_batch_mixed_ser_fmts_preserved():
+    """BATCH 内的每条 payload 各自的 ser_fmt 在 broadcast meta 中保留。"""
+    router = MessageRouter()
+    router.subscribe(b"client-1", "t.mix")
+    handlers = _CapturingHandlers(router)
+
+    items = [("str", b"hello"), ("msgpack", b"\x81\xa5world"), ("bytes", b"\x00\x01")]
+    encoded = FrameCodec.encode_batch_payload(items, comp="none")
+    ctx = _make_batch_ctx(encoded, topic="t.mix")
+
+    await handlers._handle_batch(ctx)
+
+    assert len(handlers._captured) == 3
+    for i, (frames, (ser_fmt, payload)) in enumerate(zip(handlers._captured, items)):
+        # meta[1] flags 应当反映 inner ser_fmt
+        flags = FrameFlags.decode(frames[1][1])
+        assert flags.ser_fmt == ser_fmt, \
+            f"item {i}: expected ser_fmt={ser_fmt}, got {flags.ser_fmt}"
+        assert frames[3] == payload
+
+
+@pytest.mark.asyncio
+async def test_handle_batch_uses_inner_flags_for_broadcast_meta():
+    """broadcast meta flags 来自 inner ser_fmt (而非外层 BATCH flags)。"""
     router = MessageRouter()
     router.subscribe(b"client-1", "t.f")
     handlers = _CapturingHandlers(router)
 
-    # flags: msgpack + snappy + has_topic
-    flags = FrameFlags(ser_fmt="msgpack", comp="snappy", has_topic=True)
-    meta = bytes([MsgType.BATCH, flags.encode()])
-    # 编码 1 个 payload（空 list 会让 snappy 解压失败）
-    encoded = FrameCodec.encode_batch_payload([b"x"], comp="snappy")
+    # 外层 BATCH flags: msgpack + snappy (外层只是为了压缩 msgpack 包装的 list)
+    outer_flags = FrameFlags(ser_fmt="msgpack", comp="snappy", has_topic=True)
+    meta = bytes([MsgType.BATCH, outer_flags.encode()])
+    # 内层 1 条 str payload
+    encoded = FrameCodec.encode_batch_payload(
+        [("str", b"x")], comp="snappy"
+    )
     ctx = PipelineContext(
         identity=b"c",
         msg_type=MsgType.BATCH,
@@ -223,6 +255,7 @@ async def test_handle_batch_uses_flags_byte_for_broadcast_meta():
     await handlers._handle_batch(ctx)
     # 1 条 broadcast
     assert len(handlers._captured) == 1
-    # broadcast meta[0] 应是 BROADCAST, meta[1] 沿用 BATCH 的 flags
+    # broadcast meta[0] 应是 BROADCAST, meta[1] 来自 inner ("str" + "snappy")
     assert handlers._captured[0][1][0] == MsgType.BROADCAST
-    assert handlers._captured[0][1][1] == flags.encode()
+    inner_flags = FrameFlags.decode(handlers._captured[0][1][1])
+    assert inner_flags.ser_fmt == "str"

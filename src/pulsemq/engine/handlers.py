@@ -238,8 +238,9 @@ class MessageHandlers:
     async def _handle_batch(self, ctx: PipelineContext) -> None:
         """处理 BATCH PUB：拆 N 条, 每条走完整 PUB 路径。
 
-        协议: ctx.payload 是 msgpack 编码的 list[bytes]，外层已按 ctx meta 的 comp 压缩。
-        这里先解压+msgpack 解码得到原始 payload list, 然后对每条 broadcast + cache。
+        协议: ctx.payload 是 msgpack 编码的 list[(ser_fmt, payload_bytes)]，
+        外层已按 ctx meta 的 comp 压缩。这里先解压+msgpack 解码得到原始 payload list,
+        然后对每条用其原始 ser_fmt 构造 broadcast (避免 client 端 ser_fmt 信息丢失).
 
         鉴权已在拦截器链入口处对 BATCH 整体完成, 这里不再走 pipeline。
         """
@@ -250,28 +251,28 @@ class MessageHandlers:
         flags = FrameFlags.decode(flags_byte)
         comp = flags.comp
 
-        # 1. 拆解 BATCH payload → list[bytes]
-        raw_payloads = FrameCodec.decode_batch_payload(ctx.payload, comp)
-        n = len(raw_payloads)
+        # 1. 拆解 BATCH payload → list[(ser_fmt, payload_bytes)]
+        items = FrameCodec.decode_batch_payload(ctx.payload, comp)
+        n = len(items)
         if n == 0:
             return
 
         # 2. 注册 topic（幂等）
         self.router.register_topic(topic)
 
-        # 3. 沿用 BATCH 帧的 flags 字节（meta[1]）构造 PUB meta
-        # BATCH 与 PUB 的 meta[1] 一致（ser/comp/has_topic），仅 msg_type 不同
-        pub_meta = bytes([MsgType.PUB, flags_byte])
-        rc_bytes = _RECORD_COUNT_STRUCT.pack(1)
-
-        # 4. 对每条 payload 执行 PUB 路径
+        # 3. 对每条 payload 执行 PUB 路径
         has_subs = self.router.has_subscribers(topic)
         buffered = self.router.buffer_enabled
         topic_bytes = self._get_topic_bytes(topic) if (has_subs or buffered) else None
-        # 预计算 broadcast meta（flags 不变，仅 msg_type 变）
-        broadcast_meta = self._build_broadcast_meta(pub_meta) if has_subs else None
+        rc_bytes = _RECORD_COUNT_STRUCT.pack(1)
 
-        for raw_payload in raw_payloads:
+        for ser_fmt, raw_payload in items:
+            # 构造该条 payload 的 PUB meta: msg_type=PUB, flags 来自 ser_fmt
+            # 沿用 BATCH 帧的 comp (BATCH 内 payload 压缩方式与外层一致)
+            item_flags = FrameFlags(ser_fmt=ser_fmt, comp=comp, has_topic=True)
+            pub_meta = bytes([MsgType.PUB, item_flags.encode()])
+            broadcast_meta = self._build_broadcast_meta(pub_meta) if has_subs else None
+
             # 广播
             if has_subs:
                 broadcast_frames = [topic_bytes, broadcast_meta, rc_bytes, raw_payload]

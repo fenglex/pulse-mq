@@ -260,7 +260,9 @@ class PulseClient:
         if self._batcher is not None and self._batch_size > 1:
             # BATCH 协议只支持 msgpack 编码 list[bytes], 每条是各 ser_fmt 序列化的 bytes.
             # 这里把单条 payload 包装为 [payload] 给 Batcher, Batcher 攒够 N 条再走 BATCH.
-            await self._batcher.add(payload)
+            # topic 传给 Batcher, Batcher 内部维护 current_topic, 切换 topic 时强制 flush.
+            # ser_fmt / compression 也传给 Batcher, 批次内 payload 可能用不同 ser_fmt
+            await self._batcher.add(payload, topic=topic, ser_fmt=ser_fmt, comp=compression)
             return
 
         # 直发模式 (默认): 立即发送
@@ -270,31 +272,40 @@ class PulseClient:
         await self._send_with_retry(frames, retry, retry_delay)
 
     async def _batcher_send(
-        self, payloads: list[bytes], ser_fmt: str, comp: str
+        self,
+        items: list[tuple[str, str, bytes]],
+        comp: str,
+        topic: str = "",
     ) -> None:
         """Batcher 调用的发送钩子。
 
+        Args:
+            items: list[(ser_fmt, comp, payload_bytes), ...] 每条带 ser/comp 信息
+            comp: BATCH 协议外层 msgpack 包装的压缩算法 (整批统一)
+            topic: 该批次的统一 topic (Batcher 单 topic 设计)
+
         - 1 条 payload: 走 PUB 单条路径
-        - N 条 payload: 走 BATCH 协议 (msgpack 编码 list 后按 comp 压缩)
+        - N 条 payload: 走 BATCH 协议 (msgpack 编码 list[(ser_fmt, payload_bytes)] 后按 comp 压缩)
         """
-        if not payloads:
+        if not items:
             return
-        if len(payloads) == 1:
-            # 单条退化为 PUB, topic 不可知 (Batcher 不感知 topic),
-            # 这里保持与原 publish 行为一致: 用 "" topic 是不行的,
-            # 实际上 Batcher 在批模式 (batch_size>1) 才有 len(payloads)>1,
-            # 单条场景对应 _direct 路径, Batcher 不会调用此函数。
-            # 此处保留作为防御。
+        if len(items) == 1:
+            # 单条退化为 PUB, 用 batcher 给的 topic / ser / comp
+            ser_fmt, item_comp, payload = items[0]
+            frames = FrameCodec.encode(
+                MsgType.PUB, topic, 1, payload, ser_fmt, item_comp
+            )
+            await self._send_with_retry(frames, 0, 0.1)
             return
         # N 条: BATCH 协议
-        # 注意: BATCH 协议的 record_count 字段是 N (批内条数),
-        # payload 字段是 msgpack(list[N bytes]) 然后按 comp 压缩.
-        # 内部: FrameCodec.encode_batch_payload 已经处理 msgpack + comp.
-        batch_payload = FrameCodec.encode_batch_payload(payloads, comp)
-        # BATCH 帧的 meta flags 用 (ser_fmt, comp, has_topic=False)
+        # 把 items 转为 (ser_fmt, payload_bytes) 列表 (server _handle_batch 只需 ser_fmt 不需 item comp)
+        # 但保留每条的 ser_fmt (用于 server 端 broadcast meta)
+        ser_payload_pairs = [(sf, p) for sf, _ic, p in items]
+        batch_payload = FrameCodec.encode_batch_payload(ser_payload_pairs, comp)
+        # BATCH 帧的 meta flags 用 (ser_fmt="msgpack", comp, has_topic=True)
         # 因为 batch 内的 N 条 payload 各自带 ser_fmt 标记, 外层统一 msgpack
         frames = FrameCodec.encode(
-            MsgType.BATCH, "", len(payloads), batch_payload, "msgpack", comp
+            MsgType.BATCH, topic, len(items), batch_payload, "msgpack", comp
         )
         await self._send_with_retry(frames, 0, 0.1)
 

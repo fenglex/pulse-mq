@@ -29,13 +29,19 @@ class _CapturingSend:
     """捕获所有 send_fn 调用的对象。"""
 
     def __init__(self, fail: bool = False):
-        self.calls: list[tuple[list[bytes], str, str]] = []
+        # (items, comp, topic)
+        self.calls: list[tuple[list[tuple[str, str, bytes]], str, str]] = []
         self.fail = fail
         self._lock = asyncio.Lock()
 
-    async def __call__(self, payloads: list[bytes], ser_fmt: str, comp: str) -> None:
+    async def __call__(
+        self,
+        items: list[tuple[str, str, bytes]],
+        comp: str,
+        topic: str = "",
+    ) -> None:
         async with self._lock:
-            self.calls.append((list(payloads), ser_fmt, comp))
+            self.calls.append((list(items), comp, topic))
             if self.fail:
                 raise RuntimeError("send_fn injected failure")
 
@@ -82,9 +88,13 @@ async def test_direct_mode_sends_immediately():
 
     # 3 次 add → 3 次 send
     assert len(send.calls) == 3
-    # 每次只 1 条
+    # 每次只 1 条 (item 格式: (ser, comp, payload))
     for call in send.calls:
-        assert call[0] == [b"a"] or call[0] == [b"b"] or call[0] == [b"c"]
+        assert call[0] in (
+            [("msgpack", "none", b"a")],
+            [("msgpack", "none", b"b")],
+            [("msgpack", "none", b"c")],
+        )
     # 队列始终为空
     assert b.pending == 0
     await b.close()
@@ -96,8 +106,9 @@ async def test_direct_mode_propagates_ser_comp():
     send = _CapturingSend()
     b = Batcher(send_fn=send, ser_fmt="str", comp="snappy", batch_size=1)
     await b.add(b"hi")
-    assert send.calls[0][1] == "str"
-    assert send.calls[0][2] == "snappy"
+    # call = (items, comp, topic)
+    assert send.calls[0][0] == [("str", "snappy", b"hi")]
+    assert send.calls[0][1] == "snappy"
     await b.close()
 
 
@@ -120,7 +131,11 @@ async def test_batch_flushes_when_count_reached():
     await b.add(b"c")
     # 3 条: 触发 flush
     assert len(send.calls) == 1
-    assert send.calls[0][0] == [b"a", b"b", b"c"]
+    assert send.calls[0][0] == [
+        ("msgpack", "none", b"a"),
+        ("msgpack", "none", b"b"),
+        ("msgpack", "none", b"c"),
+    ]
     assert b.pending == 0
 
     await b.add(b"d")
@@ -151,7 +166,11 @@ async def test_batch_flushes_on_interval():
     await b.add(b"c")
     # 触发 flush
     assert len(send.calls) == 1
-    assert send.calls[0][0] == [b"a", b"b", b"c"]
+    assert send.calls[0][0] == [
+        ("msgpack", "none", b"a"),
+        ("msgpack", "none", b"b"),
+        ("msgpack", "none", b"c"),
+    ]
     await b.close()
 
 
@@ -180,7 +199,10 @@ async def test_flush_explicit_drains_queue():
     assert b.pending == 2
     await b.flush()
     assert len(send.calls) == 1
-    assert send.calls[0][0] == [b"x", b"y"]
+    assert send.calls[0][0] == [
+        ("msgpack", "none", b"x"),
+        ("msgpack", "none", b"y"),
+    ]
     assert b.pending == 0
     await b.close()
 
@@ -211,7 +233,10 @@ async def test_close_flushes_residue():
     await b.close()
     # 残留应已 flush
     assert len(send.calls) == 1
-    assert send.calls[0][0] == [b"a", b"b"]
+    assert send.calls[0][0] == [
+        ("msgpack", "none", b"a"),
+        ("msgpack", "none", b"b"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -269,7 +294,54 @@ async def test_consecutive_batches_independent_intervals():
     await b.add(b"b1")
     await b.add(b"b2")  # 数量触发 → flush
     assert len(send.calls) == 2
-    assert send.calls[1][0] == [b"b1", b"b2"]
+    assert send.calls[1][0] == [
+        ("msgpack", "none", b"b1"),
+        ("msgpack", "none", b"b2"),
+    ]
+    await b.close()
+
+
+# ---- topic 切换: 强制 flush ----
+
+
+@pytest.mark.asyncio
+async def test_topic_change_forces_flush():
+    """add() 时若 topic 与当前 topic 不同, 强制 flush 当前批次。"""
+    send = _CapturingSend()
+    b = Batcher(send_fn=send, batch_size=10, batch_interval_ms=10000.0,
+                batch_max_wait_ms=10000.0)
+
+    await b.add(b"x", topic="t1")
+    await b.add(b"y", topic="t1")
+    # 2 条, batch_size=10, 未触发
+    assert len(send.calls) == 0
+    assert b.pending == 2
+
+    # 切 topic: 强制 flush
+    await b.add(b"z", topic="t2")
+    assert len(send.calls) == 1
+    assert send.calls[0][2] == "t1"  # 第一批的 topic
+    assert b.pending == 1
+    # 队列中剩下的是 t2 的一条
+    await b.close()
+
+
+@pytest.mark.asyncio
+async def test_add_with_ser_fmt_uses_actual_ser():
+    """add() 传入 ser_fmt / comp 应覆盖 Batcher 构造默认值。"""
+    send = _CapturingSend()
+    b = Batcher(send_fn=send, ser_fmt="msgpack", comp="none", batch_size=2)
+
+    await b.add(b"a", ser_fmt="str", comp="snappy")
+    await b.add(b"b", ser_fmt="str", comp="snappy")
+    # 2 条触发 flush
+    assert len(send.calls) == 1
+    assert send.calls[0][0] == [
+        ("str", "snappy", b"a"),
+        ("str", "snappy", b"b"),
+    ]
+    # 批次统一 comp (send_fn 的第二参数) = "snappy"
+    assert send.calls[0][1] == "snappy"
     await b.close()
 
 
