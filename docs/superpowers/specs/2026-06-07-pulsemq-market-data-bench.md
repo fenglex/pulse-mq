@@ -20,7 +20,7 @@
 
 | 维度 | 取值 |
 |------|------|
-| **data_types** | `str` · `df-100rows` · `df-100rows-1k` |
+| **data_types** | `str` (1 quote) · `df-100` (100 quotes) · `df-1000` (1000 quotes) |
 | **compressions** | `none` · `snappy` · `lz4` · `zstd` |
 | **每组合消息数** | 100,000 |
 | **总消息数** | 12 × 100,000 = **1,200,000** |
@@ -86,12 +86,12 @@ def build_payload(data_type: str, idx: int):
     if data_type == "str":
         # 1 quote → JSON 字符串 (约 130 bytes)
         return json.dumps(gen_quote(idx), ensure_ascii=False)
-    if data_type == "df-100rows":
+    if data_type == "df-100":
         # 100 quotes → DataFrame(100, 8)
         import pandas as pd
         rows = [gen_quote(idx * 100 + j) for j in range(100)]
         return pd.DataFrame(rows)
-    if data_type == "df-100rows-1k":
+    if data_type == "df-1000":
         # 1000 quotes → DataFrame(1000, 8)
         import pandas as pd
         rows = [gen_quote(idx * 1000 + j) for j in range(1000)]
@@ -104,8 +104,8 @@ def build_payload(data_type: str, idx: int):
 | data_type | format 参数 | 走哪个 serializer | payload 大小 (估) |
 |-----------|-------------|-------------------|------------------|
 | `str` | None | StringSerializer (UTF-8 bytes) | ~130 bytes |
-| `df-100rows` | None (默认 json) | JsonSerializer (msgspec) | ~12 KB |
-| `df-100rows-1k` | None (默认 json) | JsonSerializer (msgspec) | ~120 KB |
+| `df-100` | None (默认 json) | JsonSerializer (msgspec) | ~12 KB |
+| `df-1000` | None (默认 json) | JsonSerializer (msgspec) | ~120 KB |
 
 ---
 
