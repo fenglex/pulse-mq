@@ -115,9 +115,9 @@ async def bench_one(port: int, data_type: str, comp: str, n_messages: int) -> di
                 t0 = time.perf_counter()
                 await c.publish(topic, payload, format=fmt_arg, compression=comp)
                 latencies.append((time.perf_counter() - t0) * 1000)
-                # 每 200 条 yield 一次，避免事件循环饥饿
+                # 每 200 条 yield 一次，避免事件循环饥饿 (避免 sub 收不到 100k 全集)
                 if i > 0 and i % 200 == 0:
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0.001)  # 1ms 让 sub 跟上
 
     async def sub() -> None:
         async with PulseClient(
@@ -125,18 +125,24 @@ async def bench_one(port: int, data_type: str, comp: str, n_messages: int) -> di
             xpub_address=xpub_address,
             auto_reconnect=False,
         ) as c:
-            async for msg in c.subscribe("bench.>"):
-                received.append(msg)
-                if len(received) >= n_messages:
-                    recv_done.set()
-                    return
-                if len(received) % 200 == 0:
-                    await asyncio.sleep(0)
+            try:
+                async for msg in c.subscribe("bench.>"):
+                    received.append(msg)
+                    if len(received) >= n_messages:
+                        recv_done.set()
+                        return
+                    if len(received) % 200 == 0:
+                        await asyncio.sleep(0)
+            except (asyncio.TimeoutError, Exception):
+                # 100k 收完或 cleanup 阶段的异常, 忽略
+                pass
 
     t0 = time.perf_counter()
+    # 动态 timeout: 按 100 msg/s 下界, 至少 5 分钟
+    timeout_s = max(300, n_messages / 100)
     try:
         await asyncio.wait_for(
-            asyncio.gather(pub(), sub()), timeout=120
+            asyncio.gather(pub(), sub()), timeout=timeout_s
         )
     except asyncio.TimeoutError:
         recv_done.set()

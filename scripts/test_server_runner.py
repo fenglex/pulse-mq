@@ -42,6 +42,8 @@ def main() -> None:
         max_concurrency=100,
         data_buffer_size=50_000,
         ctrl_buffer_size=5_000,
+        zmq_sndhwm=200_000,  # 100k 压测需要更大的 XPUB 队列
+        zmq_xpub_nodrop=True,  # 队列满时阻塞 pub, 不丢消息
     )
 
     install_event_loop(config.use_uvloop)

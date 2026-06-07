@@ -20,6 +20,7 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "PULSEMQ_POOL_SIZE": ("object_pool_size", int),
     "PULSEMQ_ZMQ_RCVHWM": ("zmq_rcvhwm", int),
     "PULSEMQ_ZMQ_SNDHWM": ("zmq_sndhwm", int),
+    "PULSEMQ_ZMQ_XPUB_NODROP": ("zmq_xpub_nodrop", lambda v: v.lower() in ("true", "1", "yes")),
     "PULSEMQ_HEARTBEAT_IVL": ("zmq_heartbeat_ivl", int),
     "PULSEMQ_HEARTBEAT_TIMEOUT": ("zmq_heartbeat_timeout", int),
     "PULSEMQ_HEARTBEAT_TTL": ("zmq_heartbeat_ttl", int),
@@ -57,6 +58,7 @@ class ServerConfig:
     # ZMQ socket
     zmq_rcvhwm: int = 10000
     zmq_sndhwm: int = 10000
+    zmq_xpub_nodrop: bool = False  # True = pub 阻塞, False = 丢消息
     zmq_heartbeat_ivl: int = 2000
     zmq_heartbeat_timeout: int = 5000
     zmq_heartbeat_ttl: int = 8000
