@@ -88,10 +88,20 @@ class MessageRouter:
 
     def unsubscribe(self, identity: bytes, topic: str) -> None:
         """取消订阅（精确或通配符）。"""
-        # 尝试精确取消
-        subs = self._topic_subscriptions_remove(identity, topic)
-        # 尝试通配符取消
-        self._wildcard_unsubscribe(identity, topic)
+        # 先尝试作为通配符 pattern 取消（清理 _wildcard_subscriptions
+        # 以及通配符订阅时展开过的精确 topic 索引）
+        if topic in self._wildcard_subscriptions:
+            self._wildcard_unsubscribe(identity, topic)
+            # 找出该通配符下展开过的精确 topic, 一并清理
+            expanded = self._identity_subscriptions.get(identity, set())
+            for name in list(expanded):
+                if topic_match(topic, name):
+                    self._topic_subscriptions_remove(identity, name)
+            # 通配符缓存失效
+            self._wildcard_cache_valid = False
+            return
+        # 否则按精确 topic 取消
+        self._topic_subscriptions_remove(identity, topic)
 
     def subscribe_wildcard(self, identity: bytes, pattern: str) -> list[str]:
         """通配符订阅：匹配已有精确 topic 并展开。
