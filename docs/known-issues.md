@@ -76,3 +76,13 @@
 
 - [P0][日期 2026-06-07] I34: `_adapt_batch_size` 在 batch_size=1 时 grow/shrink 振荡 (`engine.py:316-331`)。原因: grow 条件 `h >= effective * 0.8` 在 `effective=1, h=1` 时恒成立 → 每个 adapt_window 都触发 grow 到 2; 下一个 window 触发 shrink 回 1; 永久 1↔2 振荡。修复: grow 条件前置 `effective >= 2` 守卫, 避免 floor 退化场景下的虚假 grow。
 
+## Task 6 审读（client/async_client.py）
+
+- [P1][日期 2026-06-07] I35: `unsubscribe()` 调 ZMQ `setsockopt(UNSUBSCRIBE, ...)` 未捕获 `ZMQError` — 取消未订阅过的精确 topic 可能在某些 libzmq 版本抛错逃逸到 `__aexit__` (`async_client.py:307-312`)。修复: try/except `zmq.ZMQError` + `logger.debug`，避免 caller 在清理路径上踩到边缘错误。
+- [P2][日期 2026-06-07] I36: `query()` 透传用户 dict, 服务端 `_handle_query` 期望 `query.get("action", "")` 取字符串 ("system_status" 等)。原 docstring 完全未说明 action 字段 (`async_client.py:316`)。修复: docstring 显式列出 V1 支持的 action 与示例。客户端无任何字段映射/校验逻辑；用户传错键名 (如 "type") 会得到 server 端 3004 ERROR 帧, 但本方法只解析 QUERY 响应, 不会主动处理 ERROR → 已知限制，v0.6 不修，留待 v0.7 在 query() 入口校验 + 错误帧处理。
+- [P3][日期 2026-06-07] I37: `connect()` 不探测服务端可达性。ZMQ DEALER/SUB `connect()` 立即返回（不等待 TCP 握手）, 客户端 connect 成功 ≠ 服务端在跑。Task 6 验证：测试用 `server_subprocess` fixture 启动真实 server, 所以 connect 后第一次操作成功; 真实部署如果 server 不可达, 客户端 connect 不会报错, 第一次 publish/subscribe 才超时。建议 v0.7 加可选的 `connect_timeout` 探测 (发一个 PING 等 PONG)。
+- [P3][日期 2026-06-07] I38: `_reconnect()` 重建 SUB socket 时清空所有 ZMQ 层 filter。`subscribe()` 循环体内会重新 setsockopt SUBSCRIBE — 这是正确的（重连时不会丢订阅）。但 `publish()` 调用前如果 socket 断开, 重连后 SUB socket 上如果有未重发的过滤将丢失, 后续 `subscribe()` 第一次进入循环体时才会重建 — 在 connect→subscribe 期间重连的极端场景下, publish 不受影响 (publish 走 DEALER, 不依赖 SUB 过滤), 不会丢消息。**无 bug**, 仅文档: 当前实现是"lazy re-subscribe on first recv after reconnect"。
+- [P3][日期 2026-06-07] I39: `_reconnect()` 用 `await asyncio.sleep(delay)`, 期间 `subscribe()` 循环体阻塞在 sleep, 不处理消息 — 重连过程中到达的消息会在 server 侧 buffer (buffer_enabled=False 时丢弃) 或丢失, client 重连后会因新 SUB socket 错过。重连中 broker 没有 PUB retention 机制, 这是 ZMQ pub/sub 模型固有限制, 不是 client bug。建议 docstring 加一句说明。
+- [P3][日期 2026-06-07] I40: `subscribe()` 的 `wildcard_topics` 列表为空时, `if msg and (not wildcard_topics or any(...))` 短路求值返回 True, 所有消息放行。代码 `not wildcard_topics` 看起来可疑, 实际语义正确（精确订阅时 ZMQ 层已过滤）。**无 bug**, 仅记录以便后人理解。
+- [P2][日期 2026-06-07] I41: `connect()` 创建 `self._ctx` 在最前面, 如果中途 `self._ctx.socket(...)` 抛异常 (e.g. OOM), `self._ctx` 已分配但未绑定到 `term()`。修复: 用 try/except 包 socket 创建, 失败时 term 已分配的 ctx。当前实现不会 leak (异常向上抛出后对象 GC, `__aenter__` 失败时 `__aexit__` 不会被调) — **不阻塞**, 但实现更稳健的版本可加 try/except 释放。
+

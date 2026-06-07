@@ -302,19 +302,48 @@ class PulseClient:
                     break
 
     async def unsubscribe(self, topic: str) -> None:
-        """取消订阅。"""
+        """取消订阅。
+
+        Args:
+            topic: 要取消的精确或通配符 topic。
+
+        Note:
+            1. 服务端始终收到原始 topic 字符串（含通配符）。
+            2. ZMQ SUB 层: 通配符订阅时取消的是空过滤 (b"")，精确 topic
+               取消时取消该 topic 字符串前缀。两次 unsub 同一 topic 是幂等的
+               (libzmq 不会抛错)，但我们仍捕获 ZMQError 以兼容旧版/边缘场景。
+        """
         frames = FrameCodec.encode(MsgType.UNSUB, topic, 0, b"")
         await self._dealer.send_multipart(frames)
         # ZMQ 层: 通配符订阅时取消的是空过滤
-        if self._is_wildcard(topic):
-            self._sub.setsockopt(zmq.UNSUBSCRIBE, b"")
-        else:
-            self._sub.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
+        try:
+            if self._is_wildcard(topic):
+                self._sub.setsockopt(zmq.UNSUBSCRIBE, b"")
+            else:
+                self._sub.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
+        except zmq.ZMQError as e:
+            # 边缘场景: 取消未订阅过的 topic 可能在某些 libzmq 版本抛错
+            logger.debug("UNSUBSCRIBE 忽略 ZMQ 错误: %s", e)
 
     # ---- 查询 ----
 
     async def query(self, params: dict) -> dict:
-        """发送管理查询。"""
+        """发送管理查询。
+
+        Args:
+            params: 查询参数。**必须**包含 ``"action"`` 键，值为查询类型字符串。
+                V1 支持的 action:
+                  - ``"system_status"``: 返回系统状态 (topic_count / subscription_count / connection_count / timestamp / status)
+
+        Returns:
+            服务端响应 dict。当前实现对未知 action 会让 server 端通过
+            ``_send_error`` 发出 ERROR 帧 (code 3004)，但本方法只解析 QUERY
+            响应 — ERROR 帧会被当作下条 QUERY 响应消费，可能导致调用方拿到
+            错误数据。已知限制：v0.6。
+
+        Example:
+            status = await client.query({"action": "system_status"})
+        """
         payload = FrameCodec.encode_payload(params, self._DEFAULT_SER, self._DEFAULT_COMP)
         frames = FrameCodec.encode(
             MsgType.QUERY, "", 0, payload, self._DEFAULT_SER, self._DEFAULT_COMP
