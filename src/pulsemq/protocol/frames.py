@@ -19,6 +19,16 @@ from pulsemq.serialization.registry import SerializationRegistry, CompressionReg
 _RECORD_COUNT_STRUCT = struct.Struct(">I")
 
 
+def _is_dataframe(obj) -> bool:
+    """检查 obj 是否是 pandas DataFrame (避免对非 df 误判)."""
+    cls = type(obj)
+    if cls.__name__ == "DataFrame" and (
+        cls.__module__ == "pandas" or cls.__module__.startswith("pandas.")
+    ):
+        return True
+    return False
+
+
 @dataclass
 class DecodedFrame:
     """解码后的帧数据。"""
@@ -108,10 +118,20 @@ class FrameCodec:
 
     @staticmethod
     def encode_payload(obj, ser_fmt: str = "msgpack", comp: str = "none") -> bytes:
-        """序列化 + 压缩 payload。"""
-        serializer = SerializationRegistry.get(ser_fmt)
+        """序列化 + 压缩 payload。
+
+        DataFrame + msgpack 走 Cython 加速路径 (loader 自动 fallback 到纯 Python).
+        """
+        if ser_fmt == "msgpack" and _is_dataframe(obj):
+            from pulsemq.serialization._df_msgpack_loader import (
+                encode_dataframe_to_msgpack,
+            )
+            encoded = encode_dataframe_to_msgpack(obj, use_bin_type=True)
+        else:
+            serializer = SerializationRegistry.get(ser_fmt)
+            encoded = serializer.serialize(obj)
         compressor = CompressionRegistry.get(comp)
-        return compressor.compress(serializer.serialize(obj))
+        return compressor.compress(encoded)
 
     @staticmethod
     def decode_payload(data: bytes, ser_fmt: str = "msgpack", comp: str = "none"):

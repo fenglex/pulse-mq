@@ -248,13 +248,8 @@ class PulseClient:
         ser_fmt = self._resolve_format(data, format)
         self._validate_data(data, ser_fmt)
         record_count = self._infer_record_count(data)
-        # DataFrame 走 msgpack 时先转成 list[dict]（msgpack 无法直接序列化 DataFrame）
-        payload_obj = (
-            data.to_dict(orient="records")
-            if ser_fmt == "msgpack" and isinstance(data, pd.DataFrame)
-            else data
-        )
-        payload = FrameCodec.encode_payload(payload_obj, ser_fmt, compression)
+        # DataFrame 走 msgpack 时, FrameCodec.encode_payload 内部走 Cython 加速路径
+        payload = FrameCodec.encode_payload(data, ser_fmt, compression)
 
         # 批模式: 入 Batcher, 不立即发送
         if self._batcher is not None and self._batch_size > 1:

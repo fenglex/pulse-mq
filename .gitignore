@@ -14,3 +14,9 @@ htmlcov/
 # test runner logs
 err.log
 out.log
+# Cython 编译产物
+src/pulsemq/serialization/_df_msgpack.c
+src/pulsemq/serialization/_df_msgpack.cp*
+src/pulsemq/serialization/_df_msgpack.pyd
+src/pulsemq/serialization/_df_msgpack.so
+build/
