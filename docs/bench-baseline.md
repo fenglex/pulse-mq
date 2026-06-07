@@ -26,3 +26,9 @@
 | df-pyarrow | snappy | 1411 | 0.21 | 0.39 |
 | df-pyarrow | lz4 | 1410 | 0.21 | 0.40 |
 | df-pyarrow | zstd | 1370 | 0.23 | 0.38 |
+
+## 并发压测 (4 pub × 4 sub, str/none)
+
+- 收/发: 500/2000 (总收 2003 = 4 sub × 广播)
+- 吞吐: 1611 msg/s
+- 耗时: 0.31s
