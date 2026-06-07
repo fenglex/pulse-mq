@@ -57,3 +57,22 @@
 - [P2][日期 2026-06-07] I28: `MsgpackSerializer.serialize` 用 `use_bin_type=True` (registry.py:65), `deserialize` 用 `raw=False` (registry.py:69) — 不对称语义: serialize 把 str 当 bin (bytes), deserialize 把 bin 解为 str (Python 3 默认)。组合下 roundtrip OK, 但若用户单独调用 serialize 拿到的 bytes 再传给第三方解码器, 行为会变 (第三方按 utf-8 解 str)。建议: docstring 注明这一约定。
 - [P2][日期 2026-06-07] I29: 模块顶部 docstring 列的序列化器有 4 个 (`StringSerializer/MsgpackSerializer/PyArrowSerializer/BytesSerializer`) 但类名实际是 `StringSerializer` (而非 `StrSerializer`) — 与 plan 中提到 `StrSerializer` 不一致 (registry.py:3-4)。已修正测试导入, 不阻塞。
 
+## Task 4 审读（transport/router/auth/handlers/engine/pipeline/pool/overload）
+
+### auth/permission.py
+
+- [P0][日期 2026-06-07] I30: `topic_match` 中间位置 `*` 错误接受空段 — `topic_match("a.*.c", "a..c")` 返回 True, 但语义上 `*` 应匹配恰好一个非空段 (`permission.py:55-62`)。修复: 已在 `_match_parts` 中间 `*` 分支加 `if not topic[ti]: return False` 守卫。`fnmatch` 对 `"a.*.c"` 匹配 `"a..c"` 也返回 True, 因此是自实现 `_match_parts` 的语义差异 — 与 fnmatch 行为不一致, 但项目自实现应严格定义语义, 选择"非空段"更符合用户预期。
+- [P0][日期 2026-06-07] I31: `PermissionService` 和 `PermissionCache` 缺单元测试 — Task 4 未直接覆盖 (权限测试需 mock perm_repo), 留待 Task 8 (auth 审计)。验证: `topic_match` 边界由 test_router.py::test_topic_match_* 系列覆盖, 通过。
+
+### engine/router.py
+
+- [P0][日期 2026-06-07] I32: `unsubscribe(identity, pattern)` 取消通配符订阅时, 只清理了 `_wildcard_subscriptions` 索引, 未清理通配符订阅时由 `subscribe_wildcard` 展开过的精确 topic `_topic_subscribers` 索引 — 导致 `get_subscribers(expanded_topic)` 仍返回该 identity (`router.py:89-94`)。示例: `subscribe_wildcard(c1, "team-a.>")` 后, `c1` 在 `_topic_subscribers["team-a.mkt.sh.600000"]` 中; `unsubscribe(c1, "team-a.>")` 后, 该精确 topic 索引中 `c1` 仍在, 消息会继续推送给断开连接的客户。修复: `unsubscribe` 先检查 `topic` 是否在 `_wildcard_subscriptions` 中, 若是则清理精确 topic 索引 + 失效缓存。
+
+### engine/handlers.py
+
+- [P0][日期 2026-06-07] I33: `dispatch()` 解码 `FrameCodec.decode_server(server_frames)` 在 try 块之外 (`handlers.py:70`), 非法帧数 (如 2 帧) 抛 `ValueError` 会逃逸出 dispatch, 引擎主循环的 `_process_single` 内层 `except Exception` 兜底, 但 contexts 从未 acquire, 无 finally 释放, 整个引擎可能因反复异常而 busy-loop。修复: 解码移到 try 内, 异常时 logger.warning + return。
+
+### engine/engine.py
+
+- [P0][日期 2026-06-07] I34: `_adapt_batch_size` 在 batch_size=1 时 grow/shrink 振荡 (`engine.py:316-331`)。原因: grow 条件 `h >= effective * 0.8` 在 `effective=1, h=1` 时恒成立 → 每个 adapt_window 都触发 grow 到 2; 下一个 window 触发 shrink 回 1; 永久 1↔2 振荡。修复: grow 条件前置 `effective >= 2` 守卫, 避免 floor 退化场景下的虚假 grow。
+
