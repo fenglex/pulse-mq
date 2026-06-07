@@ -2,7 +2,6 @@
 
 覆盖:
 - _is_pub_frames 静态方法（plan 要求: 不依赖真实 socket）
-- _adapt_batch_size 自适应批大小逻辑
 - _drain_buffers 优先级消费
 - metrics 字段
 - EngineMetrics dataclass
