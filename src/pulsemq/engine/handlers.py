@@ -67,8 +67,13 @@ class MessageHandlers:
 
     async def dispatch(self, server_frames: list[bytes]) -> None:
         """根据 msg_type 分发到对应处理器（含拦截器链）。"""
-        decoded = FrameCodec.decode_server(server_frames)
-        msg_type = decoded.msg_type
+        # 解码必须在 try 内, 否则非法帧会逃逸异常, 引擎主循环 catch 不到
+        try:
+            decoded = FrameCodec.decode_server(server_frames)
+            msg_type = decoded.msg_type
+        except Exception as e:
+            logger.warning("帧解码失败: %s (frames=%d)", e, len(server_frames))
+            return
 
         # 从对象池获取上下文
         ctx = self._ctx_pool.acquire(
