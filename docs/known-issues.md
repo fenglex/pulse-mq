@@ -42,3 +42,7 @@
 - [P1][日期 2026-06-07] I19: control 集合在 msg_type.py:22-24 与 overload.py:53-55 各硬编码一份, 存在单点变更风险; 建议 overload.py 改用 `MsgType.is_control(msg_type)` 单一来源。
 - [P2][日期 2026-06-07] I20: 枚举值定义后无单元测试覆盖 `from_byte()` 的合法/非法分支 — 留给 Task 2 (protocol 单测)。
 
+## Task 2 审读（tests/unit/test_protocol_*.py）
+
+- [P3][日期 2026-06-07] I21: `FrameFlags.decode()` 对未知 comp_bits 的"静默回退到 none"防御性代码实际上不可达 — comp_bits 占 2 bits, 范围 0-3 全部对应合法压缩算法 (none/snappy/lz4/zstd), 任何单字节输入都不可能产生未知 comp_bits (flags.py:55-58)。_COMP_MAP_REV.get(bits, "none") 的 default 参数实际上是死代码。验证: `(0xFF >> 3) & 0b11` = 0b11 = "zstd", 已知; `(0x00 >> 3) & 0b11` = 0b00 = "none", 已知; 中间值同理。结论: 静默回退路径只对 ser_bits (3 bits) 有效, 对 comp_bits 是死代码。Task 2 测试已文档化此事实 (test_protocol_flags.py::test_decode_unknown_comp_defaults_to_none)。
+

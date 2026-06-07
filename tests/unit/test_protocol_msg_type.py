@@ -1,0 +1,21 @@
+"""MsgType 枚举 单测。"""
+from __future__ import annotations
+
+from pulsemq.protocol.msg_type import MsgType
+
+
+def test_msg_types_distinct():
+    """所有 msg_type 值唯一。"""
+    values = [getattr(MsgType, name) for name in dir(MsgType)
+              if not name.startswith("_") and isinstance(getattr(MsgType, name), int)]
+    assert len(values) == len(set(values)), f"重复 msg_type: {values}"
+
+
+def test_msg_types_in_byte_range():
+    """msg_type 必须能用单字节表示。"""
+    for name in dir(MsgType):
+        if name.startswith("_"):
+            continue
+        v = getattr(MsgType, name)
+        if isinstance(v, int):
+            assert 0 <= v < 256, f"{name}={v} 超出单字节范围"
