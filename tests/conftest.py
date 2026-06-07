@@ -17,6 +17,12 @@ import time
 import pytest
 import pytest_asyncio
 
+# Windows 上 pyzmq 不兼容 ProactorEventLoop, 必须在导入 zmq/asyncio 相关模块前切换
+if sys.platform == "win32":
+    from pulsemq.event_loop import install_event_loop
+
+    install_event_loop(use_uvloop=False)
+
 
 def _free_port() -> int:
     """找一个当前空闲的 TCP 端口。"""
