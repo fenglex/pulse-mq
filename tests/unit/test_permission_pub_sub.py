@@ -297,81 +297,13 @@ async def test_list_user_permissions_multiple():
     assert patterns == {"a.*", "b.>", "x.>"}
 
 
-# ---- batch 配置 ----
+# ---- batch 配置 (v1.0 batcher 已撤销, 端点已删除) ----
 
 
 @pytest.mark.asyncio
-async def test_get_batch_config_default():
-    """未注入 user_repo 时抛 RuntimeError。"""
-    perm_repo = _FakePermRepo()
-    svc = PermissionService(perm_repo)  # 不传 user_repo
-
-    with pytest.raises(RuntimeError, match="user_repo"):
-        await svc.get_batch_config(1)
-
-
-@pytest.mark.asyncio
-async def test_get_batch_config_user_not_found():
-    perm_repo = _FakePermRepo()
-    user_repo = _FakeUserRepo()
-    svc = PermissionService(perm_repo, user_repo=user_repo)
-
-    with pytest.raises(LookupError):
-        await svc.get_batch_config(9999)
-
-
-@pytest.mark.asyncio
-async def test_get_batch_config_returns_dict():
-    perm_repo = _FakePermRepo()
-    user_repo = _FakeUserRepo()
-    user_repo.add(User(username="alice", api_key="k1", role="user", namespace="",
-                       batch_size=50, batch_interval_ms=25, batch_max_wait_ms=100))
-    svc = PermissionService(perm_repo, user_repo=user_repo)
-
-    cfg = await svc.get_batch_config(1)
-    assert cfg == {
-        "batch_size": 50,
-        "batch_interval_ms": 25,
-        "batch_max_wait_ms": 100,
-    }
-
-
-@pytest.mark.asyncio
-async def test_set_batch_config_updates_user():
-    perm_repo = _FakePermRepo()
-    user_repo = _FakeUserRepo()
-    user_repo.add(User(username="alice", api_key="k1", role="user", namespace=""))
-    svc = PermissionService(perm_repo, user_repo=user_repo)
-
-    await svc.set_batch_config(1, batch_size=200, batch_interval_ms=100, batch_max_wait_ms=500)
-    cfg = await svc.get_batch_config(1)
-    assert cfg == {
-        "batch_size": 200,
-        "batch_interval_ms": 100,
-        "batch_max_wait_ms": 500,
-    }
-
-
-@pytest.mark.asyncio
-async def test_set_batch_config_invalid_args():
-    perm_repo = _FakePermRepo()
-    user_repo = _FakeUserRepo()
-    user_repo.add(User(username="alice", api_key="k1", role="user", namespace=""))
-    svc = PermissionService(perm_repo, user_repo=user_repo)
-
-    with pytest.raises(ValueError, match="batch_size"):
-        await svc.set_batch_config(1, 0, 50, 200)
-    with pytest.raises(ValueError, match="batch_interval_ms"):
-        await svc.set_batch_config(1, 100, -1, 200)
-    with pytest.raises(ValueError, match="batch_max_wait_ms"):
-        await svc.set_batch_config(1, 100, 50, -1)
-
-
-@pytest.mark.asyncio
-async def test_set_batch_config_user_not_found():
-    perm_repo = _FakePermRepo()
-    user_repo = _FakeUserRepo()
-    svc = PermissionService(perm_repo, user_repo=user_repo)
-
-    with pytest.raises(LookupError):
-        await svc.set_batch_config(9999, 100, 50, 200)
+async def test_permission_service_has_no_batch_config_methods():
+    """get_batch_config / set_batch_config 已随 batcher 策略移除。"""
+    assert not hasattr(PermissionService, "get_batch_config"), \
+        "PermissionService.get_batch_config 应当已被移除"
+    assert not hasattr(PermissionService, "set_batch_config"), \
+        "PermissionService.set_batch_config 应当已被移除"

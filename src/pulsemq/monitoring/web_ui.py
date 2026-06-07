@@ -123,7 +123,6 @@ pre { background: #0f172a; padding: 12px; border-radius: 4px;
     <button data-tab="topics">主题</button>
     <button data-tab="clients">客户端</button>
     <button data-tab="users">用户/权限</button>
-    <button data-tab="batch">批量配置</button>
 </nav>
 <main>
     <!-- 概览 -->
@@ -169,18 +168,6 @@ pre { background: #0f172a; padding: 12px; border-radius: 4px;
             <button class="btn small" onclick="loadPermissions()">刷新</button>
         </div>
         <div id="permissions-content"></div>
-    </div>
-
-    <!-- 批量配置 -->
-    <div id="tab-batch" class="tab">
-        <h2 style="margin-bottom: 16px; font-size: 18px;">BATCH 客户端配置</h2>
-        <div class="form-row">
-            <div>
-                <label>选择用户</label>
-                <select id="batch-user-select" onchange="loadBatchConfig()"></select>
-            </div>
-        </div>
-        <div id="batch-config-form"></div>
     </div>
 </main>
 
@@ -247,7 +234,6 @@ document.querySelectorAll('nav button').forEach(btn => {
         if (btn.dataset.tab === 'topics') loadTopics();
         if (btn.dataset.tab === 'clients') loadClients();
         if (btn.dataset.tab === 'users') { loadUsers(); loadPermissions(); }
-        if (btn.dataset.tab === 'batch') { loadUsers().then(populateBatchSelect); }
     });
 });
 
@@ -311,10 +297,8 @@ async function loadSystem() {
     if (data) { state.system = data; renderOverview(); }
 }
 async function loadBatchConfig() {
-    const uid = $('batch-user-select').value;
-    if (!uid) return;
-    const data = await api(`/api/v1/users/${uid}/batch_config`);
-    if (data) renderBatchForm(data);
+    // batch_config 端点已移除, 保留空函数避免外部误调用
+    return;
 }
 async function loadTopicHistory(topic) {
     const data = await api(`/api/v1/topics/${encodeURIComponent(topic)}/history?minutes=60`);
@@ -341,7 +325,6 @@ function renderRealtime() {
         { label: '丢弃总数', value: r.dropped_total },
         { label: '错误率 (/s)', value: r.error_rate, sm: true },
         { label: '客户端数', value: r.clients_online },
-        { label: '引擎批大小', value: r.engine_batch_size, sm: true },
         { label: '并发使用率', value: (r.engine_concurrency_usage * 100).toFixed(1) + '%', sm: true }
     ];
     $('realtime-cards').innerHTML = cards.map(c =>
@@ -494,20 +477,12 @@ function renderPermissions() {
 }
 
 function renderBatchForm(data) {
-    $('batch-config-form').innerHTML = `
-        <div class="form-row">
-            <div><label>batch_size</label><input id="bs-size" type="number" value="${data.batch_size}"></div>
-            <div><label>batch_interval_ms</label><input id="bs-interval" type="number" value="${data.batch_interval_ms}"></div>
-            <div><label>batch_max_wait_ms</label><input id="bs-wait" type="number" value="${data.batch_max_wait_ms}"></div>
-        </div>
-        <button class="btn" onclick="submitBatchConfig(${data.user_id})">保存</button>
-    `;
+    // batch_config 端点已移除, 保留空函数避免外部误调用
+    $('batch-config-form').innerHTML = '<p>批量配置已废弃 (batcher 策略撤销)</p>';
 }
 
 function populateBatchSelect(users) {
-    const sel = $('batch-user-select');
-    sel.innerHTML = users.map(u => `<option value="${u.id}">${escapeHtml(u.username)} (${u.id})</option>`).join('');
-    if (users.length > 0) loadBatchConfig();
+    // batch_config 端点已移除, 保留空函数避免外部误调用
 }
 
 // ---- 提交操作 ----
@@ -524,7 +499,7 @@ async function submitCreateUser() {
     };
     if (!body.username) { alert('用户名不能为空'); return; }
     const r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify(body) });
-    if (r) { hideModal('modal-user'); loadUsers().then(populateBatchSelect); }
+    if (r) { hideModal('modal-user'); loadUsers(); }
 }
 async function submitGrantPerm() {
     const body = {
@@ -537,13 +512,8 @@ async function submitGrantPerm() {
     if (r) { hideModal('modal-perm'); loadPermissions(); }
 }
 async function submitBatchConfig(uid) {
-    const body = {
-        batch_size: parseInt($('bs-size').value, 10),
-        batch_interval_ms: parseInt($('bs-interval').value, 10),
-        batch_max_wait_ms: parseInt($('bs-wait').value, 10)
-    };
-    const r = await api(`/api/v1/users/${uid}/batch_config`, { method: 'PUT', body: JSON.stringify(body) });
-    if (r) alert('已保存');
+    // batch_config 端点已移除, 保留空函数避免外部误调用
+    alert('批量配置已废弃');
 }
 async function regenKey(uid) {
     if (!confirm('确认重置用户 ' + uid + ' 的 API Key?')) return;

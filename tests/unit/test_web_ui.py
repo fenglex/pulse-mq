@@ -22,8 +22,10 @@ def test_index_html_basic():
 
 
 def test_index_html_has_all_tabs():
-    for tab in ("overview", "topics", "clients", "users", "batch"):
+    for tab in ("overview", "topics", "clients", "users"):
         assert f'data-tab="{tab}"' in INDEX_HTML, f"missing tab: {tab}"
+    # batch tab 已移除 (batcher 策略撤销)
+    assert 'data-tab="batch"' not in INDEX_HTML, "batch tab 不应再存在"
 
 
 def test_index_html_has_sse_support():
@@ -58,7 +60,6 @@ def test_index_html_handles_all_apis():
         "/api/v1/clients",
         "/api/v1/users",
         "/api/v1/permissions",
-        "batch_config",  # 动态 URL 模板: /api/v1/users/${uid}/batch_config
     ):
         assert api in INDEX_HTML, f"missing API: {api}"
 

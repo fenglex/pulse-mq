@@ -111,7 +111,8 @@ def test_match_user_path_api_keys(env):
 
 
 def test_match_user_path_batch_config(env):
-    assert AdminServer._match_user_path("/api/v1/users/42/batch_config", "PUT", b"") == "BATCH:42"
+    """batch_config 路径已移除 (batcher 策略撤销), 应返回 None。"""
+    assert AdminServer._match_user_path("/api/v1/users/42/batch_config", "PUT", b"") is None
 
 
 def test_match_user_path_invalid(env):
@@ -171,18 +172,15 @@ def test_user_to_dict_all_fields():
         namespace="ns1",
         disabled=False,
         max_connections=10,
-        batch_size=200,
-        batch_interval_ms=100,
-        batch_max_wait_ms=500,
         created_at=1.0,
         updated_at=2.0,
     )
     d = _user_to_dict(u)
     assert d["id"] == 7
     assert d["username"] == "bob"
-    assert d["batch_size"] == 200
-    assert d["batch_interval_ms"] == 100
-    assert d["batch_max_wait_ms"] == 500
+    assert "batch_size" not in d
+    assert "batch_interval_ms" not in d
+    assert "batch_max_wait_ms" not in d
     assert d["created_at"] == 1.0
 
 

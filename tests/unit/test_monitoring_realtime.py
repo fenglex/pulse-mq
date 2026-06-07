@@ -171,7 +171,6 @@ def test_snapshot_has_all_keys():
         "error_rate",
         "dropped_total",
         "backpressure",
-        "engine_batch_size",
         "engine_pending_tasks",
         "engine_concurrency_usage",
     }
@@ -194,11 +193,12 @@ def test_snapshot_reflects_updates():
 def test_update_engine_metrics_propagates():
     """update_engine_metrics 应写入 snapshot 字段。"""
     m = RealtimeMetrics()
-    m.update_engine_metrics(batch_size=8, pending_tasks=3, concurrency_usage=0.42)
+    m.update_engine_metrics(pending_tasks=3, concurrency_usage=0.42)
     s = m.snapshot()
-    assert s["engine_batch_size"] == 8
     assert s["engine_pending_tasks"] == 3
     assert s["engine_concurrency_usage"] == 0.42
+    # engine_batch_size 字段已移除
+    assert "engine_batch_size" not in s
 
 
 def test_backpressure_flag_toggleable():

@@ -97,7 +97,6 @@ class RealtimeMetrics:
     backpressure: bool = False
 
     # 引擎指标
-    _engine_batch_size: int = 1
     _engine_pending_tasks: int = 0
     _engine_concurrency_usage: float = 0.0
 
@@ -130,16 +129,14 @@ class RealtimeMetrics:
             "dropped_total": self.dropped_messages,
             "backpressure": self.backpressure,
             # 引擎指标（由外部更新）
-            "engine_batch_size": self._engine_batch_size,
             "engine_pending_tasks": self._engine_pending_tasks,
             "engine_concurrency_usage": self._engine_concurrency_usage,
         }
 
     def update_engine_metrics(
-        self, batch_size: int, pending_tasks: int, concurrency_usage: float
+        self, pending_tasks: int, concurrency_usage: float
     ) -> None:
         """更新引擎运行指标。"""
-        self._engine_batch_size = batch_size
         self._engine_pending_tasks = pending_tasks
         self._engine_concurrency_usage = concurrency_usage
 

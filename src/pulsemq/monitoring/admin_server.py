@@ -1,7 +1,7 @@
 """后台管理 API + SSE 实时推送。
 
 与 monitoring/api.py 中极简的 MetricsHTTPServer 不同, AdminServer 提供:
-- 完整 REST 端点 (Topics / Clients / Users / Permissions / BatchConfig)
+- 完整 REST 端点 (Topics / Clients / Users / Permissions)
 - SSE 实时指标推送
 - 嵌入的 Web UI (单页应用)
 
@@ -47,9 +47,6 @@ def _user_to_dict(user) -> dict:
         "namespace": user.namespace,
         "disabled": user.disabled,
         "max_connections": user.max_connections,
-        "batch_size": user.batch_size,
-        "batch_interval_ms": user.batch_interval_ms,
-        "batch_max_wait_ms": user.batch_max_wait_ms,
         "created_at": user.created_at,
         "updated_at": user.updated_at,
     }
@@ -77,8 +74,6 @@ class AdminServer:
       - GET  /api/v1/permissions                JSON
       - POST /api/v1/permissions                JSON 授予
       - DELETE /api/v1/permissions              JSON 撤销 (query: group_id, topic_pattern, action)
-      - GET  /api/v1/users/{user_id}/batch_config   JSON
-      - PUT  /api/v1/users/{user_id}/batch_config   JSON
       - GET  /api/v1/system/status              JSON
     """
 
@@ -332,8 +327,7 @@ class AdminServer:
 
     @staticmethod
     def _match_user_path(path: str, method: str, body: bytes) -> str | None:
-        """匹配 /api/v1/users/{user_id}, /api/v1/users/{user_id}/api_keys,
-        /api/v1/users/{user_id}/batch_config"""
+        """匹配 /api/v1/users/{user_id}, /api/v1/users/{user_id}/api_keys"""
         prefix = "/api/v1/users/"
         if not path.startswith(prefix):
             return None
@@ -341,7 +335,6 @@ class AdminServer:
         if not rest:
             return None
         # /api/v1/users/{user_id}/api_keys -> "API_KEYS:{user_id}"
-        # /api/v1/users/{user_id}/batch_config -> "BATCH:{user_id}"
         # /api/v1/users/{user_id} -> "USER:{user_id}"
         parts = rest.split("/")
         if len(parts) == 1:
@@ -349,8 +342,6 @@ class AdminServer:
         if len(parts) == 2:
             if parts[1] == "api_keys":
                 return f"API_KEYS:{parts[0]}"
-            if parts[1] == "batch_config":
-                return f"BATCH:{parts[0]}"
         return None
 
     # ---- Handler: Topics ----
@@ -492,9 +483,6 @@ class AdminServer:
             namespace=data.get("namespace", ""),
             disabled=bool(data.get("disabled", False)),
             max_connections=int(data.get("max_connections", 10)),
-            batch_size=int(data.get("batch_size", 100)),
-            batch_interval_ms=int(data.get("batch_interval_ms", 50)),
-            batch_max_wait_ms=int(data.get("batch_max_wait_ms", 200)),
         )
         try:
             created = await self._user_repo.create(new_user)
@@ -524,9 +512,6 @@ class AdminServer:
             return
         if kind == "API_KEYS":
             await self._handle_user_api_keys(writer, method, user_id)
-            return
-        if kind == "BATCH":
-            await self._handle_user_batch(writer, method, user_id, body)
             return
         await self._respond_json(writer, 404, {"error": "unknown sub-route"})
 
@@ -566,12 +551,6 @@ class AdminServer:
                 user.disabled = bool(data["disabled"])
             if "max_connections" in data:
                 user.max_connections = int(data["max_connections"])
-            if "batch_size" in data:
-                user.batch_size = int(data["batch_size"])
-            if "batch_interval_ms" in data:
-                user.batch_interval_ms = int(data["batch_interval_ms"])
-            if "batch_max_wait_ms" in data:
-                user.batch_max_wait_ms = int(data["batch_max_wait_ms"])
             updated = await self._user_repo.update(user)
             await self._respond_json(writer, 200, _user_to_dict(updated))
             return
@@ -606,50 +585,6 @@ class AdminServer:
             "user_id": updated.id,
             "api_key": updated.api_key,
         })
-
-    async def _handle_user_batch(
-        self,
-        writer: asyncio.StreamWriter,
-        method: str,
-        user_id: int,
-        body: bytes,
-    ) -> None:
-        if self._perm_service is None:
-            await self._respond_json(writer, 503, {"error": "perm service not available"})
-            return
-        if method == "GET":
-            try:
-                cfg = await self._perm_service.get_batch_config(user_id)
-            except LookupError as e:
-                await self._respond_json(writer, 404, {"error": str(e)})
-                return
-            except Exception as e:
-                await self._respond_json(writer, 500, {"error": str(e)})
-                return
-            await self._respond_json(writer, 200, {"user_id": user_id, **cfg})
-            return
-        if method == "PUT":
-            try:
-                data = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                await self._respond_json(writer, 400, {"error": "invalid json"})
-                return
-            try:
-                await self._perm_service.set_batch_config(
-                    user_id=user_id,
-                    batch_size=int(data.get("batch_size", 100)),
-                    batch_interval_ms=int(data.get("batch_interval_ms", 50)),
-                    batch_max_wait_ms=int(data.get("batch_max_wait_ms", 200)),
-                )
-            except LookupError as e:
-                await self._respond_json(writer, 404, {"error": str(e)})
-                return
-            except ValueError as e:
-                await self._respond_json(writer, 400, {"error": str(e)})
-                return
-            await self._respond_json(writer, 200, {"updated": user_id})
-            return
-        await self._respond_json(writer, 405, {"error": "method not allowed"})
 
     # ---- Handler: Permissions ----
 
