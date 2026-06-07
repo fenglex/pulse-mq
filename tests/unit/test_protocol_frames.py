@@ -57,7 +57,11 @@ def test_decode_server_6_frames_with_delimiter():
     decoded = FrameCodec.decode_server(server_frames)
     assert decoded.identity == b"identity-uuid"
     assert decoded.topic == "t"
+    assert decoded.msg_type == MsgType.PUB
     assert decoded.ser_fmt == "str"
+    assert decoded.comp == "none"
+    assert decoded.record_count == 1
+    assert decoded.payload == b"hello"
 
 
 def test_decode_server_wrong_frame_count_raises():
@@ -66,8 +70,11 @@ def test_decode_server_wrong_frame_count_raises():
         FrameCodec.decode_server([b"x", b"y", b"z"])  # 3 帧
 
 
-def test_encode_decode_payload_roundtrip_all_ser_comp():
-    """16 组合 payload roundtrip。"""
+def test_encode_decode_payload_roundtrip_subset_ser_comp():
+    """4 ser × 4 comp = 16 组合 payload roundtrip。
+
+    仅覆盖 msgpack/bytes/str/pyarrow 四种 serializer; protobuf 因 registry/serializer 暂未集成而跳过。
+    """
     test_obj = {"k": "v-中文-🚀", "n": 42, "b": os.urandom(8)}
     sers = ["msgpack", "bytes", "str", "pyarrow"]
     comps = ["none", "snappy", "lz4", "zstd"]

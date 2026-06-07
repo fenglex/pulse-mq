@@ -40,7 +40,7 @@
 - [P2][日期 2026-06-07] I17: `MsgType` 不是 `Enum` 子类, 而是普通 class + 类属性 (msg_type.py:6) — 优点: 常量比较 `msg_type == MsgType.PUB` 仍可用且无 Enum.value 包装; 缺点: 没有类型安全, `MsgType.NONEXISTENT = 99` 可被动态添加。建议: 改 `class MsgType(enum.IntEnum)` 或加 `__slots__` 防篡改。
 - [P1][日期 2026-06-07] I18: `from_byte()` 返回 `int | None` (msg_type.py:31), 但 `decode_server()` 中直接用 `msg_type = meta[0]` (frames.py:93) 不走 `from_byte()` 验证 — 也就是说 `from_byte()` 形同虚设, 非法 msg_type 字节值会进入 dispatch switch, 落到 `else: 暂忽略` 分支静默丢弃, 不报错也不日志。建议: `decode_server()` 调 `MsgType.from_byte()` 验证, 非法值抛 `ValueError` 或 `logger.warning`。
 - [P1][日期 2026-06-07] I19: control 集合在 msg_type.py:22-24 与 overload.py:53-55 各硬编码一份, 存在单点变更风险; 建议 overload.py 改用 `MsgType.is_control(msg_type)` 单一来源。
-- [P2][日期 2026-06-07] I20: 枚举值定义后无单元测试覆盖 `from_byte()` 的合法/非法分支 — 留给 Task 2 (protocol 单测)。
+- [P2][日期 2026-06-07] I20: 枚举值定义后无单元测试覆盖 `from_byte()` 的合法/非法分支 — 测试已补 (test_protocol_msg_type.py::test_from_byte_known_values / test_from_byte_unknown_returns_none), source 修复 (decode_server 改用 from_byte 验证) 待后续 phase。
 
 ## Task 2 审读（tests/unit/test_protocol_*.py）
 

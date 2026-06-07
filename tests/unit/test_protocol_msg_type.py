@@ -19,3 +19,16 @@ def test_msg_types_in_byte_range():
         v = getattr(MsgType, name)
         if isinstance(v, int):
             assert 0 <= v < 256, f"{name}={v} 超出单字节范围"
+
+
+def test_from_byte_known_values():
+    """已知 msg_type 字节应正确返回。"""
+    for name in ("AUTH", "PUB", "SUB", "PING", "PONG", "BROADCAST"):
+        v = getattr(MsgType, name)
+        assert MsgType.from_byte(v) == v
+
+
+def test_from_byte_unknown_returns_none():
+    """未知 msg_type 字节返回 None。"""
+    assert MsgType.from_byte(0xFF) is None
+    assert MsgType.from_byte(0x00) is None  # 0 不在已知 enum 中

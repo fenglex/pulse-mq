@@ -39,16 +39,26 @@ def test_decode_unknown_ser_defaults_to_msgpack():
     assert f.ser_fmt == "msgpack"  # 静默回退
 
 
-def test_decode_unknown_comp_defaults_to_none():
-    """comp_bits 占 2 bits, 所有 4 个值都被 _COMP_MAP 覆盖, 静默回退路径实际上不可达。
+def test_decode_comp_bits_full_coverage():
+    """comp_bits 4 个值 (0-3) 必须正确解码到 none/snappy/lz4/zstd。
 
-    设计选择 (I8): 即使不可达, decode() 的 _COMP_MAP_REV.get() 仍保留 .get(bits, "none") 防御性写法。
-    此处仅文档化当前行为, 不强制断言。
+    通过构造让 comp_bits 分别为 0b00/0b01/0b10/0b11 的字节验证映射:
+    - comp_bits 占据 bit[3:4], 因此目标字节 = comp_bits << 3
+    - 0x00 << 3 = 0x00, 0x01 << 3 = 0x08, 0x02 << 3 = 0x10, 0x03 << 3 = 0x18
     """
-    # 0xFF: ser_bits=0b111(未知→msgpack), comp_bits=0b11(zstd, 已知)
-    f = FrameFlags.decode(0xFF)
-    # comp_bits 总是 0-3, 全部是合法值, 因此实际拿到的是 "zstd" 而非 "none"
-    assert f.comp in ("none", "snappy", "lz4", "zstd")
+    # comp_bits=0b11, ser_bits=0b111(已知未知→msgpack), 整字节 = 0xFF
+    assert FrameFlags.decode(0xFF).comp == "zstd"
+    # comp_bits=0b00, 其余位为 0 → 0x00
+    assert FrameFlags.decode(0x00).comp == "none"
+    # comp_bits=0b00, 高位清零 → 0xE0 (has_topic 置位但 comp 高位不受影响)
+    # 0xE0 = 0b11100000, >> 3 = 0b11100, & 0b11 = 0b00 → "none"
+    assert FrameFlags.decode(0xE0).comp == "none"
+    # comp_bits=0b01 → 整字节至少 0x08
+    # 0x08 = 0b00001000, >> 3 = 0b00001, & 0b11 = 0b01 → "snappy"
+    assert FrameFlags.decode(0x08).comp == "snappy"
+    # comp_bits=0b10 → 整字节至少 0x10
+    # 0x10 = 0b00010000, >> 3 = 0b00010, & 0b11 = 0b10 → "lz4"
+    assert FrameFlags.decode(0x10).comp == "lz4"
 
 
 @pytest.mark.parametrize("byte_val", [0, 1, 127, 128, 255])
