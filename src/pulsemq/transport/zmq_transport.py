@@ -111,11 +111,11 @@ class _ZmqBroadcastThread(threading.Thread):
     """持有 XPUB socket 的独立 IO 线程。
 
     - 死循环从 broadcast_queue (thread-safe queue.Queue) 取帧, send_multipart
-    - 每发 32 条, 排空一次 XPUB 的 SUBSCRIBE 确认 (避免接收缓冲区满)
+    - 短轮询 + poll XPUB 接收 SUBSCRIBE 确认
     - stop_event 触发后干净退出
     """
 
-    POLL_EVERY_N_SENDS = 32  # 每发多少帧, 排空一次 XPUB ack
+    POLL_TIMEOUT_S = 0.05
 
     def __init__(
         self,
@@ -129,49 +129,39 @@ class _ZmqBroadcastThread(threading.Thread):
         self._stop_event = stop_event
         self._poller = zmq.Poller()
         self._poller.register(socket, zmq.POLLIN)
-        self._send_count = 0
-
-    def _drain_xpub_ack(self) -> None:
-        """排空 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认。"""
-        try:
-            socks = self._poller.poll(0)  # 不阻塞
-            while self._socket in socks:
-                self._socket.recv_multipart()
-                socks = self._poller.poll(0)
-        except zmq.ZMQError:
-            pass
 
     def run(self) -> None:
-        """IO 线程主循环: 消费 broadcast_queue, 定期排空 XPUB ack。"""
+        """IO 线程主循环: 消费 broadcast_queue, 顺便 poll XPUB ack。"""
         while not self._stop_event.is_set():
-            # 阻塞取 1 条 (无超时, 有哨兵时立即返回)
+            # 排空 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认 (避免接收缓冲区满)
             try:
-                frames = self._broadcast_queue.get()
-            except Exception:
+                socks = dict(self._poller.poll(0))
+                while self._socket in socks and socks[self._socket] & zmq.POLLIN:
+                    self._socket.recv_multipart()
+                    socks = dict(self._poller.poll(0))
+            except zmq.ZMQError:
+                pass
+
+            # 阻塞取 1 条 (短超时, 让 stop_event 能被检测)
+            try:
+                frames = self._broadcast_queue.get(timeout=self.POLL_TIMEOUT_S)
+            except queue.Empty:
                 continue
             if frames is None:
+                # 哨兵, 退出
                 break
 
             # 发送
             try:
                 self._socket.send_multipart(frames, zmq.DONTWAIT)
             except zmq.Again:
-                # 缓冲区满, 阻塞重试 (会让所有写者停止, 但保证不丢)
+                # 缓冲区满 (SNDHWM != 0), 退回重试一次
                 try:
                     self._socket.send_multipart(frames)
                 except zmq.ZMQError as e:
                     logger.debug("broadcast 异常: %s", e)
             except zmq.ZMQError as e:
                 logger.debug("broadcast 异常: %s", e)
-
-            # 每 N 条排空一次 XPUB ack (避免接收缓冲区满)
-            self._send_count += 1
-            if self._send_count >= self.POLL_EVERY_N_SENDS:
-                self._drain_xpub_ack()
-                self._send_count = 0
-
-        # 退出前最后排空一次
-        self._drain_xpub_ack()
 
 
 class ZmqTransport:
