@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """性能基线测试。
 
-启 server + 1 pub + 1 sub, 跑 16 组合各 N 条消息, 测吞吐 / p50 / p99。
+启 server + 1 pub + 1 sub, 跑 20 组合各 N 条消息, 测吞吐 / p50 / p99。
 输出: 表格打印 + 写 docs/bench-baseline.md。
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ if sys.platform == "win32":
 
 from pulsemq.client.async_client import PulseClient  # noqa: E402
 
-DATA_TYPES = ["str", "bytes", "df-msgpack", "df-pyarrow"]
+DATA_TYPES = ["str", "bytes", "df-json", "df-msgpack", "df-pyarrow"]
 COMPRESSIONS = ["none", "snappy", "lz4", "zstd"]
 N_MESSAGES = 10_000
 
@@ -72,7 +72,7 @@ def build_payload(data_type: str, idx: int):
         return f"msg-{idx}-世界-🚀"
     if data_type == "bytes":
         return os.urandom(128)
-    if data_type in ("df-msgpack", "df-pyarrow"):
+    if data_type in ("df-json", "df-msgpack", "df-pyarrow"):
         import pandas as pd
 
         return pd.DataFrame({"i": [idx], "s": [f"row{idx}"]})
@@ -174,7 +174,7 @@ async def bench_one(port: int, data_type: str, comp: str, n_messages: int) -> di
 
 
 async def run_all(port: int, n_messages: int) -> list[dict]:
-    """跑完 4 data_type × 4 compression = 16 组合。"""
+    """跑完 5 data_type × 4 compression = 20 组合。"""
     results: list[dict] = []
     for dt in DATA_TYPES:
         for comp in COMPRESSIONS:
@@ -200,7 +200,7 @@ def write_markdown(results: list[dict], output: str, n_messages: int) -> None:
             "每组合 N 条消息，pub 顺序发布、sub 异步接收。\n\n"
         )
         f.write(f"**消息数**: 每组合 {n_messages} 条\n\n")
-        f.write("**组合**: 4 data_type × 4 compression = 16 组合\n\n")
+        f.write("**组合**: 5 data_type × 4 compression = 20 组合\n\n")
         f.write("| data_type | compression | throughput (msg/s) | p50 (ms) | p99 (ms) |\n")
         f.write("|-----------|-------------|-------------------|----------|----------|\n")
         for r in results:

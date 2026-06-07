@@ -1,6 +1,6 @@
 """Frame 3 Byte 1 flags bitfield 编解码。
 
-bit[0:2] = 序列化格式 (000=msgpack, 001=bytes, 010=pyarrow, 011=protobuf)
+bit[0:2] = 序列化格式 (000=msgpack, 001=bytes, 010=pyarrow, 011=protobuf, 100=str, 101=json)
 bit[3:4] = 压缩算法   (00=none, 01=snappy, 10=lz4, 11=zstd)
 bit[5]   = has_topic  (0=无topic, 1=有topic)
 bit[6:7] = reserved
@@ -17,6 +17,7 @@ _SER_MAP: dict[str, int] = {
     "pyarrow": 0b010,
     "protobuf": 0b011,
     "str": 0b100,
+    "json": 0b101,
 }
 _SER_MAP_REV: dict[int, str] = {v: k for k, v in _SER_MAP.items()}
 

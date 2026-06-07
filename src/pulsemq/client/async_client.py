@@ -229,12 +229,12 @@ class PulseClient:
         三种数据类型，自动推断序列化方式：
           - str       → StringSerializer (UTF-8)，限制 ≤ 16MB
           - bytes     → BytesSerializer (透传)，限制 ≤ 128MB
-          - DataFrame → msgpack 或 pyarrow（通过 format 指定，默认 msgpack）
+          - DataFrame → 默认 json, 可选 msgpack 或 pyarrow (通过 format 指定)
 
         Args:
             topic: topic 路径（必填）
             data: 消息数据，支持 str / bytes / pandas.DataFrame
-            format: 仅 DataFrame 时生效，"msgpack"（默认）/"pyarrow"；
+            format: 仅 DataFrame 时生效，"json"（默认）/"msgpack"/"pyarrow"；
                     传 str 或 bytes 时必须为 None
             compression: 压缩算法，none/snappy/lz4/zstd
             retry: 重试次数，默认 0
@@ -247,8 +247,8 @@ class PulseClient:
         ser_fmt = self._resolve_format(data, format)
         self._validate_data(data, ser_fmt)
         record_count = self._infer_record_count(data)
-        # DataFrame + msgpack: 预转 list[dict], 其他直接传 FrameCodec 通用路径
-        if isinstance(data, pd.DataFrame) and ser_fmt == "msgpack":
+        # DataFrame + json/msgpack: 预转 list[dict], 其他直接传 FrameCodec 通用路径
+        if isinstance(data, pd.DataFrame) and ser_fmt in ("json", "msgpack"):
             payload_obj = data.to_dict(orient="records")
         else:
             payload_obj = data
@@ -469,7 +469,7 @@ class PulseClient:
     def _resolve_format(data: Any, format: str | None) -> str:
         """根据 data 类型自动推断序列化格式。
 
-        str → "str"，bytes → "bytes"，DataFrame → format 参数（默认 msgpack）。
+        str → "str"，bytes → "bytes"，DataFrame → format 参数（默认 json）。
         """
         if isinstance(data, str):
             if format is not None:
@@ -480,10 +480,10 @@ class PulseClient:
                 raise ValueError("data 为 bytes 时 format 必须为 None")
             return "bytes"
         if isinstance(data, pd.DataFrame):
-            _fmt = format or "msgpack"
-            if _fmt not in ("msgpack", "pyarrow"):
+            _fmt = format or "json"  # 默认从 msgpack 改为 json
+            if _fmt not in ("json", "msgpack", "pyarrow"):
                 raise ValueError(
-                    f"DataFrame 的 format 只支持 msgpack/pyarrow，收到 '{_fmt}'"
+                    f"DataFrame 的 format 只支持 json/msgpack/pyarrow，收到 '{_fmt}'"
                 )
             return _fmt
         raise TypeError(

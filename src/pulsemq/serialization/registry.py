@@ -1,6 +1,6 @@
 """序列化与压缩：注册表 + 内置实现。
 
-序列化器：StringSerializer、MsgpackSerializer、PyArrowSerializer、BytesSerializer
+序列化器：StringSerializer、MsgpackSerializer、JsonSerializer、PyArrowSerializer、BytesSerializer
 压缩器：NoneCompressor、SnappyCompressor、Lz4Compressor、ZstdCompressor
 """
 
@@ -71,6 +71,22 @@ class MsgpackSerializer(Serializer):
     def deserialize(self, data: bytes) -> Any:
         import msgspec
         return msgspec.msgpack.decode(data)
+
+
+class JsonSerializer(Serializer):
+    """JSON 文本序列化 (msgspec.json, Rust 后端)。
+
+    适用: DataFrame / 嵌套 dict / 调试可读性场景。
+    比 msgpack 慢约 2-3x, 但可读性高 + 跨语言。
+    """
+
+    def serialize(self, obj: Any) -> bytes:
+        import msgspec
+        return msgspec.json.encode(obj)
+
+    def deserialize(self, data: bytes) -> Any:
+        import msgspec
+        return msgspec.json.decode(data)
 
 
 class PyArrowSerializer(Serializer):
@@ -242,6 +258,7 @@ def _init_builtins() -> None:
     """注册内置序列化器和压缩器。"""
     SerializationRegistry.register("str", StringSerializer())
     SerializationRegistry.register("msgpack", MsgpackSerializer())
+    SerializationRegistry.register("json", JsonSerializer())
     SerializationRegistry.register("bytes", BytesSerializer())
     SerializationRegistry.register("none", BytesSerializer())  # none 别名，等价 bytes
 
