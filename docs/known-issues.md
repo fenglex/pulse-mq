@@ -74,7 +74,7 @@
 
 ### engine/engine.py
 
-- [P0][日期 2026-06-07] I34: `_adapt_batch_size` 在 batch_size=1 时 grow/shrink 振荡 (`engine.py:316-331`)。原因: grow 条件 `h >= effective * 0.8` 在 `effective=1, h=1` 时恒成立 → 每个 adapt_window 都触发 grow 到 2; 下一个 window 触发 shrink 回 1; 永久 1↔2 振荡。修复: grow 条件前置 `effective >= 2` 守卫, 避免 floor 退化场景下的虚假 grow。
+_(无已知问题 — `_adapt_batch_size` 已随 v1.0 batcher 策略撤销)_
 
 ## Task 6 审读（client/async_client.py）
 

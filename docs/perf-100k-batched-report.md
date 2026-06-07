@@ -1,5 +1,9 @@
 # PulseMQ 100k 消息压测完整报告 (启用 Batcher)
 
+> ⚠️ **历史数据**: 本文件基于 v1.0 Batcher 实现 (size=10, interval=10ms)。
+> Batcher 策略已在 [2026-06-07-remove-publish-batcher](../superpowers/specs/2026-06-07-remove-publish-batcher.md) 中移除。
+> 数据仅作历史对比参考。
+
 **生成时间**: 2026-06-07
 **项目版本**: PulseMQ v1.0 (Phase 1-9 complete)
 **测试规模**: 1.6M 消息 (4 数据类型 × 4 压缩 × 100,000 条)

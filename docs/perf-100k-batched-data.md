@@ -1,5 +1,9 @@
 # PulseMQ 100k 批量压测数据
 
+> ⚠️ **历史数据**: 本文件基于 v1.0 Batcher 实现 (size=10, interval=10ms)。
+> Batcher 策略已在 [2026-06-07-remove-publish-batcher](../superpowers/specs/2026-06-07-remove-publish-batcher.md) 中移除。
+> 数据仅作历史对比参考。
+
 **测试环境**: Python 3.13.5, win32
 
 **场景**: 1 pub + 1 sub (同机 loopback), 客户端启用 Batcher, 每组合 N 条消息, pub 顺序发布、sub 异步接收。

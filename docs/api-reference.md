@@ -233,24 +233,10 @@ await client.publish("topic", df, format="pyarrow")
 
 #### `publish_batch(messages, format="msgpack", compression="none", retry=0, retry_delay=0.1) → None`
 
-批量发布多条消息。每条消息可单独覆盖外层默认参数。
+> ⚠️ **已废弃**: 客户端 Batcher 策略已在 v1.0 中撤销, `publish_batch` 不再可用。
+> 改用多次 `await client.publish(topic, data)` 调用实现。
 
-```python
-await client.publish_batch(
-    messages=[
-        {"topic": "topic-a", "data": {"price": 10.5}},
-        {"topic": "topic-b", "data": {"price": 20.0}},
-        {
-            "topic": "topic-c",
-            "data": df,
-            "format": "pyarrow",       # 覆盖外层 format
-            "compression": "lz4",      # 覆盖外层 compression
-        },
-    ],
-    format="msgpack",
-    compression="none",
-)
-```
+_(原批量发布文档已随 batcher 策略一并移除)_
 
 **参数:**
 
@@ -459,7 +445,6 @@ class ServerConfig:
 
     # 引擎层
     max_concurrency: int = 100                # 最大并发处理任务数
-    max_batch_size: int = 64                  # 最大批量处理大小
     drain_timeout_ms: int = 1                 # 缓冲区 drain 超时（毫秒）
     use_uvloop: bool = True                   # 是否使用 uvloop（Linux/macOS）
     object_pool_size: int = 4096              # 对象池大小
@@ -502,8 +487,6 @@ class ServerConfig:
 | `PULSEMQ_STATS_DB_URL` | `stats_db_url` | str |
 | `PULSEMQ_STATS_RETENTION` | `stats_retention_days` | int |
 | `PULSEMQ_CONCURRENCY` | `max_concurrency` | int |
-| `PULSEMQ_BATCH_SIZE` | `max_batch_size` | int |
-| `PULSEMQ_DRAIN_TIMEOUT` | `drain_timeout_ms` | int |
 | `PULSEMQ_USE_UVLOOP` | `use_uvloop` | bool |
 | `PULSEMQ_POOL_SIZE` | `object_pool_size` | int |
 | `PULSEMQ_ZMQ_RCVHWM` | `zmq_rcvhwm` | int |
@@ -980,7 +963,6 @@ curl http://localhost:9090/healthz
   "error_rate": 0.0,
   "dropped_total": 0,
   "backpressure": false,
-  "engine_batch_size": 32,
   "engine_pending_tasks": 8,
   "engine_concurrency_usage": 0.08
 }
@@ -999,7 +981,6 @@ curl http://localhost:9090/healthz
 | `error_rate` | float | 错误速率（EWMA） |
 | `dropped_total` | int | 累计丢弃消息数 |
 | `backpressure` | bool | 是否触发背压 |
-| `engine_batch_size` | int | 引擎有效批量大小 |
 | `engine_pending_tasks` | int | 引擎待处理任务数 |
 | `engine_concurrency_usage` | float | 并发使用率 |
 

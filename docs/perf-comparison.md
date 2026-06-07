@@ -1,5 +1,9 @@
 # PulseMQ 性能优化对比总表 (df-msgpack 路径)
 
+> ⚠️ **历史数据**: 本文件基于 v1.0 Batcher 实现 (size=10, interval=10ms)。
+> Batcher 策略已在 [2026-06-07-remove-publish-batcher](../superpowers/specs/2026-06-07-remove-publish-batcher.md) 中移除。
+> 数据仅作历史对比参考。
+
 **测试规模**: 100,000 消息 / 组合, 1 pub × 1 sub 同机 loopback, Batcher 启用 (size=10, interval=10ms)
 
 ---

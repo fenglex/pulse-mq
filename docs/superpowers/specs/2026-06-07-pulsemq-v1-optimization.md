@@ -1,5 +1,9 @@
 # PulseMQ v1.0 优化设计 — 性能 / 后台管理 / 监控 / 权限 / 批量
 
+> ⚠️ **部分撤销**: 客户端 Batcher / BATCH 协议 / `_handle_batch` / `_adapt_batch_size` 已被
+> [2026-06-07-remove-publish-batcher](./2026-06-07-remove-publish-batcher.md) 移除。
+> 本文档仅作历史档案,不要按本文档第 1.2、1.3 节实施。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** PulseMQ v0.6.0 → v1.0 的全面优化: 跨平台性能、后台管理 (Web UI + API)、完整监控 (每分钟粒度, 7 天 TTL)、用户/权限/订阅管控、可配置批量发布 (count + time, 低延迟)。
