@@ -20,6 +20,7 @@ import zmq.asyncio
 from pulsemq.protocol.flags import FrameFlags
 from pulsemq.protocol.frames import FrameCodec
 from pulsemq.protocol.msg_type import MsgType
+from pulsemq.auth.permission import topic_match
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,11 @@ class PulseClient:
 
     # ---- 订阅 ----
 
+    @staticmethod
+    def _is_wildcard(topic: str) -> bool:
+        """判断 topic 是否含通配符（* 或 >）。"""
+        return "*" in topic or ">" in topic
+
     async def subscribe(self, *topics: str) -> AsyncIterator[PulseMessage]:
         """订阅一个或多个 topic，返回异步迭代器。
 
@@ -236,13 +242,29 @@ class PulseClient:
             # 多 topic 订阅
             async for msg in client.subscribe("topic-a", "topic-b", "team-a.>"):
                 print(msg.topic, msg.payload)
+
+        通配符实现: ZMQ SUB 是前缀匹配，不支持 *, >。
+        对含通配符的 pattern, 在 SUB socket 上订阅空 (匹配所有),
+        在客户端用 topic_match() 过滤; 同时把 pattern 发给 server
+        让 router.has_subscribers() 知道有订阅。
         """
         if self._sub is None:
             raise PulseConnectionError("未连接")
 
-        # 注册 ZMQ SUB 订阅 + 发送 SUB 请求
-        for topic in topics:
+        # 区分精确与通配符
+        exact_topics = [t for t in topics if not self._is_wildcard(t)]
+        wildcard_topics = [t for t in topics if self._is_wildcard(t)]
+
+        # 精确 topic: 走 ZMQ 前缀过滤
+        for topic in exact_topics:
             self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+
+        # 通配符 topic: 在 ZMQ 层订阅空 (匹配所有), 客户端过滤
+        for topic in wildcard_topics:
+            self._sub.setsockopt(zmq.SUBSCRIBE, b"")
+
+        # 通知 server 注册订阅 (精确 + 通配符都要发, server 端会识别)
+        for topic in topics:
             sub_frames = FrameCodec.encode(MsgType.SUB, topic, 0, b"")
             await self._dealer.send_multipart(sub_frames)
 
@@ -263,7 +285,8 @@ class PulseClient:
                 )
                 if len(msg_frames) >= 4:
                     msg = self._decode_message(msg_frames)
-                    if msg:
+                    if msg and (not wildcard_topics or
+                                any(topic_match(p, msg.topic) for p in wildcard_topics)):
                         yield msg
             except asyncio.TimeoutError:
                 # 发送心跳
@@ -271,8 +294,10 @@ class PulseClient:
             except zmq.ZMQError:
                 if self._auto_reconnect:
                     await self._reconnect()
-                    for topic in topics:
+                    for topic in exact_topics:
                         self._sub.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
+                    for topic in wildcard_topics:
+                        self._sub.setsockopt(zmq.SUBSCRIBE, b"")
                 else:
                     break
 
@@ -280,7 +305,11 @@ class PulseClient:
         """取消订阅。"""
         frames = FrameCodec.encode(MsgType.UNSUB, topic, 0, b"")
         await self._dealer.send_multipart(frames)
-        self._sub.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
+        # ZMQ 层: 通配符订阅时取消的是空过滤
+        if self._is_wildcard(topic):
+            self._sub.setsockopt(zmq.UNSUBSCRIBE, b"")
+        else:
+            self._sub.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
 
     # ---- 查询 ----
 
@@ -295,8 +324,10 @@ class PulseClient:
         reply = await asyncio.wait_for(
             self._dealer.recv_multipart(), timeout=self._recv_timeout
         )
-        if len(reply) >= 4:
-            return FrameCodec.decode_payload(reply[3], self._DEFAULT_SER, self._DEFAULT_COMP)
+        # ROUTER 发送 [identity, b"", ...client_frames] (6 帧);
+        # DEALER 剥掉 identity, 剩 5 帧: [b"", topic, meta, rc, payload]
+        if len(reply) >= 5:
+            return FrameCodec.decode_payload(reply[4], self._DEFAULT_SER, self._DEFAULT_COMP)
         return {}
 
     # ---- 心跳 ----
@@ -315,8 +346,10 @@ class PulseClient:
         reply = await asyncio.wait_for(
             self._dealer.recv_multipart(), timeout=self._recv_timeout
         )
-        if len(reply) >= 4:
-            return FrameCodec.decode_payload(reply[3], self._DEFAULT_SER, self._DEFAULT_COMP)
+        # ROUTER 发送 [identity, b"", ...client_frames] (6 帧);
+        # DEALER 剥掉 identity, 剩 5 帧: [b"", topic, meta, rc, payload]
+        if len(reply) >= 5:
+            return FrameCodec.decode_payload(reply[4], self._DEFAULT_SER, self._DEFAULT_COMP)
         return {}
 
     # ---- 内部方法 ----
