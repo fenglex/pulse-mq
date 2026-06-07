@@ -86,7 +86,6 @@ await client.publish("topic", data, compression="zstd")
 | `PULSEMQ_AUTH_ENABLED` | 启用认证 | `true` |
 | `PULSEMQ_ADMIN_KEY` | 默认管理员 API Key | `pulse_sk_admin_default` |
 | `PULSEMQ_CONCURRENCY` | 最大并发数 | `100` |
-| `PULSEMQ_BATCH_SIZE` | 最大批处理大小 | `64` |
 | `PULSEMQ_SERIALIZER` | 默认序列化格式 | `msgpack` |
 | `PULSEMQ_COMPRESSOR` | 默认压缩算法 | `none` |
 | `PULSEMQ_USE_UVLOOP` | 使用 uvloop | `true` |
@@ -131,7 +130,6 @@ curl http://localhost:9090/metrics
   "error_rate": 0.0,
   "dropped_total": 0,
   "backpressure": false,
-  "engine_batch_size": 32,
   "engine_pending_tasks": 5,
   "engine_concurrency_usage": 0.05
 }
