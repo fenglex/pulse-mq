@@ -1,13 +1,13 @@
 """Cython 优化路径测试。
 
 1. 验证 Cython 扩展可加载 (或 fallback 到纯 Python)
-2. 验证 Cython 输出与纯 Python ``to_dict + msgpack`` 完全一致
+2. 验证 Cython 输出与纯 Python ``to_dict + msgspec`` 完全一致
 3. 测多列/混合类型/空 DF/单行/大批
 4. 验证 FrameCodec.encode_payload 集成 (DataFrame + msgpack 走 Cython 路径)
 """
 from __future__ import annotations
 
-import msgpack
+import msgspec
 import pandas as pd
 import pytest
 
@@ -47,14 +47,14 @@ def test_output_matches_pure_python():
 def test_empty_dataframe():
     df = pd.DataFrame({"a": [], "b": []})
     result = encode_dataframe_to_msgpack(df)
-    expected = msgpack.packb([], use_bin_type=True)
+    expected = msgspec.msgpack.encode([])
     assert result == expected
 
 
 def test_single_row():
     df = pd.DataFrame({"x": [42]})
     result = encode_dataframe_to_msgpack(df)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert decoded == [{"x": 42}]
 
 
@@ -66,7 +66,7 @@ def test_large_dataframe():
         }
     )
     result = encode_dataframe_to_msgpack(df)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert len(decoded) == 10000
     assert decoded[0] == {"i": 0, "s": "row0"}
     assert decoded[9999] == {"i": 9999, "s": "row9999"}
@@ -84,7 +84,7 @@ def test_mixed_types():
         }
     )
     result = encode_dataframe_to_msgpack(df)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert decoded[0]["none"] is None
     assert decoded[0]["int"] == 1
     assert decoded[0]["float"] == 1.5
@@ -97,7 +97,7 @@ def test_use_bin_type_false():
     """use_bin_type=False 时 str → raw, 不影响最终结果兼容性 (raw 在 unpackb raw=False 时仍解码为 str)."""
     df = pd.DataFrame({"s": ["hello", "world"]})
     result = encode_dataframe_to_msgpack(df, use_bin_type=False)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert decoded == [{"s": "hello"}, {"s": "world"}]
 
 
@@ -105,14 +105,14 @@ def test_int32_column():
     """numpy int32 元素经 .item() 转 Python int."""
     df = pd.DataFrame({"x": pd.array([1, 2, 3], dtype="int32")})
     result = encode_dataframe_to_msgpack(df)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert decoded == [{"x": 1}, {"x": 2}, {"x": 3}]
 
 
 def test_float32_column():
     df = pd.DataFrame({"x": pd.array([1.5, 2.5], dtype="float32")})
     result = encode_dataframe_to_msgpack(df)
-    decoded = msgpack.unpackb(result, raw=False)
+    decoded = msgspec.msgpack.decode(result)
     assert decoded == [{"x": 1.5}, {"x": 2.5}]
 
 

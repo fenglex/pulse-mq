@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator
 
-import msgpack
 import pandas as pd
 import zmq
 import zmq.asyncio

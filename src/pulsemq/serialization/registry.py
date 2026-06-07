@@ -58,15 +58,15 @@ class StringSerializer(Serializer):
 
 
 class MsgpackSerializer(Serializer):
-    """msgpack 二进制序列化。"""
+    """msgpack 二进制序列化（msgspec 后端，2-3x 更快）。"""
 
     def serialize(self, obj: Any) -> bytes:
-        import msgpack
-        return msgpack.packb(obj, use_bin_type=True)
+        import msgspec
+        return msgspec.msgpack.encode(obj)
 
     def deserialize(self, data: bytes) -> Any:
-        import msgpack
-        return msgpack.unpackb(data, raw=False)
+        import msgspec
+        return msgspec.msgpack.decode(data)
 
 
 class PyArrowSerializer(Serializer):
@@ -91,8 +91,8 @@ class PyArrowSerializer(Serializer):
                 df = pd.DataFrame([obj])
                 table = pa.Table.from_pandas(df, preserve_index=False)
             else:
-                import msgpack
-                return msgpack.packb(obj, use_bin_type=True)
+                import msgspec
+                return msgspec.msgpack.encode(obj)
 
         sink = BytesIO()
         writer = pa.ipc.new_stream(sink, table.schema)

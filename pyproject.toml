@@ -21,7 +21,7 @@ classifiers = [
 ]
 dependencies = [
     "pyzmq>=26.0",
-    "msgpack>=1.0",
+    "msgspec>=0.18",
     "python-snappy>=0.7",
     "lz4>=4.0",
     "zstandard>=0.22",

@@ -151,11 +151,11 @@ class FrameCodec:
         Args:
             payloads: list[(ser_fmt, payload_bytes), ...], 每条 PUB 预序列化的结果.
         """
-        import msgpack
+        import msgspec
         compressor = CompressionRegistry.get(comp)
         # msgpack 不能直接序列化 str/binary 的混合 tuple, 但 (str, bytes) 可以
         wrapped = [(sf, p) for sf, p in payloads]
-        encoded_list = msgpack.packb(wrapped, use_bin_type=True)
+        encoded_list = msgspec.msgpack.encode(wrapped)
         return compressor.compress(encoded_list)
 
     @staticmethod
@@ -165,9 +165,9 @@ class FrameCodec:
         Returns:
             list of (ser_fmt, payload_bytes) tuples.
         """
-        import msgpack
+        import msgspec
         compressor = CompressionRegistry.get(comp)
         decompressed = compressor.decompress(data)
-        raw = msgpack.unpackb(decompressed, raw=False)
+        raw = msgspec.msgpack.decode(decompressed)
         # raw 是 list[tuple[str, bytes]]
         return [(item[0], item[1]) for item in raw]

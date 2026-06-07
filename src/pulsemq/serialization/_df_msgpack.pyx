@@ -3,14 +3,15 @@
 """Cython 加速的 DataFrame → msgpack bytes 编码。
 
 策略: 用 typed numpy 缓冲区直接读列, 避免 pandas.to_dict 的 Python-level 包装.
-保持与 ``df.to_dict(orient="records") + msgpack.packb`` 输出完全一致.
+保持与 ``df.to_dict(orient="records") + msgspec.msgpack.encode`` 输出完全一致.
 """
 from __future__ import annotations
 
 cimport cython
 cimport numpy as cnp
 import numpy as np
-import msgpack
+import msgspec
+import msgspec.msgpack
 
 __all__ = ["encode_dataframe_to_msgpack"]
 
@@ -38,12 +39,13 @@ cpdef bytes encode_dataframe_to_msgpack(object df, bint use_bin_type=True):
         object col
         list arrays
     if n_rows == 0:
-        return msgpack.packb([], use_bin_type=use_bin_type)
+        # msgspec 默认 str→str, bytes→bin, 等价于 msgpack.packb(use_bin_type=True)
+        return msgspec.msgpack.encode([])
     if n_cols == 0:
         records = []
         for i in range(n_rows):
             records.append({})
-        return msgpack.packb(records, use_bin_type=use_bin_type)
+        return msgspec.msgpack.encode(records)
 
     # 缓存每列的底层数组 (.values 优先, 退化为 to_numpy())
     arrays = []
@@ -61,4 +63,4 @@ cpdef bytes encode_dataframe_to_msgpack(object df, bint use_bin_type=True):
             col = arrays[j]
             record[columns[j]] = _scalar_to_py(col, i)
         records_view.append(record)
-    return msgpack.packb(records_view, use_bin_type=use_bin_type)
+    return msgspec.msgpack.encode(records_view)

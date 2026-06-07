@@ -1,10 +1,10 @@
 """纯 Python fallback: DataFrame → msgpack bytes.
 
-与 Cython 版本输出等价, 用 ``df.to_dict(orient='records') + msgpack.packb``.
+与 Cython 版本输出等价, 用 ``df.to_dict(orient='records') + msgspec.msgpack.encode``.
 """
 from __future__ import annotations
 
-import msgpack
+import msgspec
 
 __all__ = ["encode_dataframe_to_msgpack"]
 
@@ -14,12 +14,9 @@ def encode_dataframe_to_msgpack(df, use_bin_type: bool = True) -> bytes:
 
     Args:
         df: pandas DataFrame.
-        use_bin_type: 透传给 msgpack.packb.
+        use_bin_type: 仅用于 API 兼容, msgspec 默认 str→str/bytes→bin, 等价 use_bin_type=True.
 
     Returns:
         msgpack 编码后的 bytes.
     """
-    return msgpack.packb(
-        df.to_dict(orient="records"),
-        use_bin_type=use_bin_type,
-    )
+    return msgspec.msgpack.encode(df.to_dict(orient="records"))

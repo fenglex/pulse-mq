@@ -8,7 +8,6 @@ import signal
 import sys
 import time
 
-import msgpack
 import zmq
 
 from pulsemq.auth.memory_store import AuthMemoryStore

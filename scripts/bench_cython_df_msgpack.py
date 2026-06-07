@@ -38,11 +38,11 @@ for _ in range(N_ITERS):
 cython_time = time.perf_counter() - t0
 
 # Pure Python (to_dict + packb)
-import msgpack
+import msgspec
 
 t0 = time.perf_counter()
 for _ in range(N_ITERS):
-    msgpack.packb(df.to_dict(orient="records"), use_bin_type=True)
+    msgspec.msgpack.encode(df.to_dict(orient="records"))
 py_time = time.perf_counter() - t0
 
 print(f"DataFrame: {N_ROWS} rows x {N_COLS} cols, {N_ITERS} iters")
