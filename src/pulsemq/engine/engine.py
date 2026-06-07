@@ -76,8 +76,9 @@ class Engine:
         self._pub_fast_path = not config.auth_enabled
 
         # #7 优化：broadcast 解耦队列
-        # 主循环把 broadcast_frames 放入队列，由独立协程发送到 XPUB
-        # 这样主循环不被 XPUB 发送阻塞，recv 和 broadcast 并行
+        # 注意: v1 zmq_io_threading 后, broadcast_queue 已在 ZmqTransport.BroadcastThread
+        # 这里保留 broadcast_queue/broadcast_task 字段为空, 仅供 stop() 调用
+        # 主循环直接 await transport.broadcast() (内部入 transport 线程安全队列)
         self._broadcast_queue: asyncio.Queue[list[bytes] | None] | None = None
         self._broadcast_task: asyncio.Task | None = None
 
@@ -98,16 +99,14 @@ class Engine:
         self._metrics = EngineMetrics()
 
     async def run(self) -> None:
-        """启动消息主循环。"""
+        """启动消息主循环。
+
+        v1 改造: zmq IO 已线程化, 主循环 recv/broadcast 都不再有 zmq await。
+        - recv: await transport.recv() (内部 to_thread 包装 recv_queue.get)
+        - broadcast: await transport.broadcast() (内部入 thread-safe 队列)
+        """
         self._running = True
 
-        # #7 优化：启动 broadcast 消费协程
-        # 无限队列：主循环 put_nowait 不阻塞，broadcast_loop 按自己节奏消费
-        self._broadcast_queue = asyncio.Queue(maxsize=0)  # 0 = unlimited
-        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
-
-        # 注入解耦队列到 handlers
-        self._handlers.set_broadcast_queue(self._broadcast_queue)
         # 注入 Engine 引用 (用于 dispatch_pub_fast 累积 metrics)
         self._handlers.set_engine(self)
 
@@ -157,7 +156,8 @@ class Engine:
         """停止引擎，等待后台任务完成。"""
         self._running = False
 
-        # 直接取消 broadcast 协程（不等队列清空）
+        # 注意: v1 zmq_io_threading 后, broadcast_loop 已被 BroadcastThread 取代
+        # 这里不再需要取消 _broadcast_task (其始终为 None)
         if self._broadcast_task is not None:
             self._broadcast_task.cancel()
             try:
@@ -221,71 +221,6 @@ class Engine:
             return
         # 拦截器链路径: SUB/UNSUB/PING/QUERY/非 PUB 走这里
         await self._process_single(frames)
-
-    # broadcast_loop 批量: 有积压时一次 drain N 条再批量 send
-    _BROADCAST_DRAIN_MAX = 64  # 一次最多取 64 条
-
-    async def _broadcast_loop(self) -> None:
-        """独立协程消费 broadcast 队列, 批量发送到 XPUB。
-
-        策略:
-        - 队列空时, await 阻塞等 1 条 (低延迟, 单条立即发)
-        - 队列有积压时, 一次 drain N 条 (非阻塞), gather 并发 send (高吞吐)
-        - 始终消费 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认消息
-        """
-        assert self._broadcast_queue is not None
-        transport = self._transport
-        xpub = transport._xpub
-
-        batch: list[list[bytes]] = []
-        while self._running:
-            try:
-                # 消费 XPUB 的订阅/取消确认消息（避免接收缓冲区满）
-                if xpub is not None:
-                    try:
-                        while await xpub.poll(timeout=0, flags=zmq.POLLIN):
-                            await xpub.recv_multipart()
-                    except Exception:
-                        pass
-
-                # 等 1 条 (阻塞, 单条立即发保证低延迟)
-                if not batch:
-                    first = await self._broadcast_queue.get()
-                    if first is None:
-                        break  # 哨兵, 停止
-                    batch.append(first)
-
-                # 非阻塞 drain 队列 (有积压则一次取多条)
-                while len(batch) < self._BROADCAST_DRAIN_MAX:
-                    try:
-                        nxt = self._broadcast_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if nxt is None:
-                        self._running = False
-                        break
-                    batch.append(nxt)
-
-                # 批量 send:
-                # - 单条: 顺序 await (低延迟, 无 gather 开销)
-                # - 多条: gather 并发 send (ZMQ socket 内部保序, 减少 await 切换)
-                if len(batch) == 1:
-                    await transport.broadcast(batch[0])
-                    self._broadcast_queue.task_done()
-                else:
-                    await asyncio.gather(
-                        *(transport.broadcast(f) for f in batch),
-                        return_exceptions=True,
-                    )
-                    for _ in batch:
-                        self._broadcast_queue.task_done()
-                batch.clear()
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("broadcast 协程异常")
-                batch.clear()
-
     @staticmethod
     def _is_pub_frames(frames: list[bytes]) -> bool:
         """快速判断 ROUTER 帧是否为 PUB 消息（不完整解码）。"""
