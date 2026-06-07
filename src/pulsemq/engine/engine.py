@@ -230,7 +230,7 @@ class Engine:
 
         策略:
         - 队列空时, await 阻塞等 1 条 (低延迟, 单条立即发)
-        - 队列有积压时, 一次 drain N 条 (非阻塞), 再按顺序 send (高吞吐)
+        - 队列有积压时, 一次 drain N 条 (非阻塞), gather 并发 send (高吞吐)
         - 始终消费 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认消息
         """
         assert self._broadcast_queue is not None
@@ -266,10 +266,19 @@ class Engine:
                         break
                     batch.append(nxt)
 
-                # 批量 send (每条一次 send_multipart, 但少了 N-1 次 get/poll await)
-                for frames in batch:
-                    await transport.broadcast(frames)
+                # 批量 send:
+                # - 单条: 顺序 await (低延迟, 无 gather 开销)
+                # - 多条: gather 并发 send (ZMQ socket 内部保序, 减少 await 切换)
+                if len(batch) == 1:
+                    await transport.broadcast(batch[0])
                     self._broadcast_queue.task_done()
+                else:
+                    await asyncio.gather(
+                        *(transport.broadcast(f) for f in batch),
+                        return_exceptions=True,
+                    )
+                    for _ in batch:
+                        self._broadcast_queue.task_done()
                 batch.clear()
             except asyncio.CancelledError:
                 break
