@@ -102,6 +102,21 @@ class ClientTracker:
             info.msg_in_count += 1
             info.msg_in_rate_1min.update(1)
 
+    def flush_minute(self, identity: bytes, count: int) -> None:
+        """分钟级批量更新 (无锁 Engine → tracker 推送)。
+
+        替代每条消息的 on_pub() 调用, 避免高 QPS 下 EWMA 的争用。
+        - identity: 发布者 client identity
+        - count: 本分钟该 client 累计 PUB 数
+
+        若 client 离线 (不在 _clients 表), 直接忽略 — 不重建无主记录。
+        """
+        info = self._clients.get(identity)
+        if info is None:
+            return
+        info.msg_out_count += count
+        info.msg_out_rate_1min.update(count)
+
     # ---- 查询 ----
 
     def get(self, identity: bytes) -> ClientInfo | None:

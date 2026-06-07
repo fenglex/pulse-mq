@@ -81,6 +81,18 @@ class Engine:
         self._broadcast_queue: asyncio.Queue[list[bytes] | None] | None = None
         self._broadcast_task: asyncio.Task | None = None
 
+        # ---- 累积 metrics 计数器 (无锁, 单写者: Engine 主循环) ----
+        # 替代每条消息的 tracker.on_pub/topic_metrics.record 加锁调用
+        # 后台 _metrics_flush_loop 每 60s 把累计值推送到 trackers
+        self._cum_msg_total: int = 0
+        self._cum_per_topic: dict[str, int] = {}
+        self._cum_per_client: dict[bytes, int] = {}
+        self._cum_latency_sum: float = 0.0
+        self._cum_latency_count: int = 0
+        self._cum_latency_max: float = 0.0
+        self._flush_task: asyncio.Task | None = None
+        self._flush_interval_s: float = 60.0
+
         # 运行状态
         self._running = False
         self._metrics = EngineMetrics()
@@ -96,6 +108,11 @@ class Engine:
 
         # 注入解耦队列到 handlers
         self._handlers.set_broadcast_queue(self._broadcast_queue)
+        # 注入 Engine 引用 (用于 dispatch_pub_fast 累积 metrics)
+        self._handlers.set_engine(self)
+
+        # 启动 metrics 累积 flush 后台 task
+        self._flush_task = asyncio.create_task(self._metrics_flush_loop())
 
         logger.info(
             "Engine 启动: max_concurrency=%d, fast_path=%s",
@@ -162,6 +179,17 @@ class Engine:
                 for task in list(self._background_tasks):
                     task.cancel()
 
+        # 停止 metrics flush task, 最后做一次 flush
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._flush_task = None
+        # 收尾 flush (把残留累计值推给 trackers)
+        self._flush_metrics_once()
+
     async def _drain_buffers(self) -> int:
         """消费双缓冲中的消息（控制优先）。"""
         consumed = 0
@@ -194,16 +222,22 @@ class Engine:
         # 拦截器链路径: SUB/UNSUB/PING/QUERY/非 PUB 走这里
         await self._process_single(frames)
 
-    async def _broadcast_loop(self) -> None:
-        """#7 优化：独立协程消费 broadcast 队列，发送到 XPUB。
+    # broadcast_loop 批量: 有积压时一次 drain N 条再批量 send
+    _BROADCAST_DRAIN_MAX = 64  # 一次最多取 64 条
 
-        主循环把 broadcast 帧放入 _broadcast_queue，此协程异步消费。
-        同时消费 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认消息。
+    async def _broadcast_loop(self) -> None:
+        """独立协程消费 broadcast 队列, 批量发送到 XPUB。
+
+        策略:
+        - 队列空时, await 阻塞等 1 条 (低延迟, 单条立即发)
+        - 队列有积压时, 一次 drain N 条 (非阻塞), 再按顺序 send (高吞吐)
+        - 始终消费 XPUB 的 SUBSCRIBE/UNSUBSCRIBE 确认消息
         """
         assert self._broadcast_queue is not None
         transport = self._transport
         xpub = transport._xpub
 
+        batch: list[list[bytes]] = []
         while self._running:
             try:
                 # 消费 XPUB 的订阅/取消确认消息（避免接收缓冲区满）
@@ -214,16 +248,34 @@ class Engine:
                     except Exception:
                         pass
 
-                # 等待 broadcast 帧
-                frames = await self._broadcast_queue.get()
-                if frames is None:
-                    break  # 哨兵，停止
-                await transport.broadcast(frames)
-                self._broadcast_queue.task_done()
+                # 等 1 条 (阻塞, 单条立即发保证低延迟)
+                if not batch:
+                    first = await self._broadcast_queue.get()
+                    if first is None:
+                        break  # 哨兵, 停止
+                    batch.append(first)
+
+                # 非阻塞 drain 队列 (有积压则一次取多条)
+                while len(batch) < self._BROADCAST_DRAIN_MAX:
+                    try:
+                        nxt = self._broadcast_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:
+                        self._running = False
+                        break
+                    batch.append(nxt)
+
+                # 批量 send (每条一次 send_multipart, 但少了 N-1 次 get/poll await)
+                for frames in batch:
+                    await transport.broadcast(frames)
+                    self._broadcast_queue.task_done()
+                batch.clear()
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("broadcast 协程异常")
+                batch.clear()
 
     @staticmethod
     def _is_pub_frames(frames: list[bytes]) -> bool:
@@ -257,3 +309,72 @@ class Engine:
     @property
     def dual_buffer(self) -> DualBuffer:
         return self._dual_buffer
+
+    # ---- 累积 metrics (无锁) ----
+
+    def record_msg(self, topic: str, identity: bytes, latency_ms: float = 0.0) -> None:
+        """记录一条消息到累积计数器 (无锁, 单写者: Engine 主循环)。
+
+        替代每条调用 tracker.on_pub() / topic_metrics.record() 的加锁开销。
+        后台 _metrics_flush_loop 每 60s 把累计值推送给 trackers。
+        """
+        self._cum_msg_total += 1
+        self._cum_per_topic[topic] = self._cum_per_topic.get(topic, 0) + 1
+        self._cum_per_client[identity] = self._cum_per_client.get(identity, 0) + 1
+        if latency_ms > 0.0:
+            self._cum_latency_sum += latency_ms
+            self._cum_latency_count += 1
+            if latency_ms > self._cum_latency_max:
+                self._cum_latency_max = latency_ms
+
+    async def _metrics_flush_loop(self) -> None:
+        """后台 task: 每 60s 推送累积 metrics 到 topic/client trackers。
+
+        监控粒度 = 分钟; 每分钟一次的更新足够, 不需要在每条消息上争锁。
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(self._flush_interval_s)
+                if not self._running:
+                    break
+                self._flush_metrics_once()
+        except asyncio.CancelledError:
+            # stop() 时取消, 此时 stop() 末尾会再调一次 _flush_metrics_once()
+            pass
+        except Exception:
+            logger.exception("metrics flush 异常")
+
+    def _flush_metrics_once(self) -> None:
+        """一次性推送累积值到 topic/client trackers, 然后清零。"""
+        if self._cum_msg_total == 0:
+            return
+
+        # 推 topic metrics
+        if self._topic_metrics is not None:
+            avg_ms = (
+                self._cum_latency_sum / self._cum_latency_count
+                if self._cum_latency_count > 0
+                else 0.0
+            )
+            max_ms = self._cum_latency_max
+            for topic, count in self._cum_per_topic.items():
+                try:
+                    self._topic_metrics.flush_minute(topic, count, avg_ms, max_ms)
+                except Exception:
+                    logger.debug("topic flush_minute 失败: %s", topic)
+
+        # 推 client tracker
+        if self._client_tracker is not None:
+            for identity, count in self._cum_per_client.items():
+                try:
+                    self._client_tracker.flush_minute(identity, count)
+                except Exception:
+                    logger.debug("client flush_minute 失败: %s=%s", identity, count)
+
+        # 清零
+        self._cum_msg_total = 0
+        self._cum_per_topic.clear()
+        self._cum_per_client.clear()
+        self._cum_latency_sum = 0.0
+        self._cum_latency_count = 0
+        self._cum_latency_max = 0.0

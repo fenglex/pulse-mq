@@ -73,6 +73,10 @@ class MessageHandlers:
         """注入 broadcast 解耦队列（#7 优化）。"""
         self._broadcast_queue = queue
 
+    def set_engine(self, engine) -> None:
+        """注入 Engine 引用, 让 dispatch_pub_fast 可调用 record_msg() 累积 metrics。"""
+        self._engine = engine
+
     async def dispatch(self, server_frames: list[bytes]) -> None:
         """根据 msg_type 分发到对应处理器（含拦截器链）。"""
         # 解码必须在 try 内, 否则非法帧会逃逸异常, 引擎主循环 catch 不到
@@ -133,14 +137,11 @@ class MessageHandlers:
             payload = frames[4]
             record_count = _RECORD_COUNT_STRUCT.unpack(frames[3])[0]
 
-        # Phase 4: 客户端追踪 - 发布计数
-        if self._client_tracker is not None:
-            self._client_tracker.on_pub(identity, len(payload))
-
-        # Phase 5: topic 1-min 监控 (快速路径没有 ctx.timestamp,
-        # 直接用 0 延迟占位, 不影响分位数)
-        if self._topic_metrics is not None:
-            self._topic_metrics.record(topic, 0.0)
+        # Metrics 累积 (无锁, 单写者 Engine)
+        # 替代每条 on_pub/record 的加锁调用; 后台 _metrics_flush_loop 每 60s 推送
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            engine.record_msg(topic, identity, 0.0)
 
         # 构造 broadcast meta：保留原始 ser/comp，仅替换 msg_type=BROADCAST
         broadcast_meta = self._build_broadcast_meta(wire_meta)

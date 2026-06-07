@@ -242,6 +242,38 @@ class TopicMetricsRegistry:
         # 背压
         m.backpressure = m.in_flight > self._backpressure_threshold
 
+    def flush_minute(self, topic: str, count: int, avg_ms: float, max_ms: float) -> None:
+        """分钟级批量更新 (无锁 Engine → tracker 推送)。
+
+        替代每条消息的 record() 调用, 避免高 QPS 下 SlidingWindow + EWMA 的争用。
+        - count: 本分钟该 topic 累计消息数
+        - avg_ms: 本分钟该 topic 平均延迟 (ms)
+        - max_ms: 本分钟该 topic 最大延迟 (ms)
+
+        p50/p99/p999 在分钟级粒度下用 avg/max 近似:
+        - p50  = avg  (中位数 ≈ 平均, 假设近似正态)
+        - p99  = max  (尾部由 max 近似)
+        - p999 = max
+        - max  = max
+        """
+        m = self._ensure_topic(topic)
+        self._maybe_roll_window(topic, m)
+
+        m.msg_count_1min += count
+        m.last_msg_ts = time.time()
+        # 用 max 近似填充 3 个 sliding window (1 个样本足够表达分钟级)
+        # 注意: 这里的样本数等于 1, percentile() 会返回这个 max 值
+        ts = m.last_msg_ts
+        self._w_p50[topic].add(avg_ms, ts=ts)
+        self._w_p99[topic].add(max_ms, ts=ts)
+        self._w_p999[topic].add(max_ms, ts=ts)
+        self._w_max[topic].add(max_ms, ts=ts)
+        # 速率 EWMA: 用 count 一次更新 (更平滑)
+        self._ewma[topic].update(count)
+        m.msg_rate_1min = self._ewma[topic].value
+        # 背压
+        m.backpressure = m.in_flight > self._backpressure_threshold
+
     def inc_in_flight(self, topic: str) -> None:
         """递增 in_flight (处理开始时)。"""
         m = self._ensure_topic(topic)
