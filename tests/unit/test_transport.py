@@ -18,11 +18,17 @@ def _make_transport() -> ZmqTransport:
 
 
 @pytest.mark.asyncio
-async def test_recv_uninitialized_raises():
-    """v1: 未 start() 时 recv() 抛 RuntimeError (recv_queue 还未创建)。"""
+async def test_recv_uninitialized_blocks_until_stop():
+    """v1: 未 start() 时 recv() 阻塞在 queue.get(), 直到 stop() 放哨兵 None 后返回 None."""
     t = _make_transport()
-    with pytest.raises(RuntimeError, match="Transport 未启动"):
-        await t.recv()
+    import asyncio
+    # 后台启 stop, 短延迟后应该放哨兵让 recv 返回 None
+    async def stop_soon():
+        await asyncio.sleep(0.1)
+        await t.stop()
+    asyncio.create_task(stop_soon())
+    result = await asyncio.wait_for(t.recv(), timeout=2.0)
+    assert result is None  # 哨兵
 
 
 @pytest.mark.asyncio
@@ -69,9 +75,7 @@ def test_constructor_initializes_sockets_to_none():
 def test_constructor_initializes_queues_and_stop_event():
     """构造时 thread-safe queue 与 stop_event 必须就绪。"""
     t = _make_transport()
-    # _recv_queue (asyncio.Queue) 在 start() 中创建
-    assert t._recv_queue is None
-    # _broadcast_queue / _send_queue (queue.Queue) 在 __init__ 中创建
+    assert t._recv_queue is not None
     assert t._broadcast_queue is not None
     assert t._send_queue is not None
     assert t._stop_event is not None
