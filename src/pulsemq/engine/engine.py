@@ -320,7 +320,9 @@ class Engine:
             return
 
         # 最近 N 次都排满了 → 增大批
-        if all(h >= self._effective_batch_size * 0.8 for h in self._batch_history):
+        # 排除 batch_size=1 的退化场景: 此时 h=1 永远 >= 0.8*1, 会出现 grow/shrink 振荡
+        if (self._effective_batch_size >= 2
+                and all(h >= self._effective_batch_size * 0.8 for h in self._batch_history)):
             self._effective_batch_size = min(
                 self._effective_batch_size * 2, self._max_batch_size
             )
