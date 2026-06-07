@@ -22,9 +22,6 @@ CREATE TABLE IF NOT EXISTS users (
     namespace  TEXT NOT NULL DEFAULT '',
     disabled   INTEGER NOT NULL DEFAULT 0,
     max_connections INTEGER NOT NULL DEFAULT 10,
-    batch_size INTEGER NOT NULL DEFAULT 100,
-    batch_interval_ms INTEGER NOT NULL DEFAULT 50,
-    batch_max_wait_ms INTEGER NOT NULL DEFAULT 200,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -54,12 +51,12 @@ CREATE TABLE IF NOT EXISTS user_groups (
 );
 """
 
-# 老库迁移：补齐 batch_* 字段（Phase 7）
-_MIGRATIONS = [
-    ("users", "batch_size", "INTEGER NOT NULL DEFAULT 100"),
-    ("users", "batch_interval_ms", "INTEGER NOT NULL DEFAULT 50"),
-    ("users", "batch_max_wait_ms", "INTEGER NOT NULL DEFAULT 200"),
-]
+# 老库迁移：移除已废弃的 batch_* 字段 (v1.0 batcher 后退)
+_BATCH_COLUMNS_TO_DROP = (
+    "batch_size",
+    "batch_interval_ms",
+    "batch_max_wait_ms",
+)
 
 _DEFAULT_ADMIN_SQL = """
 INSERT OR IGNORE INTO users (username, api_key, role, namespace, disabled, max_connections, created_at, updated_at)
@@ -73,16 +70,22 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """对老库执行 ALTER TABLE 补字段。失败（已存在）静默忽略。"""
-    for table, column, col_def in _MIGRATIONS:
-        if not _column_exists(conn, table, column):
-            try:
-                conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {col_def}"
-                )
-            except Exception:
-                # 极端情况：列已存在但 PRAGMA 没识别。吞掉。
-                pass
+    """对老库执行迁移：移除已废弃的 batch_* 字段。
+
+    SQLite 3.35+ 原生支持 DROP COLUMN。失败抛 RuntimeError (fail-fast)。
+    """
+    if not _column_exists(conn, "users", _BATCH_COLUMNS_TO_DROP[0]):
+        # 没有 batch_* 列 (新库或已迁移过), 跳过
+        return
+
+    for column in _BATCH_COLUMNS_TO_DROP:
+        if not _column_exists(conn, "users", column):
+            continue
+        sql = f"ALTER TABLE users DROP COLUMN {column}"
+        try:
+            conn.execute(sql)
+        except sqlite3.Error as e:
+            raise RuntimeError(f"迁移失败: {sql} → {e}") from e
     conn.commit()
 
 

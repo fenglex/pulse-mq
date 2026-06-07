@@ -18,10 +18,6 @@ class User:
     namespace: str = ""
     disabled: bool = False
     max_connections: int = 10
-    # 客户端 BATCH 配置（Phase 7）
-    batch_size: int = 100           # 触发批量的消息数
-    batch_interval_ms: int = 50     # 批量触发间隔（毫秒）
-    batch_max_wait_ms: int = 200    # 最大等待时间（毫秒）
     created_at: float = 0.0
     updated_at: float = 0.0
 

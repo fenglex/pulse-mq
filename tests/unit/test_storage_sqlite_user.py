@@ -198,62 +198,21 @@ async def test_disabled_flag_persists(repo: SqliteUserRepo):
     assert got.disabled is True
 
 
-# ---- Phase 7: batch_* 字段 ----
+# ---- Phase 7: batch_* 字段 (v1.0 batcher 后退, 字段已删除) ----
 
 
 @pytest.mark.asyncio
-async def test_batch_config_defaults(repo: SqliteUserRepo):
-    """未指定 batch 字段时使用默认值。"""
-    u = await repo.create(_user(username="alice", api_key="k1"))
-    got = await repo.get_by_id(u.id)
-    assert got is not None
-    assert got.batch_size == 100
-    assert got.batch_interval_ms == 50
-    assert got.batch_max_wait_ms == 200
+async def test_init_db_drops_legacy_batch_columns():
+    """老库 users 表带 batch_* 列, init_db 应自动 DROP COLUMN。
 
-
-@pytest.mark.asyncio
-async def test_batch_config_persists(repo: SqliteUserRepo):
-    """自定义 batch 字段写入后再读出保持一致。"""
-    u = await repo.create(_user(
-        username="alice", api_key="k1",
-        batch_size=250, batch_interval_ms=30, batch_max_wait_ms=400,
-    ))
-    got = await repo.get_by_id(u.id)
-    assert got is not None
-    assert got.batch_size == 250
-    assert got.batch_interval_ms == 30
-    assert got.batch_max_wait_ms == 400
-
-
-@pytest.mark.asyncio
-async def test_batch_config_update_persists(repo: SqliteUserRepo):
-    """update 改 batch 字段后再次读出。"""
-    u = await repo.create(_user(username="alice", api_key="k1"))
-    u.batch_size = 500
-    u.batch_interval_ms = 10
-    u.batch_max_wait_ms = 100
-    await repo.update(u)
-
-    got = await repo.get_by_id(u.id)
-    assert got is not None
-    assert got.batch_size == 500
-    assert got.batch_interval_ms == 10
-    assert got.batch_max_wait_ms == 100
-
-
-@pytest.mark.asyncio
-async def test_init_db_migrates_legacy_schema():
-    """老库（无 batch 字段）init_db 时应自动 ALTER TABLE 补齐。
-
-    模拟场景: 手动建老版 users 表, 不含 batch 字段,
-    然后 init_db 应迁移成功, 后续 get_by_id 不报 KeyError。
+    模拟场景: 手动建 v1.0 schema (含 batch_size/batch_interval_ms/batch_max_wait_ms),
+    然后 init_db 应迁移成功, 三个列被删, 老用户能读出 (无 KeyError)。
     """
     import sqlite3
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         path = f.name
     try:
-        # 1) 手动建老库
+        # 1) 手动建 v1.0 schema (含 batch_* 列)
         conn = sqlite3.connect(path)
         conn.executescript("""
             CREATE TABLE users (
@@ -264,6 +223,9 @@ async def test_init_db_migrates_legacy_schema():
                 namespace TEXT NOT NULL DEFAULT '',
                 disabled INTEGER NOT NULL DEFAULT 0,
                 max_connections INTEGER NOT NULL DEFAULT 10,
+                batch_size INTEGER NOT NULL DEFAULT 100,
+                batch_interval_ms INTEGER NOT NULL DEFAULT 50,
+                batch_max_wait_ms INTEGER NOT NULL DEFAULT 200,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -272,16 +234,19 @@ async def test_init_db_migrates_legacy_schema():
         """)
         conn.commit()
         conn.close()
-        # 2) 重新 init_db（应触发迁移）
+        # 2) 重新 init_db (应触发迁移, 删除 batch_* 列)
         conn2 = init_db(path)
-        # 3) 验证老用户能读出，且 batch 字段用 DEFAULT
+        # 3) 验证列已被删
+        cur = conn2.execute("PRAGMA table_info(users)")
+        cols = {row[1] for row in cur.fetchall()}
+        assert "batch_size" not in cols, "batch_size 列应被自动删除"
+        assert "batch_interval_ms" not in cols
+        assert "batch_max_wait_ms" not in cols
+        # 4) 老用户仍可读出
         r = SqliteUserRepo(conn2)
         u = await r.get_by_id(1)
         assert u is not None
         assert u.username == "legacy"
-        assert u.batch_size == 100
-        assert u.batch_interval_ms == 50
-        assert u.batch_max_wait_ms == 200
         conn2.close()
     finally:
         os.unlink(path)
