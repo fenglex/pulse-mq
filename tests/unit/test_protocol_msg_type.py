@@ -32,3 +32,10 @@ def test_from_byte_unknown_returns_none():
     """未知 msg_type 字节返回 None。"""
     assert MsgType.from_byte(0xFF) is None
     assert MsgType.from_byte(0x00) is None  # 0 不在已知 enum 中
+
+
+def test_batch_msg_type_removed():
+    """BATCH 协议已在 v1.0 batcher 后退时移除,MsgType 中不应有 BATCH。"""
+    assert not hasattr(MsgType, "BATCH"), "MsgType.BATCH 应当已被移除"
+    # 0x0C 不应再识别为有效 msg_type
+    assert MsgType.from_byte(0x0C) is None, "0x0C 不应再是有效 msg_type"

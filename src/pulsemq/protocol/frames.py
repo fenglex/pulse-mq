@@ -124,35 +124,3 @@ class FrameCodec:
         compressor = CompressionRegistry.get(comp)
         serializer = SerializationRegistry.get(ser_fmt)
         return serializer.deserialize(compressor.decompress(data))
-
-    @staticmethod
-    def encode_batch_payload(payloads, comp: str = "none") -> bytes:
-        """批量编码：msgpack 编码 list[(ser_fmt, payload)] 后压缩。
-
-        BATCH 协议的 payload 部分：msgpack(list[N (ser_fmt, payload_bytes)])，再压缩。
-        每条 PUB 在 client 端按各自 ser_fmt 序列化为 bytes, 这里把 ser_fmt 也编码进 batch,
-        避免 server 端无法反序列化的歧义 (BATCH 帧外层 flags 只能表示 1 种 ser_fmt).
-
-        Args:
-            payloads: list[(ser_fmt, payload_bytes), ...], 每条 PUB 预序列化的结果.
-        """
-        import msgspec
-        compressor = CompressionRegistry.get(comp)
-        # msgpack 不能直接序列化 str/binary 的混合 tuple, 但 (str, bytes) 可以
-        wrapped = [(sf, p) for sf, p in payloads]
-        encoded_list = msgspec.msgpack.encode(wrapped)
-        return compressor.compress(encoded_list)
-
-    @staticmethod
-    def decode_batch_payload(data: bytes, comp: str = "none") -> list:
-        """批量解码：先解压，再 msgpack 解码 list[(ser_fmt, payload)]。
-
-        Returns:
-            list of (ser_fmt, payload_bytes) tuples.
-        """
-        import msgspec
-        compressor = CompressionRegistry.get(comp)
-        decompressed = compressor.decompress(data)
-        raw = msgspec.msgpack.decode(decompressed)
-        # raw 是 list[tuple[str, bytes]]
-        return [(item[0], item[1]) for item in raw]

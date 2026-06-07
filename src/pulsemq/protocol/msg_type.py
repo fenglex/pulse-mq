@@ -17,7 +17,6 @@ class MsgType:
     ERROR = 0x09
     BROADCAST = 0x0A
     HISTORY_REPLAY = 0x0B
-    BATCH = 0x0C  # 批量 PUB：客户端把 N 条 PUB 打包为 1 条 BATCH，server 拆解
 
     # 控制消息集合（进入 ctrl_buffer）
     _CONTROL_TYPES: frozenset[int] = frozenset({
@@ -35,6 +34,6 @@ class MsgType:
         valid = {
             cls.AUTH, cls.PUB, cls.SUB, cls.UNSUB, cls.QUERY,
             cls.PING, cls.PONG, cls.STATUS, cls.ERROR, cls.BROADCAST,
-            cls.HISTORY_REPLAY, cls.BATCH,
+            cls.HISTORY_REPLAY,
         }
         return b if b in valid else None
