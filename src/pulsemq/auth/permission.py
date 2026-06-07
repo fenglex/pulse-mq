@@ -97,7 +97,8 @@ class PermissionService:
 
     def __init__(self, perm_repo, user_repo=None, ttl: float = 60.0):
         self._perm_repo = perm_repo
-        self._user_repo = user_repo  # 用于 batch 配置读写（Phase 7）
+        # user_repo 保留参数以兼容旧调用方, 实际不再使用
+        self._user_repo = user_repo
         self._cache: dict[int, PermissionCache] = {}
         self._ttl = ttl
 
@@ -147,60 +148,6 @@ class PermissionService:
             for p in patterns:
                 result.append({"action": action, "topic_pattern": p})
         return result
-
-    # ---- Phase 7: batch 配置 API ----
-
-    async def get_batch_config(self, user_id: int) -> dict:
-        """读取用户 BATCH 配置。
-
-        Returns:
-            {"batch_size": int, "batch_interval_ms": int, "batch_max_wait_ms": int}
-
-        Raises:
-            RuntimeError: 未注入 user_repo
-            LookupError: 用户不存在
-        """
-        if self._user_repo is None:
-            raise RuntimeError("user_repo 未注入, 无法读取 batch 配置")
-        user = await self._user_repo.get_by_id(user_id)
-        if user is None:
-            raise LookupError(f"用户不存在: {user_id}")
-        return {
-            "batch_size": user.batch_size,
-            "batch_interval_ms": user.batch_interval_ms,
-            "batch_max_wait_ms": user.batch_max_wait_ms,
-        }
-
-    async def set_batch_config(
-        self,
-        user_id: int,
-        batch_size: int,
-        batch_interval_ms: int,
-        batch_max_wait_ms: int,
-    ) -> None:
-        """更新用户 BATCH 配置。
-
-        Raises:
-            RuntimeError: 未注入 user_repo
-            LookupError: 用户不存在
-            ValueError: 参数非法
-        """
-        if self._user_repo is None:
-            raise RuntimeError("user_repo 未注入, 无法更新 batch 配置")
-        if batch_size < 1:
-            raise ValueError(f"batch_size 必须 >= 1, 收到 {batch_size}")
-        if batch_interval_ms < 0:
-            raise ValueError(f"batch_interval_ms 必须 >= 0, 收到 {batch_interval_ms}")
-        if batch_max_wait_ms < 0:
-            raise ValueError(f"batch_max_wait_ms 必须 >= 0, 收到 {batch_max_wait_ms}")
-
-        user = await self._user_repo.get_by_id(user_id)
-        if user is None:
-            raise LookupError(f"用户不存在: {user_id}")
-        user.batch_size = batch_size
-        user.batch_interval_ms = batch_interval_ms
-        user.batch_max_wait_ms = batch_max_wait_ms
-        await self._user_repo.update(user)
 
     # ---- 内部辅助 ----
 
