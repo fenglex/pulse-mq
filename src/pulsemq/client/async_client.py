@@ -212,7 +212,13 @@ class PulseClient:
         ser_fmt = self._resolve_format(data, format)
         self._validate_data(data, ser_fmt)
         record_count = self._infer_record_count(data)
-        payload = FrameCodec.encode_payload(data, ser_fmt, compression)
+        # DataFrame 走 msgpack 时先转成 list[dict]（msgpack 无法直接序列化 DataFrame）
+        payload_obj = (
+            data.to_dict(orient="records")
+            if ser_fmt == "msgpack" and isinstance(data, pd.DataFrame)
+            else data
+        )
+        payload = FrameCodec.encode_payload(payload_obj, ser_fmt, compression)
         frames = FrameCodec.encode(
             MsgType.PUB, topic, record_count, payload, ser_fmt, compression
         )
