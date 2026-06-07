@@ -205,9 +205,27 @@ class PermissionService:
     # ---- 内部辅助 ----
 
     async def _grant_for_user(self, user_id: int, topic_pattern: str, action: str) -> None:
-        """在用户的所有权限组上添加 (topic_pattern, action) 规则。"""
-        # 找到用户的所有 group_id
+        """在用户的所有权限组上添加 (topic_pattern, action) 规则。
+
+        若用户不在任何 group, 自动创建/加入一个名为 '_u_{user_id}' 的私有 group,
+        避免 admin 通过 REST 授权时无 group 可写。
+        """
         groups = await self._perm_repo.get_user_groups(user_id)
+        if not groups:
+            # 用户无 group: 创建/复用私有 group, 加入
+            private_name = f"_u_{user_id}"
+            existing = None
+            for g in await self._perm_repo.list_groups():
+                if g.name == private_name:
+                    existing = g
+                    break
+            if existing is None:
+                private = await self._perm_repo.create_group(private_name)
+                gid = private.id
+            else:
+                gid = existing.id
+            await self._perm_repo.add_member(gid, user_id)
+            groups = await self._perm_repo.get_user_groups(user_id)
         for g in groups:
             if g.id is None:
                 continue

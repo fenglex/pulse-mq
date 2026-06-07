@@ -28,6 +28,7 @@ from pulsemq.engine.pipeline import (
 )
 from pulsemq.engine.router import MessageRouter
 from pulsemq.event_loop import install_event_loop
+from pulsemq.monitoring.admin_server import AdminServer
 from pulsemq.monitoring.api import MetricsHTTPServer
 from pulsemq.monitoring.client_tracker import ClientTracker
 from pulsemq.monitoring.minute import MinuteAggregator
@@ -128,6 +129,22 @@ class PulseServer:
         # Phase 6: 后台任务引用
         self._stats_cleanup_task: asyncio.Task | None = None
         self._stats_minute_task: asyncio.Task | None = None
+        # Phase 8: 服务端启动时间 (给 AdminServer 用)
+        self._server_start_time: float = time.time()
+
+        # Phase 8: AdminServer (REST + SSE + Web UI)
+        self._admin_server = AdminServer(
+            bind=self._config.admin_bind,
+            client_tracker=self._client_tracker,
+            topic_metrics=self._topic_metrics,
+            realtime_metrics=self._realtime_metrics,
+            stats_repo=self._stats_repo,
+            user_repo=self._user_repo,
+            perm_service=self._perm_service,
+            perm_repo=self._perm_repo,
+            snapshot_fn=self._realtime_metrics.snapshot,
+            start_time=self._server_start_time,
+        )
 
     async def start(self) -> None:
         """启动服务端。"""
@@ -145,6 +162,10 @@ class PulseServer:
         if self._config.metrics_enabled:
             await self._metrics_http.start()
             await self._minute_aggregator.start()
+
+        # Phase 8: 启动 AdminServer (REST + SSE + Web UI)
+        if self._config.admin_enabled:
+            await self._admin_server.start()
 
         # Phase 6: 启动 topic_stats 后台任务 (清理 + 分钟落库)
         self._stats_cleanup_task = await self._stats_repo.start_cleanup_task(
@@ -190,6 +211,12 @@ class PulseServer:
         if self._config.metrics_enabled:
             await self._minute_aggregator.stop()
             await self._metrics_http.stop()
+        # Phase 8: 关闭 AdminServer
+        if self._config.admin_enabled:
+            try:
+                await self._admin_server.stop()
+            except Exception as e:
+                logger.debug("admin_server stop 异常: %s", e)
         await self._transport.stop(linger_ms=2000)
         if self._db_conn:
             self._db_conn.close()
@@ -407,6 +434,10 @@ class PulseServer:
     @property
     def stats_repo(self) -> SQLiteStatsRepo:
         return self._stats_repo
+
+    @property
+    def admin_server(self) -> AdminServer:
+        return self._admin_server
 
 
 def main() -> None:

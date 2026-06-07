@@ -39,6 +39,7 @@ def main() -> None:
         xpub_bind=f"tcp://*:{args.port + 1}",
         auth_enabled=False,
         metrics_enabled=False,
+        admin_enabled=False,  # e2e 不需要 Web UI
         max_concurrency=100,
         data_buffer_size=50_000,
         ctrl_buffer_size=5_000,

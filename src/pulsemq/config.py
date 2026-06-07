@@ -31,6 +31,8 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "PULSEMQ_COMPRESSOR": ("default_compressor", str),
     "PULSEMQ_AUTH_ENABLED": ("auth_enabled", lambda v: v.lower() in ("true", "1", "yes")),
     "PULSEMQ_ADMIN_KEY": ("default_admin_key", str),
+    "PULSEMQ_ADMIN_BIND": ("admin_bind", str),
+    "PULSEMQ_ADMIN_ENABLED": ("admin_enabled", lambda v: v.lower() in ("true", "1", "yes")),
 }
 
 
@@ -78,7 +80,11 @@ class ServerConfig:
 
     # 监控
     metrics_enabled: bool = True
-    metrics_bind: str = "0.0.0.0:9090"
+    metrics_bind: str = "0.0.0.0:9091"     # 旧 MetricsHTTPServer (AdminServer 含更全的功能)
+
+    # Phase 8: 后台管理 (AdminServer + Web UI)
+    admin_enabled: bool = True
+    admin_bind: str = "0.0.0.0:9090"
 
 
 def load_config(config_dict: dict | None = None) -> ServerConfig:
