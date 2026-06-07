@@ -29,7 +29,6 @@ from pulsemq.transport.zmq_transport import ZmqTransport
 
 def test_engine_metrics_defaults():
     m = EngineMetrics()
-    assert m.effective_batch_size == 1
     assert m.pending_tasks == 0
     assert m.concurrency_usage == 0.0
     assert m.backpressure_events == 0
@@ -85,14 +84,13 @@ def test_is_pub_frames_false_for_short_meta():
     assert Engine._is_pub_frames(frames) is False
 
 
-# ---- _adapt_batch_size ----
+# ---- _drain_buffers 优先级消费 ----
 
 
 def _make_engine() -> Engine:
     """构造一个不绑定 socket 的 Engine 实例, 用 stub transport。"""
     cfg = ServerConfig()
     cfg.max_concurrency = 4
-    cfg.max_batch_size = 64
     transport = ZmqTransport(cfg)  # 未 start, 仅占位
     router = MessageRouter()
     handlers = MessageHandlers(
@@ -101,53 +99,6 @@ def _make_engine() -> Engine:
         broadcast_fn=lambda *a, **kw: asyncio.sleep(0),
     )
     return Engine(transport=transport, handlers=handlers, config=cfg)
-
-
-def test_adapt_batch_size_initial():
-    """初始批大小 = 1, history < adapt_window 时不调整。"""
-    e = _make_engine()
-    assert e._effective_batch_size == 1
-    for _ in range(5):
-        e._adapt_batch_size(1)
-    assert e._effective_batch_size == 1
-
-
-def test_adapt_batch_size_grows_under_high_load():
-    """连续 N 次都排满 → 批大小翻倍。"""
-    e = _make_engine()
-    # 模拟高负载: 每次都达到 effective_batch_size
-    e._effective_batch_size = 4
-    for _ in range(e._adapt_window):
-        e._adapt_batch_size(4)  # 4 >= 4 * 0.8
-    assert e._effective_batch_size == 8
-
-
-def test_adapt_batch_size_caps_at_max():
-    """批大小不能超过 max_batch_size。"""
-    e = _make_engine()
-    e._max_batch_size = 8
-    e._effective_batch_size = 4
-    for _ in range(e._adapt_window * 2):
-        e._adapt_batch_size(8)
-    assert e._effective_batch_size == 8
-
-
-def test_adapt_batch_size_shrinks_under_low_load():
-    """连续 N 次都收不满 (< 2) → 批大小减半。"""
-    e = _make_engine()
-    e._effective_batch_size = 8
-    for _ in range(e._adapt_window):
-        e._adapt_batch_size(1)  # < 2
-    assert e._effective_batch_size == 4
-
-
-def test_adapt_batch_size_floor_at_1():
-    """批大小最小 1。"""
-    e = _make_engine()
-    e._effective_batch_size = 2
-    for _ in range(e._adapt_window * 2):
-        e._adapt_batch_size(1)
-    assert e._effective_batch_size == 1
 
 
 # ---- _drain_buffers 优先级消费 ----
@@ -190,15 +141,7 @@ def test_metrics_property_returns_dataclass():
     e = _make_engine()
     m = e.metrics
     assert isinstance(m, EngineMetrics)
-    assert m.effective_batch_size == 1
     assert m.pending_tasks == 0
-
-
-def test_metrics_reflects_adapt_state():
-    e = _make_engine()
-    e._effective_batch_size = 16
-    m = e.metrics
-    assert m.effective_batch_size == 16
 
 
 def test_metrics_concurrency_usage_zero_when_max_zero():

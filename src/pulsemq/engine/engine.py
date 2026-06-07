@@ -1,10 +1,10 @@
-"""Engine 消息主循环：自适应批处理 + 同 topic 有序 + 信号量并发 + 背压。
+"""Engine 消息主循环：单条派发 + 信号量并发 + 背压。
 
 核心设计：
 - 主循环只负责最快把消息从 socket 取出来，不等待处理完成
-- 按 topic 分组，同 topic 串行保序，不同 topic 并发
+- 单条消息派发，PUB 走快速路径，其他走拦截器链
 - 信号量控制总并发，pending_tasks 超阈值暂停 recv（背压）
-- 自适应批大小：低负载=1（即时处理），高负载渐进增大
+- 双缓冲：高负载入双缓冲，低负载直接派发
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 
 from pulsemq.config import ServerConfig
@@ -20,7 +19,6 @@ from pulsemq.engine.handlers import MessageHandlers
 from pulsemq.engine.overload import DualBuffer
 from pulsemq.engine.pipeline import PipelineContext
 from pulsemq.engine.pool import MessageContextPool
-from pulsemq.protocol.frames import FrameCodec
 from pulsemq.protocol.msg_type import MsgType
 from pulsemq.transport.zmq_transport import ZmqTransport
 
@@ -33,7 +31,6 @@ logger = logging.getLogger(__name__)
 class EngineMetrics:
     """引擎运行指标。"""
 
-    effective_batch_size: int = 1
     pending_tasks: int = 0
     concurrency_usage: float = 0.0
     backpressure_events: int = 0
@@ -58,13 +55,6 @@ class Engine:
         self._sem = asyncio.Semaphore(config.max_concurrency)
         self._pending_tasks: int = 0
         self._max_concurrency = config.max_concurrency
-
-        # 自适应批大小
-        self._effective_batch_size: int = 1
-        self._max_batch_size: int = config.max_batch_size
-        self._drain_timeout_ms: int = config.drain_timeout_ms
-        self._batch_history: list[int] = []
-        self._adapt_window: int = 10
 
         # 背压
         self._backpressure_threshold: float = config.backpressure_threshold
@@ -108,8 +98,8 @@ class Engine:
         self._handlers.set_broadcast_queue(self._broadcast_queue)
 
         logger.info(
-            "Engine 启动: max_concurrency=%d, max_batch_size=%d, fast_path=%s",
-            self._max_concurrency, self._max_batch_size, self._pub_fast_path,
+            "Engine 启动: max_concurrency=%d, fast_path=%s",
+            self._max_concurrency, self._pub_fast_path,
         )
 
         while self._running:
@@ -135,16 +125,8 @@ class Engine:
                     # 高负载：入双缓冲，由后续 drain 消费
                     self._dual_buffer.enqueue(frames)
                 else:
-                    batch = [frames]
-
-                    # 5. 排空 socket 缓冲区（#9 优化：RCVTIMEO=1ms）
-                    await self._drain_socket(batch)
-
-                    # 6. 按 topic 分组派发
-                    await self._dispatch_batch(batch)
-
-                    # 7. 更新自适应批大小
-                    self._adapt_batch_size(len(batch))
+                    # 5. 单条派发（PUB 走 fast path, 其他走 _process_single）
+                    await self._dispatch_one(frames)
 
             except asyncio.CancelledError:
                 break
@@ -196,61 +178,21 @@ class Engine:
 
         return consumed
 
-    async def _drain_socket(self, batch: list) -> None:
-        """排空 ZMQ socket 缓冲区到 batch（#9 优化：减少 wait_for 开销）。
+    async def _dispatch_one(self, frames: list[bytes]) -> None:
+        """派发单条消息。
 
-        使用 poll + recv 替代 wait_for(timeout)，减少协程调度开销。
+        优先走 PUB 快速路径 (绕过拦截器链),否则走 _process_single (含拦截器链)。
         """
-        effective_max = self._effective_batch_size - 1  # 已有 1 条
-        if effective_max <= 0:
-            return
-
-        socket = self._transport._router
-        if socket is None:
-            return
-
-        for _ in range(effective_max):
+        if self._pub_fast_path and self._is_pub_frames(frames):
             try:
-                # poll 0ms 检查是否有立即可读的消息
-                if not await socket.poll(timeout=0, flags=zmq.POLLIN):
-                    break
-                frames = await socket.recv_multipart()
-                batch.append(frames)
-            except zmq.ZMQError:
-                break
-
-    async def _dispatch_batch(self, batch: list) -> None:
-        """按 topic 分组派发，同 topic 串行，不同 topic 并发。
-
-        不在主循环中等待完成，后台执行以不阻塞 recv。
-        """
-        if not batch:
+                await self._handlers.dispatch_pub_fast(frames)
+                self._metrics.total_messages += 1
+            except Exception as e:
+                self._metrics.total_errors += 1
+                logger.debug("快速路径处理错误: %s", e)
             return
-
-        # #3/#5 优化：PUB 快速路径 — 内联处理，不创建 task
-        # 检查 batch 中是否所有帧都是 PUB
-        if self._pub_fast_path and all(self._is_pub_frames(f) for f in batch):
-            for frames in batch:
-                try:
-                    await self._handlers.dispatch_pub_fast(frames)
-                    self._metrics.total_messages += 1
-                except Exception as e:
-                    self._metrics.total_errors += 1
-                    logger.debug("快速路径处理错误: %s", e)
-            return
-
-        # 按 (identity, topic) 分组 — 同连接同 topic 串行
-        groups: dict[tuple[bytes, str], list[list[bytes]]] = defaultdict(list)
-        for frames in batch:
-            decoded = FrameCodec.decode_server(frames)
-            key = (decoded.identity, decoded.topic)
-            groups[key].append(frames)
-
-        # 每组创建一个后台 task
-        for key, group_frames in groups.items():
-            task = asyncio.create_task(self._process_group(group_frames))
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+        # 拦截器链路径: SUB/UNSUB/PING/QUERY/非 PUB 走这里
+        await self._process_single(frames)
 
     async def _broadcast_loop(self) -> None:
         """#7 优化：独立协程消费 broadcast 队列，发送到 XPUB。
@@ -294,16 +236,6 @@ class Engine:
         except (IndexError, TypeError):
             return False
 
-    async def _process_group(self, frames_list: list[list[bytes]]) -> None:
-        """处理同一 topic 的一批消息（串行保证有序）。"""
-        async with self._sem:
-            self._pending_tasks += 1
-            try:
-                for frames in frames_list:
-                    await self._process_single(frames)
-            finally:
-                self._pending_tasks -= 1
-
     async def _process_single(self, frames: list[bytes]) -> None:
         """处理单条消息（通过 handlers.dispatch，含拦截器链）。"""
         try:
@@ -313,28 +245,8 @@ class Engine:
             self._metrics.total_errors += 1
             logger.debug("消息处理错误: %s", e)
 
-    def _adapt_batch_size(self, actual: int) -> None:
-        """自适应调整批大小。"""
-        self._batch_history.append(actual)
-        if len(self._batch_history) < self._adapt_window:
-            return
-
-        # 最近 N 次都排满了 → 增大批
-        # 排除 batch_size=1 的退化场景: 此时 h=1 永远 >= 0.8*1, 会出现 grow/shrink 振荡
-        if (self._effective_batch_size >= 2
-                and all(h >= self._effective_batch_size * 0.8 for h in self._batch_history)):
-            self._effective_batch_size = min(
-                self._effective_batch_size * 2, self._max_batch_size
-            )
-        # 最近 N 次都收不满 → 减小
-        elif all(h < 2 for h in self._batch_history):
-            self._effective_batch_size = max(self._effective_batch_size // 2, 1)
-
-        self._batch_history.clear()
-
     @property
     def metrics(self) -> EngineMetrics:
-        self._metrics.effective_batch_size = self._effective_batch_size
         self._metrics.pending_tasks = self._pending_tasks
         self._metrics.concurrency_usage = (
             self._pending_tasks / self._max_concurrency

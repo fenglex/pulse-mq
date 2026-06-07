@@ -274,7 +274,7 @@ class PulseServer:
                 # 同步引擎指标
                 metrics = self._engine.metrics
                 self._realtime_metrics.update_engine_metrics(
-                    batch_size=metrics.effective_batch_size,
+                    batch_size=1,
                     pending_tasks=metrics.pending_tasks,
                     concurrency_usage=metrics.concurrency_usage,
                 )
