@@ -86,3 +86,19 @@
 - [P3][日期 2026-06-07] I40: `subscribe()` 的 `wildcard_topics` 列表为空时, `if msg and (not wildcard_topics or any(...))` 短路求值返回 True, 所有消息放行。代码 `not wildcard_topics` 看起来可疑, 实际语义正确（精确订阅时 ZMQ 层已过滤）。**无 bug**, 仅记录以便后人理解。
 - [P2][日期 2026-06-07] I41: `connect()` 创建 `self._ctx` 在最前面, 如果中途 `self._ctx.socket(...)` 抛异常 (e.g. OOM), `self._ctx` 已分配但未绑定到 `term()`。修复: 用 try/except 包 socket 创建, 失败时 term 已分配的 ctx。当前实现不会 leak (异常向上抛出后对象 GC, `__aenter__` 失败时 `__aexit__` 不会被调) — **不阻塞**, 但实现更稳健的版本可加 try/except 释放。
 
+## Task 10 审读（monitoring/）
+
+### monitoring/realtime.py
+
+- [P2][日期 2026-06-07] I42: `SlidingWindow` docstring 声称采用 "reservoir sampling" (随机替换), 但实际是 `deque(maxlen=...)` 的 FIFO 截断 + 窗口过期清理 (`realtime.py:36-41`)。修复: docstring 改为准确描述"底层 deque(maxlen) + 窗口外 _cleanup"。当前实现不阻塞, 行为符合调用方预期 (FIFO 截断对 P50/P99 延迟计算无偏), 仅文档需修正。
+- [P3][日期 2026-06-07] I43: `SlidingWindow.add()` 在 `len(self._data) >= self._max_samples` 时先 `_cleanup(ts)` 再 `append` — 但 `deque(maxlen=max_samples)` 在 append 时已自动丢最旧, `_cleanup` 若是无过期样本则为 wasted call (`realtime.py:48-53`)。修复: 简化为直接 append, 容量裁剪由 deque 自身保证。仅微优化, 不阻塞。
+
+### monitoring/api.py
+
+- [P1][日期 2026-06-07] I44: `MetricsHTTPServer._handle_request` 在 `request_line` 为空时直接 `writer.close()` 后 return (`api.py:49-51`)，但 finally 块又再次 `writer.close()` + `await writer.wait_closed()`。重复 close() 在部分 asyncio 实现会触发 `InvalidStateError` 或 `ConnectionResetError` 警告日志（虽被 `try/except` 吞掉）。修复: 移除提前 close, 让 finally 统一处理, 避免双重关闭。
+- [P3][日期 2026-06-07] I45: `MetricsHTTPServer._respond_json` 硬编码 status_text 仅 200/404, 其他状态码默认 "OK" (`api.py:85`)。当前路由只返回 200/404, 不影响功能；但 v0.7 若加 401/503 等状态码会显示错误文案。建议: 扩展 status_text 字典或 fallback 到标准 reason phrase。
+
+### monitoring/minute.py
+
+- [P3][日期 2026-06-07] I46: `MinuteAggregator` 使用 `int(next_minute) // 60` 作为 `ts` (分钟精度) (`minute.py:83`)。这意味着每个跨分钟边界会写入一行; 但当 `time.time()` 返回的 now 已非常接近 next_minute (e.g. 59.999s), `await asyncio.sleep(next_minute - now)` 睡眠 1ms 后立刻切槽, 极端情况下 ts 出现"整分钟边界重复" (e.g. 边界 60s 与 60s 同号)。不阻塞: 实际 `time.time()` 抖动已足够, 但理论边界需注意。
+

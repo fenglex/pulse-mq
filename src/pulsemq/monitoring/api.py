@@ -47,7 +47,7 @@ class MetricsHTTPServer:
             # 读取请求行
             request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
             if not request_line:
-                writer.close()
+                # 空请求行: 直接返回, 由 finally 统一 close
                 return
 
             line = request_line.decode("utf-8", errors="ignore").strip()

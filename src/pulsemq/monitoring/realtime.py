@@ -37,7 +37,10 @@ class SlidingWindow:
     """滑动窗口，用于计算 P50/P99 延迟。
 
     保留最近 window_seconds 秒内的数据点，限制最大容量避免排序开销。
-    采用 reservoir sampling 策略：超过 max_samples 时随机替换。
+    实现策略：
+    - 底层 deque(maxlen=max_samples): 容量满后自动丢弃最旧数据 (FIFO 截断)
+    - 计算百分位时调用 _cleanup() 移除 window 之外的所有过期样本
+    注：与"reservoir sampling"不同；当前实现是 FIFO + 滑动窗口。
     """
 
     def __init__(self, window_seconds: float = 60.0, max_samples: int = 4096):

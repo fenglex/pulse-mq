@@ -11,3 +11,6 @@ htmlcov/
 *.db-shm
 *.db-wal
 .idea
+# test runner logs
+err.log
+out.log
