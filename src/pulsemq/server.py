@@ -227,11 +227,7 @@ class PulseServer:
         logger.info("PulseMQ 服务端已停止")
 
     async def _event_loop(self) -> None:
-        """监听 ZMQ 连接/断开事件，管理认证和资源清理。
-
-        v1 zmq_io_threading: monitor_socket 现在是 sync zmq.Socket,
-        用 asyncio.to_thread 包装 recv_multipart, 避免阻塞 event loop。
-        """
+        """监听 ZMQ 连接/断开事件，管理认证和资源清理。"""
         monitor_socket = self._transport._router.get_monitor_socket(
             zmq.EVENT_CONNECTED | zmq.EVENT_DISCONNECTED
         )
@@ -243,8 +239,7 @@ class PulseServer:
         try:
             while self._running:
                 try:
-                    # to_thread 包装 sync recv, 不阻塞 event loop
-                    event = await asyncio.to_thread(monitor_socket.recv_multipart)
+                    event = await monitor_socket.recv_multipart()
                     if len(event) < 2:
                         continue
                     # event[0] = 事件类型（2 bytes）, event[1] = 地址
