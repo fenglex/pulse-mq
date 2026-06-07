@@ -109,12 +109,17 @@ class MessageHandlers:
         # 内联解码，避免 DecodedFrame dataclass 开销
         if len(frames) == 6:
             topic = frames[2].decode("utf-8")
+            wire_meta = frames[3]      # 原始 2 字节 meta（msg_type + flags）
             payload = frames[5]
             record_count = _RECORD_COUNT_STRUCT.unpack(frames[4])[0]
         else:  # 5 帧
             topic = frames[1].decode("utf-8")
+            wire_meta = frames[2]
             payload = frames[4]
             record_count = _RECORD_COUNT_STRUCT.unpack(frames[3])[0]
+
+        # 构造 broadcast meta：保留原始 ser/comp，仅替换 msg_type=BROADCAST
+        broadcast_meta = self._build_broadcast_meta(wire_meta)
 
         # 注册 topic（幂等）
         self.router.register_topic(topic)
@@ -123,7 +128,7 @@ class MessageHandlers:
         if self.router.has_subscribers(topic):
             topic_bytes = self._get_topic_bytes(topic)
             rc_bytes = _RECORD_COUNT_STRUCT.pack(record_count)
-            broadcast_frames = [topic_bytes, self._broadcast_meta, rc_bytes, payload]
+            broadcast_frames = [topic_bytes, broadcast_meta, rc_bytes, payload]
             # #7 优化：通过解耦队列发送，不阻塞主循环
             if self._broadcast_queue is not None:
                 self._broadcast_queue.put_nowait(broadcast_frames)
@@ -145,6 +150,17 @@ class MessageHandlers:
         b = topic.encode("utf-8")
         self._topic_bytes_cache[topic] = b
         return b
+
+    @staticmethod
+    def _build_broadcast_meta(wire_meta: bytes) -> bytes:
+        """从原始 PUB 帧的 meta 构造 BROADCAST meta。
+
+        保留原始 ser_fmt/comp/has_topic 标志，仅把 msg_type 替换为 BROADCAST，
+        让 subscriber 端能正确反序列化（之前用 default_ser/default_comp 预计算的
+        _broadcast_meta 会丢失每条消息的 ser/comp 信息）。
+        """
+        flags_byte = wire_meta[1] if len(wire_meta) > 1 else 0
+        return bytes([MsgType.BROADCAST, flags_byte])
 
     async def _dispatch_internal(self, ctx: PipelineContext, server_frames: list[bytes]) -> None:
         """内部分发。"""
@@ -174,7 +190,8 @@ class MessageHandlers:
         if self.router.has_subscribers(topic):
             topic_bytes = self._get_topic_bytes(topic)
             rc_bytes = _RECORD_COUNT_STRUCT.pack(record_count)
-            broadcast_frames = [topic_bytes, self._broadcast_meta, rc_bytes, ctx.payload]
+            broadcast_meta = self._build_broadcast_meta(ctx.meta)
+            broadcast_frames = [topic_bytes, broadcast_meta, rc_bytes, ctx.payload]
             result = self._broadcast(broadcast_frames)
             if result is not None:
                 await result
