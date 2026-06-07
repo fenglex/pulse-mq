@@ -196,3 +196,92 @@ async def test_disabled_flag_persists(repo: SqliteUserRepo):
     got = await repo.get_by_id(u.id)
     assert got is not None
     assert got.disabled is True
+
+
+# ---- Phase 7: batch_* 字段 ----
+
+
+@pytest.mark.asyncio
+async def test_batch_config_defaults(repo: SqliteUserRepo):
+    """未指定 batch 字段时使用默认值。"""
+    u = await repo.create(_user(username="alice", api_key="k1"))
+    got = await repo.get_by_id(u.id)
+    assert got is not None
+    assert got.batch_size == 100
+    assert got.batch_interval_ms == 50
+    assert got.batch_max_wait_ms == 200
+
+
+@pytest.mark.asyncio
+async def test_batch_config_persists(repo: SqliteUserRepo):
+    """自定义 batch 字段写入后再读出保持一致。"""
+    u = await repo.create(_user(
+        username="alice", api_key="k1",
+        batch_size=250, batch_interval_ms=30, batch_max_wait_ms=400,
+    ))
+    got = await repo.get_by_id(u.id)
+    assert got is not None
+    assert got.batch_size == 250
+    assert got.batch_interval_ms == 30
+    assert got.batch_max_wait_ms == 400
+
+
+@pytest.mark.asyncio
+async def test_batch_config_update_persists(repo: SqliteUserRepo):
+    """update 改 batch 字段后再次读出。"""
+    u = await repo.create(_user(username="alice", api_key="k1"))
+    u.batch_size = 500
+    u.batch_interval_ms = 10
+    u.batch_max_wait_ms = 100
+    await repo.update(u)
+
+    got = await repo.get_by_id(u.id)
+    assert got is not None
+    assert got.batch_size == 500
+    assert got.batch_interval_ms == 10
+    assert got.batch_max_wait_ms == 100
+
+
+@pytest.mark.asyncio
+async def test_init_db_migrates_legacy_schema():
+    """老库（无 batch 字段）init_db 时应自动 ALTER TABLE 补齐。
+
+    模拟场景: 手动建老版 users 表, 不含 batch 字段,
+    然后 init_db 应迁移成功, 后续 get_by_id 不报 KeyError。
+    """
+    import sqlite3
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        path = f.name
+    try:
+        # 1) 手动建老库
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                api_key TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL DEFAULT 'user',
+                namespace TEXT NOT NULL DEFAULT '',
+                disabled INTEGER NOT NULL DEFAULT 0,
+                max_connections INTEGER NOT NULL DEFAULT 10,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            INSERT INTO users (username, api_key, created_at, updated_at)
+            VALUES ('legacy', 'k1', 0, 0);
+        """)
+        conn.commit()
+        conn.close()
+        # 2) 重新 init_db（应触发迁移）
+        conn2 = init_db(path)
+        # 3) 验证老用户能读出，且 batch 字段用 DEFAULT
+        r = SqliteUserRepo(conn2)
+        u = await r.get_by_id(1)
+        assert u is not None
+        assert u.username == "legacy"
+        assert u.batch_size == 100
+        assert u.batch_interval_ms == 50
+        assert u.batch_max_wait_ms == 200
+        conn2.close()
+    finally:
+        os.unlink(path)

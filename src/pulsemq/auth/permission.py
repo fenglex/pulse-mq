@@ -95,8 +95,9 @@ class PermissionCache:
 class PermissionService:
     """权限服务：查询 + 缓存 + 校验。"""
 
-    def __init__(self, perm_repo, ttl: float = 60.0):
+    def __init__(self, perm_repo, user_repo=None, ttl: float = 60.0):
         self._perm_repo = perm_repo
+        self._user_repo = user_repo  # 用于 batch 配置读写（Phase 7）
         self._cache: dict[int, PermissionCache] = {}
         self._ttl = ttl
 
@@ -107,6 +108,126 @@ class PermissionService:
 
         cache = await self._get_or_load(user.user_id)
         return cache.has_permission(action, topic)
+
+    # ---- Phase 7: pub/sub 高层 API ----
+
+    async def check_pub(self, user: AuthUser, topic: str) -> bool:
+        """检查用户是否有 topic 的 pub 权限。"""
+        return await self.check_permission(user, "pub", topic)
+
+    async def check_sub(self, user: AuthUser, topic: str) -> bool:
+        """检查用户是否有 topic 的 sub 权限。"""
+        return await self.check_permission(user, "sub", topic)
+
+    async def grant_pub(self, user_id: int, topic_pattern: str) -> None:
+        """授予用户 pub 权限（作用于所有 group 上的 pattern）。"""
+        await self._grant_for_user(user_id, topic_pattern, "pub")
+
+    async def grant_sub(self, user_id: int, topic_pattern: str) -> None:
+        """授予用户 sub 权限。"""
+        await self._grant_for_user(user_id, topic_pattern, "sub")
+
+    async def revoke_pub(self, user_id: int, topic_pattern: str) -> None:
+        """撤销用户 pub 权限。"""
+        await self._revoke_for_user(user_id, topic_pattern, "pub")
+
+    async def revoke_sub(self, user_id: int, topic_pattern: str) -> None:
+        """撤销用户 sub 权限。"""
+        await self._revoke_for_user(user_id, topic_pattern, "sub")
+
+    async def list_user_permissions(self, user_id: int) -> list[dict]:
+        """列出用户所有权限。
+
+        Returns:
+            list of {"action": "pub"/"sub"/..., "topic_pattern": "..."}
+        """
+        perms = await self._perm_repo.get_user_expanded_permissions(user_id)
+        result: list[dict] = []
+        for action, patterns in perms.items():
+            for p in patterns:
+                result.append({"action": action, "topic_pattern": p})
+        return result
+
+    # ---- Phase 7: batch 配置 API ----
+
+    async def get_batch_config(self, user_id: int) -> dict:
+        """读取用户 BATCH 配置。
+
+        Returns:
+            {"batch_size": int, "batch_interval_ms": int, "batch_max_wait_ms": int}
+
+        Raises:
+            RuntimeError: 未注入 user_repo
+            LookupError: 用户不存在
+        """
+        if self._user_repo is None:
+            raise RuntimeError("user_repo 未注入, 无法读取 batch 配置")
+        user = await self._user_repo.get_by_id(user_id)
+        if user is None:
+            raise LookupError(f"用户不存在: {user_id}")
+        return {
+            "batch_size": user.batch_size,
+            "batch_interval_ms": user.batch_interval_ms,
+            "batch_max_wait_ms": user.batch_max_wait_ms,
+        }
+
+    async def set_batch_config(
+        self,
+        user_id: int,
+        batch_size: int,
+        batch_interval_ms: int,
+        batch_max_wait_ms: int,
+    ) -> None:
+        """更新用户 BATCH 配置。
+
+        Raises:
+            RuntimeError: 未注入 user_repo
+            LookupError: 用户不存在
+            ValueError: 参数非法
+        """
+        if self._user_repo is None:
+            raise RuntimeError("user_repo 未注入, 无法更新 batch 配置")
+        if batch_size < 1:
+            raise ValueError(f"batch_size 必须 >= 1, 收到 {batch_size}")
+        if batch_interval_ms < 0:
+            raise ValueError(f"batch_interval_ms 必须 >= 0, 收到 {batch_interval_ms}")
+        if batch_max_wait_ms < 0:
+            raise ValueError(f"batch_max_wait_ms 必须 >= 0, 收到 {batch_max_wait_ms}")
+
+        user = await self._user_repo.get_by_id(user_id)
+        if user is None:
+            raise LookupError(f"用户不存在: {user_id}")
+        user.batch_size = batch_size
+        user.batch_interval_ms = batch_interval_ms
+        user.batch_max_wait_ms = batch_max_wait_ms
+        await self._user_repo.update(user)
+
+    # ---- 内部辅助 ----
+
+    async def _grant_for_user(self, user_id: int, topic_pattern: str, action: str) -> None:
+        """在用户的所有权限组上添加 (topic_pattern, action) 规则。"""
+        # 找到用户的所有 group_id
+        groups = await self._perm_repo.get_user_groups(user_id)
+        for g in groups:
+            if g.id is None:
+                continue
+            await self._perm_repo.add_permission(g.id, topic_pattern, action)
+            # 失效该 group 所有成员缓存
+            member_ids = await self._perm_repo.get_group_all_members(g.id)
+            self.invalidate_group_members(member_ids)
+        # 同时失效该用户自己的缓存（即便不在任何 group）
+        self.invalidate_user(user_id)
+
+    async def _revoke_for_user(self, user_id: int, topic_pattern: str, action: str) -> None:
+        """在用户的所有权限组上移除 (topic_pattern, action) 规则。"""
+        groups = await self._perm_repo.get_user_groups(user_id)
+        for g in groups:
+            if g.id is None:
+                continue
+            await self._perm_repo.remove_permission(g.id, topic_pattern, action)
+            member_ids = await self._perm_repo.get_group_all_members(g.id)
+            self.invalidate_group_members(member_ids)
+        self.invalidate_user(user_id)
 
     async def _get_or_load(self, user_id: int) -> PermissionCache:
         """获取缓存或从 DB 加载。"""

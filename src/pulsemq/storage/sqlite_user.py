@@ -36,10 +36,14 @@ class SqliteUserRepo(UserRepository):
 
         def _do():
             cursor = self._conn.execute(
-                """INSERT INTO users (username, api_key, role, namespace, disabled, max_connections, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO users (username, api_key, role, namespace, disabled, max_connections,
+                                      batch_size, batch_interval_ms, batch_max_wait_ms,
+                                      created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user.username, user.api_key, user.role, user.namespace,
-                 int(user.disabled), user.max_connections, now, now),
+                 int(user.disabled), user.max_connections,
+                 user.batch_size, user.batch_interval_ms, user.batch_max_wait_ms,
+                 now, now),
             )
             self._conn.commit()
             return cursor.lastrowid
@@ -55,10 +59,14 @@ class SqliteUserRepo(UserRepository):
         def _do():
             self._conn.execute(
                 """UPDATE users SET username=?, api_key=?, role=?, namespace=?,
-                   disabled=?, max_connections=?, updated_at=?
+                   disabled=?, max_connections=?,
+                   batch_size=?, batch_interval_ms=?, batch_max_wait_ms=?,
+                   updated_at=?
                    WHERE id=?""",
                 (user.username, user.api_key, user.role, user.namespace,
-                 int(user.disabled), user.max_connections, now, user.id),
+                 int(user.disabled), user.max_connections,
+                 user.batch_size, user.batch_interval_ms, user.batch_max_wait_ms,
+                 now, user.id),
             )
             self._conn.commit()
 
@@ -80,6 +88,12 @@ class SqliteUserRepo(UserRepository):
 
     @staticmethod
     def _row_to_user(row: sqlite3.Row) -> User:
+        # 兼容老库（Phase 7 之前没有 batch_* 字段）
+        def _col(name, default):
+            try:
+                return row[name]
+            except (IndexError, KeyError):
+                return default
         return User(
             id=row["id"],
             username=row["username"],
@@ -88,6 +102,9 @@ class SqliteUserRepo(UserRepository):
             namespace=row["namespace"],
             disabled=bool(row["disabled"]),
             max_connections=row["max_connections"],
+            batch_size=_col("batch_size", 100),
+            batch_interval_ms=_col("batch_interval_ms", 50),
+            batch_max_wait_ms=_col("batch_max_wait_ms", 200),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

@@ -71,7 +71,9 @@ class PulseServer:
 
         # 认证
         self._auth_store = AuthMemoryStore()
-        self._perm_service = PermissionService(self._perm_repo)
+        self._perm_service = PermissionService(
+            self._perm_repo, user_repo=self._user_repo
+        )
 
         # 注入 auth_store 引用到 router（用于连接计数）
         self._router._auth_store = self._auth_store
