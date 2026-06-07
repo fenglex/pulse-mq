@@ -181,6 +181,8 @@ class MessageHandlers:
             await self._handle_query(ctx)
         elif ctx.msg_type == MsgType.HISTORY_REPLAY:
             await self._handle_history_replay(ctx)
+        elif ctx.msg_type == MsgType.BATCH:
+            await self._handle_batch(ctx)
         # 其他类型暂忽略
 
     async def _handle_pub(self, ctx: PipelineContext) -> None:
@@ -204,6 +206,54 @@ class MessageHandlers:
         # 条件化缓存（#4 优化）
         if self.router.buffer_enabled:
             self.router.append_message(topic, ctx.meta, record_count, ctx.payload)
+
+    async def _handle_batch(self, ctx: PipelineContext) -> None:
+        """处理 BATCH PUB：拆 N 条, 每条走完整 PUB 路径。
+
+        协议: ctx.payload 是 msgpack 编码的 list[bytes]，外层已按 ctx meta 的 comp 压缩。
+        这里先解压+msgpack 解码得到原始 payload list, 然后对每条 broadcast + cache。
+
+        鉴权已在拦截器链入口处对 BATCH 整体完成, 这里不再走 pipeline。
+        """
+        topic = ctx.topic
+
+        # 从 meta[1] flags 字节解码 comp（PipelineContext 没有 comp 字段）
+        flags_byte = ctx.meta[1] if len(ctx.meta) > 1 else 0
+        flags = FrameFlags.decode(flags_byte)
+        comp = flags.comp
+
+        # 1. 拆解 BATCH payload → list[bytes]
+        raw_payloads = FrameCodec.decode_batch_payload(ctx.payload, comp)
+        n = len(raw_payloads)
+        if n == 0:
+            return
+
+        # 2. 注册 topic（幂等）
+        self.router.register_topic(topic)
+
+        # 3. 沿用 BATCH 帧的 flags 字节（meta[1]）构造 PUB meta
+        # BATCH 与 PUB 的 meta[1] 一致（ser/comp/has_topic），仅 msg_type 不同
+        pub_meta = bytes([MsgType.PUB, flags_byte])
+        rc_bytes = _RECORD_COUNT_STRUCT.pack(1)
+
+        # 4. 对每条 payload 执行 PUB 路径
+        has_subs = self.router.has_subscribers(topic)
+        buffered = self.router.buffer_enabled
+        topic_bytes = self._get_topic_bytes(topic) if (has_subs or buffered) else None
+        # 预计算 broadcast meta（flags 不变，仅 msg_type 变）
+        broadcast_meta = self._build_broadcast_meta(pub_meta) if has_subs else None
+
+        for raw_payload in raw_payloads:
+            # 广播
+            if has_subs:
+                broadcast_frames = [topic_bytes, broadcast_meta, rc_bytes, raw_payload]
+                result = self._broadcast(broadcast_frames)
+                if result is not None:
+                    await result
+
+            # 缓存
+            if buffered:
+                self.router.append_message(topic, pub_meta, 1, raw_payload)
 
     async def _handle_sub(self, ctx: PipelineContext) -> None:
         """处理 SUB：建立订阅（支持通配符）→ 发送确认。"""

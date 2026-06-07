@@ -119,3 +119,27 @@ class FrameCodec:
         compressor = CompressionRegistry.get(comp)
         serializer = SerializationRegistry.get(ser_fmt)
         return serializer.deserialize(compressor.decompress(data))
+
+    @staticmethod
+    def encode_batch_payload(payloads, comp: str = "none") -> bytes:
+        """批量编码：msgpack 编码 list[原始 payload] 后压缩。
+
+        BATCH 协议的 payload 部分：msgpack(list[N 原始 payload bytes])，再压缩。
+        N 原始 payload 是每条 PUB 的 bytes，由 client 端按各自序列化格式产生。
+        """
+        import msgpack
+        compressor = CompressionRegistry.get(comp)
+        encoded_list = msgpack.packb(list(payloads), use_bin_type=True)
+        return compressor.compress(encoded_list)
+
+    @staticmethod
+    def decode_batch_payload(data: bytes, comp: str = "none") -> list:
+        """批量解码：先解压，再 msgpack 解码 list[原始 payload]。
+
+        Returns:
+            list of raw payload bytes（每条由 caller 决定怎么用）。
+        """
+        import msgpack
+        compressor = CompressionRegistry.get(comp)
+        decompressed = compressor.decompress(data)
+        return msgpack.unpackb(decompressed, raw=False)
