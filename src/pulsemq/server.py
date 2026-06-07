@@ -29,6 +29,7 @@ from pulsemq.engine.pipeline import (
 from pulsemq.engine.router import MessageRouter
 from pulsemq.event_loop import install_event_loop
 from pulsemq.monitoring.api import MetricsHTTPServer
+from pulsemq.monitoring.client_tracker import ClientTracker
 from pulsemq.monitoring.minute import MinuteAggregator
 from pulsemq.monitoring.realtime import RealtimeMetrics
 from pulsemq.protocol.frames import FrameCodec
@@ -91,6 +92,9 @@ class PulseServer:
             interceptors.append(PermissionInterceptor(self._perm_service)) # 权限
         pipeline = InterceptorChain(interceptors)
 
+        # Phase 4: 客户端追踪器
+        self._client_tracker = ClientTracker()
+
         # 处理器
         self._handlers = MessageHandlers(
             router=self._router,
@@ -99,6 +103,7 @@ class PulseServer:
             pipeline=pipeline,
             default_ser=self._config.default_serializer,
             default_comp=self._config.default_compressor,
+            client_tracker=self._client_tracker,
         )
 
         # Engine
@@ -270,6 +275,8 @@ class PulseServer:
             self._realtime_metrics.active_connections = len(
                 self._auth_store._identity_user
             )
+            # Phase 4: 客户端追踪 - 注册新连接
+            self._client_tracker.on_connect(address, user.user_id)
             logger.info("连接建立: user_id=%s role=%s", user.user_id, user.role)
 
     async def _on_disconnected(self, address: bytes) -> None:
@@ -282,6 +289,8 @@ class PulseServer:
                 self._auth_store._identity_user
             )
             self._realtime_metrics.active_subscriptions = self._router.subscription_count()
+            # Phase 4: 客户端追踪 - 移除断开连接
+            self._client_tracker.on_disconnect(address)
             logger.info("连接断开: user_id=%s", user.user_id)
 
     async def _push_auth_info(self, identity: bytes, user) -> None:
@@ -315,6 +324,10 @@ class PulseServer:
     @property
     def realtime_metrics(self) -> RealtimeMetrics:
         return self._realtime_metrics
+
+    @property
+    def client_tracker(self) -> ClientTracker:
+        return self._client_tracker
 
 
 def main() -> None:

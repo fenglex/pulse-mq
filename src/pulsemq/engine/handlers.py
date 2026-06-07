@@ -21,6 +21,7 @@ from pulsemq.engine.pipeline import (
 from pulsemq.engine.pool import PipelineContextPool
 from pulsemq.engine.router import MessageRouter
 from pulsemq.models import TopicInfo
+from pulsemq.monitoring.client_tracker import ClientTracker
 from pulsemq.protocol.flags import FrameFlags
 from pulsemq.protocol.frames import FrameCodec, _RECORD_COUNT_STRUCT
 from pulsemq.protocol.msg_type import MsgType
@@ -39,6 +40,7 @@ class MessageHandlers:
         pipeline: InterceptorChain | None = None,
         default_ser: str = "msgpack",
         default_comp: str = "none",
+        client_tracker: ClientTracker | None = None,
     ):
         self.router = router
         self._send = send_fn
@@ -47,6 +49,8 @@ class MessageHandlers:
         self._default_ser = default_ser
         self._default_comp = default_comp
         self._ctx_pool = PipelineContextPool(size=4096)
+        # Phase 4: 客户端追踪器 (可选注入, 兼容旧调用方)
+        self._client_tracker = client_tracker
 
         # 预计算 broadcast 帧的固定部分（#1 优化）
         _flags = FrameFlags(ser_fmt=default_ser, comp=default_comp, has_topic=True)
@@ -113,15 +117,21 @@ class MessageHandlers:
         """
         # 内联解码，避免 DecodedFrame dataclass 开销
         if len(frames) == 6:
+            identity = frames[0]
             topic = frames[2].decode("utf-8")
             wire_meta = frames[3]      # 原始 2 字节 meta（msg_type + flags）
             payload = frames[5]
             record_count = _RECORD_COUNT_STRUCT.unpack(frames[4])[0]
         else:  # 5 帧
+            identity = frames[0]
             topic = frames[1].decode("utf-8")
             wire_meta = frames[2]
             payload = frames[4]
             record_count = _RECORD_COUNT_STRUCT.unpack(frames[3])[0]
+
+        # Phase 4: 客户端追踪 - 发布计数
+        if self._client_tracker is not None:
+            self._client_tracker.on_pub(identity, len(payload))
 
         # 构造 broadcast meta：保留原始 ser/comp，仅替换 msg_type=BROADCAST
         broadcast_meta = self._build_broadcast_meta(wire_meta)
@@ -192,6 +202,10 @@ class MessageHandlers:
 
         # 注册 topic（幂等）
         self.router.register_topic(topic)
+
+        # Phase 4: 客户端追踪 - 发布者 PUB 计数 (msg_out)
+        if self._client_tracker is not None:
+            self._client_tracker.on_pub(ctx.identity, len(ctx.payload))
 
         # 轻量级订阅者检查（#2 优化）
         if self.router.has_subscribers(topic):
@@ -275,6 +289,10 @@ class MessageHandlers:
             self.router.subscribe(identity, topic)
             expanded = [topic]
 
+        # Phase 4: 客户端追踪 - 记录订阅
+        if self._client_tracker is not None:
+            self._client_tracker.on_sub(identity, topic)
+
         # 发送 SUB 确认
         reply_payload = FrameCodec.encode_payload(
             {"status": "ok", "expanded_topics": expanded},
@@ -296,6 +314,10 @@ class MessageHandlers:
 
         self.router.unsubscribe(identity, topic)
 
+        # Phase 4: 客户端追踪 - 删除订阅
+        if self._client_tracker is not None:
+            self._client_tracker.on_unsub(identity, topic)
+
         reply_payload = FrameCodec.encode_payload(
             {"status": "ok"},
             self._default_ser,
@@ -312,6 +334,10 @@ class MessageHandlers:
     async def _handle_ping(self, ctx: PipelineContext) -> None:
         """处理 PING：回复 PONG。"""
         identity = ctx.identity
+
+        # Phase 4: 客户端追踪 - 更新心跳
+        if self._client_tracker is not None:
+            self._client_tracker.on_heartbeat(identity)
 
         try:
             client_data = FrameCodec.decode_payload(
