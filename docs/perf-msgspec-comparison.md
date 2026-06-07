@@ -92,3 +92,99 @@ PYTHONIOENCODING=utf-8 uv run python scripts/test_e2e_all.py --port 17050 --time
 # 跑 100k 压测
 PYTHONIOENCODING=utf-8 uv run python scripts/bench_baseline.py --port 17060 --output docs/perf-100k-msgspec-data.md --n-messages 100000
 ```
+
+## Cython 移除 (msgspec 简化版)
+
+### 背景
+
+之前的 Cython 扩展 (`_df_msgpack.pyx`) 通过 `cnp.PyArray_GETITEM` 跳过
+`df.to_dict()` 的 Python 包装，将 df-msgpack 路径从 3,445 提升到 4,094 msg/s。
+但代价显著：
+
+- 需 MSVC Build Tools 编译 (Windows) / gcc + Python dev headers (Linux)
+- 增加 setup.py + .pyx + loader + 纯 Python fallback 四类文件
+- `uv sync` 后还需 `python setup.py build_ext --inplace`
+- 编译产物 `.pyd` / `.so` 需 gitignore + 部署时现编
+- Cython 与 pandas 新版本 dtype (Arrow backend) 兼容性需持续维护
+
+经权衡，决定**移除 Cython 扩展**，`df.to_dict(orient="records")` 直接交由
+pandas 原生 C 实现 (性能已足够) + msgspec.msgpack.encode (Rust) 编码。
+
+### 简化前后对比 (100k 端到端, Batcher 启用)
+
+| data_type | comp | Cython+msgspec (msg/s) | msgspec 简化 (msg/s) | 变化 |
+|-----------|------|------------------------|----------------------|------|
+| str       | none    | 22,011 | 21,878 | -1%  ≈持平 |
+| str       | snappy  | 20,079 | 19,768 | -2%  ≈持平 |
+| str       | lz4     | 20,863 | 23,473 | +12% (噪声, str 不走 df 路径) |
+| str       | zstd    | 20,849 | 23,694 | +14% (噪声) |
+| bytes     | none    | 22,081 | 23,899 | +8%  (噪声) |
+| bytes     | snappy  | 19,932 | 23,172 | +16% (噪声) |
+| bytes     | lz4     | 21,013 | 23,497 | +12% (噪声) |
+| bytes     | zstd    | 19,379 | 23,316 | +20% (噪声) |
+| **df-msgpack** | **none**    | **4,094** | **3,440** | **-16%** |
+| **df-msgpack** | **snappy**  | **3,965** | **3,379** | **-15%** |
+| **df-msgpack** | **lz4**     | **4,022** | **3,400** | **-15%** |
+| **df-msgpack** | **zstd**    | **3,956** | **3,383** | **-14%** |
+| df-pyarrow | none    | 2,533 | 2,858 | +13% (噪声, 不经 to_dict) |
+| df-pyarrow | snappy  | 2,441 | 2,761 | +13% (噪声) |
+| df-pyarrow | lz4     | 2,479 | 2,790 | +13% (噪声) |
+| df-pyarrow | zstd    | 2,335 | 2,655 | +14% (噪声) |
+
+> **注**: str / bytes / df-pyarrow 三类路径**完全不经过** `to_dict()`，差异属测量噪声。
+> 唯一受影响路径是 **df-msgpack 4 个压缩组合**，吞吐从 ~4,010 → ~3,400 msg/s (-15%)。
+
+### 关键路径分析
+
+- **str / bytes 路径**: 走 `MsgpackSerializer.encode(str/bytes)`, **与 Cython 无关**,
+  本次对比差异属环境噪声。预期持平。
+- **df-pyarrow 路径**: 走 `PyArrowSerializer`, pandas DataFrame → Arrow Table → IPC,
+  **与 Cython 无关**。差异属噪声。
+- **df-msgpack 路径**: Cython 阶段走 numpy C API 直接读列 + msgspec encode;
+  简化后走 `df.to_dict(orient="records")` (pandas C 路径) + msgspec encode。
+  - 失去 Cython 跳过 `to_dict()` Python 包装的 ~15% 收益
+  - 收益换部署简化
+
+### df-msgpack 4 组合平均
+
+| 阶段 | 4 组合平均 (msg/s) |
+|------|---------------------|
+| v0.6.0 baseline (msgpack-python) | 3,132 |
+| Cython+msgpack | 3,740 |
+| **Cython+msgspec** | **4,009** |
+| **msgspec 简化 (无 Cython)** | **3,400** |
+
+### 部署简化收益
+
+| 维度 | Cython 阶段 | msgspec 简化 | 收益 |
+|------|-------------|--------------|------|
+| 编译依赖 | MSVC Build Tools / gcc + Python dev | 无 | 部署零依赖 |
+| 安装步骤 | `uv sync` + `setup.py build_ext --inplace` | `uv sync` 一步 | 一步完成 |
+| 源码文件 | `.pyx` + `.py` fallback + loader + setup.py = 4 个 | 0 (纯 Python) | -250 行 |
+| 包大小 | +3MB cython 包 + 编译产物 | 0 | 显著减小 |
+| 跨平台 | 需每平台现编 | 一次构建 | 容器化更简单 |
+| 维护成本 | pandas dtype 演进需修 .pyx | 跟 pandas 升级 | 持续维护低 |
+
+### 结论
+
+**简化版是合理 trade-off**：
+
+- df-msgpack 路径吞吐下降 ~15% (3,440 vs 4,010 msg/s)
+- 但仍比 v0.6.0 baseline (3,132 msg/s) 高 ~9%
+- 换来部署零依赖、安装一步到位、跨平台一致
+- str / bytes / df-pyarrow 路径完全不受影响
+- 代码减少 ~250 行, 大幅降低维护成本
+
+如未来 df-msgpack 路径成为瓶颈, 可考虑:
+1. 升级 msgspec (未来版本可能直接支持 pandas/numpy 高效编码)
+2. 用 PyArrow 替换 msgpack (Arrow IPC 已是 C 实现, 本项目 df-pyarrow 2,858 msg/s 看似低是因 IPC 体积大)
+3. 重写 to_dict (写一个 Cython 加速的 `dict_of_arrays` 而非 `list[dict]`, 减少 msgpack 嵌套层)
+
+### 复现命令 (msgspec 简化)
+
+```bash
+cd D:/workflow/pulse-mq && uv sync
+PYTHONIOENCODING=utf-8 uv run python scripts/bench_baseline.py \
+    --port 17110 --output docs/perf-100k-msgspec-simplified-data.md --n-messages 100000
+```
+

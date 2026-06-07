@@ -58,7 +58,11 @@ class StringSerializer(Serializer):
 
 
 class MsgpackSerializer(Serializer):
-    """msgpack 二进制序列化（msgspec 后端，2-3x 更快）。"""
+    """msgpack 二进制序列化（msgspec 后端，Rust 实现）。
+
+    不再为 DataFrame 做特化（to_dict 由调用方在 publish 前预转换），
+    所有 obj 走同一 msgspec 路径，简洁且零依赖编译。
+    """
 
     def serialize(self, obj: Any) -> bytes:
         import msgspec
