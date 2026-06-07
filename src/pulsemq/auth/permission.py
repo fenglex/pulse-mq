@@ -56,8 +56,10 @@ def _match_parts(pat: list[str], pi: int, topic: list[str], ti: int) -> bool:
             # * 在末尾匹配一个或多个段
             return ti < len(topic) and _match_parts(pat, pi + 1, topic, len(topic))
         else:
-            # * 在中间匹配恰好一个段
+            # * 在中间匹配恰好一个非空段
             if ti >= len(topic):
+                return False
+            if not topic[ti]:
                 return False
             return _match_parts(pat, pi + 1, topic, ti + 1)
 
