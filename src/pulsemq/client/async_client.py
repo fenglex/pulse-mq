@@ -16,7 +16,6 @@ import pandas as pd
 import zmq
 import zmq.asyncio
 
-from pulsemq.client.batcher import Batcher
 from pulsemq.protocol.flags import FrameFlags
 from pulsemq.protocol.frames import FrameCodec
 from pulsemq.protocol.msg_type import MsgType
@@ -105,9 +104,6 @@ class PulseClient:
         recv_timeout: float = 5.0,
         connect_timeout: float = 5.0,
         identity: bytes | None = None,
-        batch_size: int = 1,
-        batch_interval_ms: float = 10.0,
-        batch_max_wait_ms: float = 50.0,
     ):
         self._address = address
         self._xpub_address = xpub_address or address.replace("5555", "5556")
@@ -120,12 +116,6 @@ class PulseClient:
         self._recv_timeout = recv_timeout
         self._connect_timeout = connect_timeout
         self._identity = identity or f"client_{id(self)}".encode()
-        # 批量发送参数 (Phase 2: 客户端 Batcher)
-        # 默认 batch_size=1 → 退化为单条直发, 保持向后兼容
-        self._batch_size = batch_size
-        self._batch_interval_ms = batch_interval_ms
-        self._batch_max_wait_ms = batch_max_wait_ms
-
         self._ctx: zmq.asyncio.Context | None = None
         self._dealer: zmq.asyncio.Socket | None = None
         self._sub: zmq.asyncio.Socket | None = None
@@ -159,19 +149,6 @@ class PulseClient:
         self._sub = self._ctx.socket(zmq.SUB)
         self._sub.connect(self._xpub_address)
 
-        # 创建 Batcher (Phase 2)
-        # send_fn 接收 (payloads_list, ser_fmt, comp):
-        #   - batch_size == 1: 列表里始终 1 条, 走单条 PUB
-        #   - batch_size > 1:  列表里 N 条, 走 BATCH 协议
-        self._batcher = Batcher(
-            send_fn=self._batcher_send,
-            ser_fmt=self._DEFAULT_SER,
-            comp=self._DEFAULT_COMP,
-            batch_size=self._batch_size,
-            batch_interval_ms=self._batch_interval_ms,
-            batch_max_wait_ms=self._batch_max_wait_ms,
-        )
-
         self._connected = True
         self._reconnect_count = 0
         logger.info("已连接到 %s", self._address)
@@ -179,13 +156,6 @@ class PulseClient:
     async def disconnect(self) -> None:
         """断开连接。"""
         self._connected = False
-        # 先关闭 Batcher, flush 残留
-        if self._batcher is not None:
-            try:
-                await self._batcher.close()
-            except Exception as e:
-                logger.debug("Batcher close 异常: %s", e)
-            self._batcher = None
         if self._sub:
             self._sub.close(linger=0)
             self._sub = None
@@ -253,59 +223,10 @@ class PulseClient:
         else:
             payload_obj = data
         payload = FrameCodec.encode_payload(payload_obj, ser_fmt, compression)
-
-        # 批模式: 入 Batcher, 不立即发送
-        if self._batcher is not None and self._batch_size > 1:
-            # BATCH 协议只支持 msgpack 编码 list[bytes], 每条是各 ser_fmt 序列化的 bytes.
-            # 这里把单条 payload 包装为 [payload] 给 Batcher, Batcher 攒够 N 条再走 BATCH.
-            # topic 传给 Batcher, Batcher 内部维护 current_topic, 切换 topic 时强制 flush.
-            # ser_fmt / compression 也传给 Batcher, 批次内 payload 可能用不同 ser_fmt
-            await self._batcher.add(payload, topic=topic, ser_fmt=ser_fmt, comp=compression)
-            return
-
-        # 直发模式 (默认): 立即发送
         frames = FrameCodec.encode(
             MsgType.PUB, topic, record_count, payload, ser_fmt, compression
         )
         await self._send_with_retry(frames, retry, retry_delay)
-
-    async def _batcher_send(
-        self,
-        items: list[tuple[str, str, bytes]],
-        comp: str,
-        topic: str = "",
-    ) -> None:
-        """Batcher 调用的发送钩子。
-
-        Args:
-            items: list[(ser_fmt, comp, payload_bytes), ...] 每条带 ser/comp 信息
-            comp: BATCH 协议外层 msgpack 包装的压缩算法 (整批统一)
-            topic: 该批次的统一 topic (Batcher 单 topic 设计)
-
-        - 1 条 payload: 走 PUB 单条路径
-        - N 条 payload: 走 BATCH 协议 (msgpack 编码 list[(ser_fmt, payload_bytes)] 后按 comp 压缩)
-        """
-        if not items:
-            return
-        if len(items) == 1:
-            # 单条退化为 PUB, 用 batcher 给的 topic / ser / comp
-            ser_fmt, item_comp, payload = items[0]
-            frames = FrameCodec.encode(
-                MsgType.PUB, topic, 1, payload, ser_fmt, item_comp
-            )
-            await self._send_with_retry(frames, 0, 0.1)
-            return
-        # N 条: BATCH 协议
-        # 把 items 转为 (ser_fmt, payload_bytes) 列表 (server _handle_batch 只需 ser_fmt 不需 item comp)
-        # 但保留每条的 ser_fmt (用于 server 端 broadcast meta)
-        ser_payload_pairs = [(sf, p) for sf, _ic, p in items]
-        batch_payload = FrameCodec.encode_batch_payload(ser_payload_pairs, comp)
-        # BATCH 帧的 meta flags 用 (ser_fmt="msgpack", comp, has_topic=True)
-        # 因为 batch 内的 N 条 payload 各自带 ser_fmt 标记, 外层统一 msgpack
-        frames = FrameCodec.encode(
-            MsgType.BATCH, topic, len(items), batch_payload, "msgpack", comp
-        )
-        await self._send_with_retry(frames, 0, 0.1)
 
     # ---- 订阅 ----
 
