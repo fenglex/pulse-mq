@@ -22,6 +22,7 @@ from pulsemq.engine.pool import PipelineContextPool
 from pulsemq.engine.router import MessageRouter
 from pulsemq.models import TopicInfo
 from pulsemq.monitoring.client_tracker import ClientTracker
+from pulsemq.monitoring.realtime import TopicMetricsRegistry
 from pulsemq.protocol.flags import FrameFlags
 from pulsemq.protocol.frames import FrameCodec, _RECORD_COUNT_STRUCT
 from pulsemq.protocol.msg_type import MsgType
@@ -41,6 +42,7 @@ class MessageHandlers:
         default_ser: str = "msgpack",
         default_comp: str = "none",
         client_tracker: ClientTracker | None = None,
+        topic_metrics: TopicMetricsRegistry | None = None,
     ):
         self.router = router
         self._send = send_fn
@@ -51,6 +53,8 @@ class MessageHandlers:
         self._ctx_pool = PipelineContextPool(size=4096)
         # Phase 4: 客户端追踪器 (可选注入, 兼容旧调用方)
         self._client_tracker = client_tracker
+        # Phase 5: topic 维度 1-min 监控 (可选注入)
+        self._topic_metrics = topic_metrics
 
         # 预计算 broadcast 帧的固定部分（#1 优化）
         _flags = FrameFlags(ser_fmt=default_ser, comp=default_comp, has_topic=True)
@@ -133,6 +137,11 @@ class MessageHandlers:
         if self._client_tracker is not None:
             self._client_tracker.on_pub(identity, len(payload))
 
+        # Phase 5: topic 1-min 监控 (快速路径没有 ctx.timestamp,
+        # 直接用 0 延迟占位, 不影响分位数)
+        if self._topic_metrics is not None:
+            self._topic_metrics.record(topic, 0.0)
+
         # 构造 broadcast meta：保留原始 ser/comp，仅替换 msg_type=BROADCAST
         broadcast_meta = self._build_broadcast_meta(wire_meta)
 
@@ -206,6 +215,11 @@ class MessageHandlers:
         # Phase 4: 客户端追踪 - 发布者 PUB 计数 (msg_out)
         if self._client_tracker is not None:
             self._client_tracker.on_pub(ctx.identity, len(ctx.payload))
+
+        # Phase 5: topic 1-min 监控 - 记录延迟
+        if self._topic_metrics is not None:
+            latency_ms = max(0.0, (time.time() - ctx.timestamp) * 1000.0)
+            self._topic_metrics.record(topic, latency_ms)
 
         # 轻量级订阅者检查（#2 优化）
         if self.router.has_subscribers(topic):

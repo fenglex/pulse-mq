@@ -31,7 +31,7 @@ from pulsemq.event_loop import install_event_loop
 from pulsemq.monitoring.api import MetricsHTTPServer
 from pulsemq.monitoring.client_tracker import ClientTracker
 from pulsemq.monitoring.minute import MinuteAggregator
-from pulsemq.monitoring.realtime import RealtimeMetrics
+from pulsemq.monitoring.realtime import RealtimeMetrics, TopicMetricsRegistry
 from pulsemq.protocol.frames import FrameCodec
 from pulsemq.protocol.msg_type import MsgType
 from pulsemq.storage.database import init_db, parse_db_url
@@ -95,6 +95,9 @@ class PulseServer:
         # Phase 4: 客户端追踪器
         self._client_tracker = ClientTracker()
 
+        # Phase 5: topic 维度 1-min 监控注册表
+        self._topic_metrics = TopicMetricsRegistry()
+
         # 处理器
         self._handlers = MessageHandlers(
             router=self._router,
@@ -104,6 +107,7 @@ class PulseServer:
             default_ser=self._config.default_serializer,
             default_comp=self._config.default_compressor,
             client_tracker=self._client_tracker,
+            topic_metrics=self._topic_metrics,
         )
 
         # Engine
@@ -328,6 +332,10 @@ class PulseServer:
     @property
     def client_tracker(self) -> ClientTracker:
         return self._client_tracker
+
+    @property
+    def topic_metrics(self) -> TopicMetricsRegistry:
+        return self._topic_metrics
 
 
 def main() -> None:
