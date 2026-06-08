@@ -90,6 +90,26 @@ class PulsePublisher:
             return fn
         return decorator
 
+    def burst_producer(
+        self,
+        name: str,
+        *,
+        cache_size: int = 100_000,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ) -> Callable:
+        """装饰器：注册 burst producer（无间隔连续发送，用于极限性能测试）。"""
+        def decorator(fn: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
+            self._producer_mgr.register_burst(
+                callback=fn,
+                name=name,
+                cache_size=cache_size,
+                serializer=serializer,
+                compression=compression,
+            )
+            return fn
+        return decorator
+
     def register_producer(
         self,
         fn: Callable[[], Awaitable[Any]],

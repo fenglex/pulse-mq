@@ -109,7 +109,7 @@ class ZmqPubTransport:
         """启动 PUB socket，可选开启 PLAIN 认证。"""
         self._ctx = zmq.asyncio.Context()
         self._pub = self._ctx.socket(zmq.PUB)
-        self._pub.setsockopt(zmq.SNDHWM, 10000)
+        self._pub.setsockopt(zmq.SNDHWM, 0)  # 0=无上限，burst 模式不丢消息
         self._pub.setsockopt(zmq.LINGER, 1000)
 
         if self._api_keys:

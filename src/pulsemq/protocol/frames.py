@@ -1,10 +1,11 @@
 """4 帧格式编解码。
 
 Frame 1: topic (UTF-8 bytes)
-Frame 2: meta (3 bytes)
+Frame 2: meta (5 bytes)
   Byte 0: msg_type (0x01=DATA, 0x02=PING)
   Byte 1: flags (ser_fmt + comp 编码)
-  Byte 2: record_count (uint8, 0-255)
+  Byte 2-3: record_count (big-endian uint16, 0-65535)
+  Byte 4: reserved
 Frame 3: timestamp (8 bytes, big-endian int64, 纳秒)
 Frame 4: payload (序列化+压缩后的 bytes)
 """
@@ -23,7 +24,8 @@ from pulsemq.protocol.msg_type import MsgType
 
 # timestamp 编码：8 字节 big-endian int64
 _TS_STRUCT = struct.Struct(">q")
-# record_count: meta Byte 2 (uint8)
+# record_count 编码：2 字节 big-endian uint16
+_RC_STRUCT = struct.Struct(">H")
 
 
 @dataclass
@@ -49,7 +51,7 @@ def encode(
     """编码数据为 4 帧。
 
     Returns:
-        [topic_bytes, meta(3B), timestamp(8B), payload]
+        [topic_bytes, meta(5B), timestamp(8B), payload]
     """
     # 序列化 + 压缩
     serializer_obj = ser_mod.get(serializer)
@@ -57,9 +59,10 @@ def encode(
     compressor = comp_mod.get(compression)
     payload = compressor.compress(encoded)
 
-    # meta 3 字节
+    # meta 5 字节
     flags_byte = encode_flags(serializer, compression)
-    meta = bytes([MsgType.DATA, flags_byte, record_count & 0xFF])
+    rc_bytes = _RC_STRUCT.pack(record_count & 0xFFFF)
+    meta = bytes([MsgType.DATA, flags_byte]) + rc_bytes + b'\x00'
 
     # 纳秒时间戳
     timestamp_ns = time.time_ns()
@@ -80,7 +83,7 @@ def decode(frames: list[bytes]) -> PulseMessage:
 
     msg_type = meta[0]
     flags_byte = meta[1]
-    record_count = meta[2]
+    record_count = _RC_STRUCT.unpack(meta[2:4])[0]
 
     ser_fmt, comp_name = decode_flags(flags_byte)
 

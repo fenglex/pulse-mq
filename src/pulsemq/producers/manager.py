@@ -1,6 +1,8 @@
 """ProducerManager: 回调注册 + asyncio Task 并发调度。
 
-每个 producer 是独立的 asyncio.Task，固定延迟调度。
+两种模式：
+- 普通 producer：固定延迟调度（interval > 0）
+- burst producer：无间隔连续发送（interval=0），用于极限性能测试
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ class ProducerManager:
         serializer: str = "msgpack",
         compression: str = "none",
     ) -> None:
-        """注册一个 producer。"""
+        """注册一个普通 producer。"""
         spec = ProducerSpec(
             name=name,
             callback=callback,
@@ -57,6 +59,26 @@ class ProducerManager:
         )
         self._specs[name] = spec
         logger.info("Producer 注册: name=%s interval=%.1fs", name, interval)
+
+    def register_burst(
+        self,
+        callback: ProducerCallback,
+        name: str,
+        cache_size: int = 100_000,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ) -> None:
+        """注册一个 burst producer：无间隔连续发送，用于极限性能测试。"""
+        spec = ProducerSpec(
+            name=name,
+            callback=callback,
+            interval=0.0,  # burst 模式标记
+            cache_size=cache_size,
+            serializer=serializer,
+            compression=compression,
+        )
+        self._specs[name] = spec
+        logger.info("Burst Producer 注册: name=%s", name)
 
     @property
     def specs(self) -> dict[str, ProducerSpec]:
@@ -70,12 +92,13 @@ class ProducerManager:
         """
         self._running = True
         for name, spec in self._specs.items():
-            task = asyncio.create_task(
-                self._run_loop(spec, on_message),
-                name=f"producer-{name}",
-            )
+            if spec.interval == 0.0:
+                coro = self._run_burst_loop(spec, on_message)
+            else:
+                coro = self._run_loop(spec, on_message)
+            task = asyncio.create_task(coro, name=f"producer-{name}")
             self._tasks[name] = task
-            logger.info("Producer 启动: %s", name)
+            logger.info("Producer 启动: %s (burst=%s)", name, spec.interval == 0.0)
 
     async def stop_all(self) -> None:
         """停止所有 producer 任务。"""
@@ -113,3 +136,21 @@ class ProducerManager:
             else:
                 # 不积压，让出控制权
                 await asyncio.sleep(0)
+
+    async def _run_burst_loop(self, spec: ProducerSpec, on_message: Any) -> None:
+        """Burst 模式：无间隔连续发送，直到 stop 或回调返回 None。
+
+        - 每次循环直接调用回调，无 sleep
+        - 异常后短暂冷却 0.1s，避免空转
+        """
+        while self._running:
+            try:
+                data = await spec.callback()
+                if data is None:
+                    break  # 回调主动结束
+                await on_message(spec, data)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.warning("Burst Producer %s 回调异常", spec.name, exc_info=True)
+                await asyncio.sleep(0.1)

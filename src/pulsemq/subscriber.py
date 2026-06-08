@@ -40,7 +40,7 @@ class PulseSubscriber:
         """连接 PUB socket，PLAIN 认证。"""
         self._ctx = zmq.asyncio.Context()
         self._sub = self._ctx.socket(zmq.SUB)
-        self._sub.setsockopt(zmq.RCVHWM, 10000)
+        self._sub.setsockopt(zmq.RCVHWM, 0)  # 0=无上限
 
         if self._username:
             self._sub.setsockopt(zmq.PLAIN_USERNAME, self._username.encode())
