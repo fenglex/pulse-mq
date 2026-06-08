@@ -1,1 +1,1 @@
-"""传输层：ZMQ 适配器。"""
+"""传输层：ZMQ PUB socket + PLAIN 认证。"""

@@ -1,7 +1,7 @@
 [project]
 name = "pulse-mq"
-version = "0.6.0"
-description = "高性能金融行情消息中间件"
+version = "2.0.0"
+description = "高性能纯 pub→sub 消息系统"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
@@ -35,7 +35,7 @@ Repository = "https://github.com/haifeng/pulse-mq"
 Issues = "https://github.com/haifeng/pulse-mq/issues"
 
 [project.scripts]
-pulse-mq = "pulsemq.server:main"
+pulse-mq = "pulsemq.publisher:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsemq"]

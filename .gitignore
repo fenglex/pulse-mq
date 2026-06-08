@@ -19,3 +19,4 @@ out.log
 *.so
 build/
 src/pulsemq/serialization/_df_msgpack.*
+.superpowers/

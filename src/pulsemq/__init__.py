@@ -1,28 +1,14 @@
-"""PulseMQ - 高性能金融行情消息中间件。"""
+"""PulseMQ v2 — 纯 pub → sub 架构，无 broker。"""
 
-from pulsemq.server import PulseServer
-from pulsemq.client.async_client import (
-    PulseClient,
-    PulseMessage,
-    PulseError,
-    PulseConnectionError,
-    PulseAuthError,
-    PulsePermissionError,
-    PulseTimeoutError,
-    PulseServerError,
-)
-from pulsemq.config import ServerConfig, load_config
+from pulsemq.publisher import PulsePublisher
+from pulsemq.subscriber import PulseSubscriber
+from pulsemq.protocol.frames import PulseMessage
+from pulsemq.config import PublisherConfig, load_config
 
 __all__ = [
-    "PulseServer",
-    "PulseClient",
+    "PulsePublisher",
+    "PulseSubscriber",
     "PulseMessage",
-    "PulseError",
-    "PulseConnectionError",
-    "PulseAuthError",
-    "PulsePermissionError",
-    "PulseTimeoutError",
-    "PulseServerError",
-    "ServerConfig",
+    "PublisherConfig",
     "load_config",
 ]

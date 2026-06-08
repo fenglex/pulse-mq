@@ -1,126 +1,116 @@
-"""固定 6 帧格式的编解码。
+"""4 帧格式编解码。
 
-客户端发送 4 帧: [topic][meta(2B)][record_count(4B)][payload]
-ZMQ 自动附加:   [identity][delimiter] + 客户端 4 帧 = 服务端收到 6 帧
-
-服务端广播 4 帧: [topic][meta(2B)][record_count(4B)][payload]
+Frame 1: topic (UTF-8 bytes)
+Frame 2: meta (3 bytes)
+  Byte 0: msg_type (0x01=DATA, 0x02=PING)
+  Byte 1: flags (ser_fmt + comp 编码)
+  Byte 2: record_count (uint8, 0-255)
+Frame 3: timestamp (8 bytes, big-endian int64, 纳秒)
+Frame 4: payload (序列化+压缩后的 bytes)
 """
 
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass
+from typing import Any
 
-from pulsemq.protocol.flags import FrameFlags
+from pulsemq.protocol import compression as comp_mod
+from pulsemq.protocol import serialization as ser_mod
+from pulsemq.protocol.flags import decode_flags, encode_flags
 from pulsemq.protocol.msg_type import MsgType
-from pulsemq.serialization.registry import SerializationRegistry, CompressionRegistry
 
-# record_count 编码格式：4 字节 big-endian uint32
-_RECORD_COUNT_STRUCT = struct.Struct(">I")
+# timestamp 编码：8 字节 big-endian int64
+_TS_STRUCT = struct.Struct(">q")
+# record_count: meta Byte 2 (uint8)
 
 
 @dataclass
-class DecodedFrame:
-    """解码后的帧数据。"""
+class PulseMessage:
+    """解码后的消息。"""
 
-    identity: bytes       # ZMQ identity
-    topic: str            # Frame 2
-    msg_type: int         # Frame 3 Byte 0
-    flags: FrameFlags     # Frame 3 Byte 1 解析结果
-    record_count: int     # Frame 4
-    payload: bytes        # Frame 5
-    has_topic: bool       # topic 是否非空
-    ser_fmt: str          # 序列化格式名
-    comp: str             # 压缩算法名
+    topic: str
+    payload: Any              # 解码后数据
+    raw_payload: bytes        # 原始字节
+    record_count: int         # 本帧记录数
+    timestamp_ns: int         # 纳秒时间戳
+    serializer: str           # 序列化格式名
+    compression: str          # 压缩格式名
 
 
-class FrameCodec:
-    """帧编解码器。"""
+def encode(
+    topic: str,
+    data: Any,
+    serializer: str = "msgpack",
+    compression: str = "none",
+    record_count: int = 1,
+) -> list[bytes]:
+    """编码数据为 4 帧。
 
-    @staticmethod
-    def encode(
-        msg_type: int,
-        topic: str,
-        record_count: int,
-        payload: bytes,
-        ser_fmt: str = "msgpack",
-        comp: str = "none",
-    ) -> list[bytes]:
-        """编码为 4 帧（客户端发送或服务端广播）。
+    Returns:
+        [topic_bytes, meta(3B), timestamp(8B), payload]
+    """
+    # 序列化 + 压缩
+    serializer_obj = ser_mod.get(serializer)
+    encoded = serializer_obj.serialize(data)
+    compressor = comp_mod.get(compression)
+    payload = compressor.compress(encoded)
 
-        Returns:
-            [topic_bytes, meta_bytes(2B), record_count_bytes(4B), payload_bytes]
-        """
-        has_topic = bool(topic)
-        flags = FrameFlags(ser_fmt=ser_fmt, comp=comp, has_topic=has_topic)
-        meta = bytes([msg_type, flags.encode()])
-        rc_bytes = _RECORD_COUNT_STRUCT.pack(record_count)
-        return [topic.encode("utf-8"), meta, rc_bytes, payload]
+    # meta 3 字节
+    flags_byte = encode_flags(serializer, compression)
+    meta = bytes([MsgType.DATA, flags_byte, record_count & 0xFF])
 
-    @staticmethod
-    def decode_server(frames: list[bytes]) -> DecodedFrame:
-        """解码服务端 ROUTER 收到的帧。
+    # 纳秒时间戳
+    timestamp_ns = time.time_ns()
+    ts_bytes = _TS_STRUCT.pack(timestamp_ns)
 
-        支持两种情况:
-            5 帧: [identity, topic, meta(2B), record_count(4B), payload]
-                  DEALER → ROUTER（无 delimiter）
-            6 帧: [identity, delimiter, topic, meta(2B), record_count(4B), payload]
-                  ROUTER 路由信封（含 delimiter）
+    return [topic.encode("utf-8"), meta, ts_bytes, payload]
 
-        Raises:
-            ValueError: 帧数不在 5-6 范围内。
-        """
-        if len(frames) == 6:
-            # 含 delimiter
-            identity = frames[0]
-            # frames[1] = delimiter（空帧，跳过）
-            topic = frames[2].decode("utf-8")
-            meta = frames[3]
-            record_count_raw = frames[4]
-            payload = frames[5]
-        elif len(frames) == 5:
-            # 无 delimiter（DEALER 直连 ROUTER）
-            identity = frames[0]
-            topic = frames[1].decode("utf-8")
-            meta = frames[2]
-            record_count_raw = frames[3]
-            payload = frames[4]
-        else:
-            raise ValueError(
-                f"帧数不正确：期望 5-6 帧，收到 {len(frames)} 帧"
-            )
 
-        msg_type = meta[0]
-        flags = FrameFlags.decode(meta[1])
-        record_count = _RECORD_COUNT_STRUCT.unpack(record_count_raw)[0]
+def decode(frames: list[bytes]) -> PulseMessage:
+    """解码 4 帧为 PulseMessage。"""
+    if len(frames) != 4:
+        raise ValueError(f"帧数不正确：期望 4 帧，收到 {len(frames)} 帧")
 
-        return DecodedFrame(
-            identity=identity,
-            topic=topic,
-            msg_type=msg_type,
-            flags=flags,
-            record_count=record_count,
-            payload=payload,
-            has_topic=flags.has_topic,
-            ser_fmt=flags.ser_fmt,
-            comp=flags.comp,
-        )
+    topic = frames[0].decode("utf-8")
+    meta = frames[1]
+    timestamp_ns = _TS_STRUCT.unpack(frames[2])[0]
+    raw_payload = frames[3]
 
-    @staticmethod
-    def encode_payload(obj, ser_fmt: str = "msgpack", comp: str = "none") -> bytes:
-        """序列化 + 压缩 payload。
+    msg_type = meta[0]
+    flags_byte = meta[1]
+    record_count = meta[2]
 
-        调用方需在传入前将 DataFrame 等复杂类型预转为 list[dict] 等 msgpack
-        友好形式；本方法对所有 ser_fmt 走同一条注册表路径。
-        """
-        serializer = SerializationRegistry.get(ser_fmt)
-        encoded = serializer.serialize(obj)
-        compressor = CompressionRegistry.get(comp)
-        return compressor.compress(encoded)
+    ser_fmt, comp_name = decode_flags(flags_byte)
 
-    @staticmethod
-    def decode_payload(data: bytes, ser_fmt: str = "msgpack", comp: str = "none"):
-        """解压 + 反序列化 payload。"""
-        compressor = CompressionRegistry.get(comp)
-        serializer = SerializationRegistry.get(ser_fmt)
-        return serializer.deserialize(compressor.decompress(data))
+    # 解压 + 反序列化
+    compressor = comp_mod.get(comp_name)
+    decompressed = compressor.decompress(raw_payload)
+    serializer = ser_mod.get(ser_fmt)
+    payload = serializer.deserialize(decompressed)
+
+    return PulseMessage(
+        topic=topic,
+        payload=payload,
+        raw_payload=raw_payload,
+        record_count=record_count,
+        timestamp_ns=timestamp_ns,
+        serializer=ser_fmt,
+        compression=comp_name,
+    )
+
+
+def encode_payload(obj: Any, serializer: str = "msgpack", compression: str = "none") -> bytes:
+    """序列化 + 压缩。"""
+    serializer_obj = ser_mod.get(serializer)
+    encoded = serializer_obj.serialize(obj)
+    compressor = comp_mod.get(compression)
+    return compressor.compress(encoded)
+
+
+def decode_payload(data: bytes, serializer: str = "msgpack", compression: str = "none") -> Any:
+    """解压 + 反序列化。"""
+    compressor = comp_mod.get(compression)
+    serializer_obj = ser_mod.get(serializer)
+    return serializer_obj.deserialize(compressor.decompress(data))
