@@ -49,9 +49,17 @@ def encode(
 ) -> list[bytes]:
     """编码数据为 4 帧。
 
+    Args:
+        record_count: 本帧记录数，最大 1,000,000。
+
     Returns:
-        [topic_bytes, meta(5B), timestamp(8B), payload]
+        [topic_bytes, meta(6B), timestamp(8B), payload]
+
+    Raises:
+        ValueError: record_count > 1,000,000。
     """
+    if record_count > 1_000_000:
+        raise ValueError(f"单批次最大 1,000,000 条记录，收到 {record_count:,}")
     # 序列化 + 压缩
     serializer_obj = ser_mod.get(serializer)
     encoded = serializer_obj.serialize(data)
