@@ -45,8 +45,6 @@ class PulseSubscriber:
         if self._username:
             self._sub.setsockopt(zmq.PLAIN_USERNAME, self._username.encode())
             self._sub.setsockopt(zmq.PLAIN_PASSWORD, self._password.encode())
-            # 必须设置 PLAIN_CLIENT 才能启用客户端认证
-            self._sub.setsockopt(zmq.PLAIN_SERVER, 0)
 
         self._sub.connect(self._address)
         logger.info("Subscriber 连接到 %s (auth=%s)", self._address, "on" if self._username else "off")

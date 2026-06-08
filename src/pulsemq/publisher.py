@@ -283,3 +283,17 @@ class PulsePublisher:
             if int(next_minute) % 3600 < 70:
                 if self._storage:
                     self._storage.cleanup()
+
+
+def main() -> None:
+    """CLI 入口点。提供最小示例 publisher。"""
+    import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+    pub = PulsePublisher()
+    print("PulseMQ Publisher v2 — 零配置模式启动", file=sys.stderr)
+    print("用法: 参考 PulsePublisher 文档注册 producer", file=sys.stderr)
+    pub.start()

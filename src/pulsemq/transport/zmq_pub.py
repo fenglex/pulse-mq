@@ -2,12 +2,15 @@
 
 v2 简化：单一 PUB socket，无需 ROUTER/XPUB。
 api_keys 非空时自动开启 ZMQ PLAIN 认证。
+
+ZAP handler 运行在 asyncio 事件循环中（与 PUB socket 同 context），
+避免跨线程 inproc:// 的兼容性问题。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
 
 import zmq
 import zmq.asyncio
@@ -15,42 +18,47 @@ import zmq.asyncio
 logger = logging.getLogger(__name__)
 
 
-class PulseZAPHandler:
-    """ZMQ PLAIN 认证的 ZAP handler。
+class AsyncZAPHandler:
+    """ZMQ PLAIN 认证的 ZAP handler（asyncio 版）。
 
-    简化版：仅白名单校验，不查数据库。
+    与 PUB socket 共享同一个 zmq.asyncio.Context，
+    在 asyncio 事件循环中处理 ZAP 请求。
     """
 
-    def __init__(self, api_keys: dict[str, str]) -> None:
-        self._api_keys = api_keys  # {username: password}
-        self._thread: threading.Thread | None = None
-        self._ctx: zmq.Context | None = None
-        self._zap: zmq.Socket | None = None
+    def __init__(self, api_keys: dict[str, str], ctx: zmq.asyncio.Context) -> None:
+        self._api_keys = api_keys
+        self._ctx = ctx
+        self._zap: zmq.asyncio.Socket | None = None
+        self._task: asyncio.Task | None = None
 
-    def start(self) -> None:
-        """在独立线程启动 ZAP handler。"""
-        self._ctx = zmq.Context()
+    async def start(self) -> None:
+        """启动 ZAP handler。"""
         self._zap = self._ctx.socket(zmq.REP)
         self._zap.bind("inproc://zeromq.zap.01")
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self._task = asyncio.create_task(self._loop())
         logger.info("ZAP handler 启动: %d 个白名单用户", len(self._api_keys))
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
         if self._zap is not None:
             self._zap.close(linger=100)
             self._zap = None
-        if self._ctx is not None:
-            self._ctx.term()
-            self._ctx = None
 
-    def _loop(self) -> None:
-        """ZAP 请求处理循环（同步，在独立线程运行）。"""
+    async def _loop(self) -> None:
+        """ZAP 请求处理循环（asyncio）。"""
         assert self._zap is not None
         while True:
             try:
-                msg = self._zap.recv_multipart()
+                msg = await self._zap.recv_multipart()
             except zmq.ZMQError:
+                break
+            except asyncio.CancelledError:
                 break
 
             # ZAP 请求帧格式:
@@ -95,7 +103,7 @@ class ZmqPubTransport:
         self._api_keys = api_keys or {}
         self._ctx: zmq.asyncio.Context | None = None
         self._pub: zmq.asyncio.Socket | None = None
-        self._zap: PulseZAPHandler | None = None
+        self._zap: AsyncZAPHandler | None = None
 
     async def start(self) -> None:
         """启动 PUB socket，可选开启 PLAIN 认证。"""
@@ -105,9 +113,10 @@ class ZmqPubTransport:
         self._pub.setsockopt(zmq.LINGER, 1000)
 
         if self._api_keys:
+            # ZAP handler 必须在 PUB bind 之前启动
+            self._zap = AsyncZAPHandler(self._api_keys, self._ctx)
+            await self._zap.start()
             self._pub.setsockopt(zmq.PLAIN_SERVER, 1)
-            self._zap = PulseZAPHandler(self._api_keys)
-            self._zap.start()
 
         self._pub.bind(self._bind)
         logger.info("PUB socket 绑定到 %s (auth=%s)", self._bind, "on" if self._api_keys else "off")
@@ -124,7 +133,7 @@ class ZmqPubTransport:
             self._pub.close(linger=1000)
             self._pub = None
         if self._zap is not None:
-            self._zap.stop()
+            await self._zap.stop()
             self._zap = None
         if self._ctx is not None:
             self._ctx.term()
