@@ -1,6 +1,6 @@
 [project]
 name = "pulse-mq"
-version = "2.0.0"
+version = "2.0.2"
 description = "高性能纯 pub→sub 消息系统"
 readme = "README.md"
 license = "MIT"
@@ -39,6 +39,7 @@ pulse-mq = "pulsemq.publisher:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsemq"]
+artifacts = ["src/pulsemq/admin/static/*.js"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
