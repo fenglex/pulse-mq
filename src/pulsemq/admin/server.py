@@ -229,18 +229,45 @@ class AdminServer:
         return {"topic_count": len(topics), "topics": topics}
 
     def _topic_history(self, topic: str, minutes: int) -> dict:
-        """分钟级历史。"""
-        # 优先从内存
+        """分钟级历史（内存 + SQLite 合并，timestamp 去重）。"""
+        # 内存数据优先
+        mem_history: list[dict] = []
         if self._traffic is not None:
-            history = self._traffic.get_history(topic, minutes)
-            if history:
-                return {"topic": topic, "minutes": minutes, "history": history}
-        # 从 SQLite
+            mem_history = self._traffic.get_history(topic, minutes)
+
+        if mem_history and len(mem_history) >= minutes:
+            # 内存数据已覆盖请求范围，直接返回
+            return {"topic": topic, "minutes": minutes, "history": mem_history}
+
+        # SQLite 补充更早的数据
+        db_history: list[dict] = []
         if self._storage is not None:
             since_ts = int(time.time()) - minutes * 60
-            history = self._storage.load_history(topic, since_ts)
-            return {"topic": topic, "minutes": minutes, "history": history}
-        return {"topic": topic, "minutes": minutes, "history": []}
+            db_history = self._storage.load_history(topic, since_ts)
+
+        if not mem_history and not db_history:
+            return {"topic": topic, "minutes": minutes, "history": []}
+
+        # 合并去重：内存优先（更准确），SQLite 按时间戳去重
+        seen: set[int] = set()
+        merged: list[dict] = []
+
+        for item in mem_history:
+            ts = item.get("timestamp", 0)
+            if ts not in seen:
+                seen.add(ts)
+                merged.append(item)
+
+        for item in db_history:
+            ts = item.get("timestamp", 0)
+            if ts not in seen:
+                seen.add(ts)
+                merged.append(item)
+
+        # 按 timestamp 排序
+        merged.sort(key=lambda x: x.get("timestamp", 0))
+
+        return {"topic": topic, "minutes": minutes, "history": merged}
 
     def _system_status(self) -> dict:
         return {

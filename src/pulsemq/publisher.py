@@ -36,7 +36,7 @@ from pulsemq.transport.zmq_pub import ZmqPubTransport
 logger = logging.getLogger(__name__)
 
 # 包版本：与 pyproject.toml 同步
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 
 class PulsePublisher:

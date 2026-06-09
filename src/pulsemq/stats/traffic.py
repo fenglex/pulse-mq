@@ -110,20 +110,35 @@ class TrafficStats:
         """所有 topic 完整快照（含历史信息）。"""
         result: dict[str, dict] = {}
         all_topics = set(self._current.keys()) | set(self._slots.keys())
+        now_ts = time.time()
+        elapsed = max(now_ts - self._current_minute, 1.0)
+
         for topic in all_topics:
             cur = self._current.get(topic)
             slots = self._slots.get(topic, deque())
-            # 计算最近 1 分钟 msg_rate
-            recent_rate = 0.0
-            if slots:
-                last = slots[-1]
-                recent_rate = last.msg_count / 60.0
+            cur_msg = cur.msg_count if cur else 0
+            cur_rec = cur.record_count if cur else 0
+            cur_bytes = cur.bytes_total if cur else 0
+
+            # 近 60 秒滚动均值：当前分钟 + 上一分钟按比例补齐
+            prev = slots[-1] if slots else None
+            prev_msg = prev.msg_count if prev else 0
+            prev_rec = prev.record_count if prev else 0
+            prev_bytes = prev.bytes_total if prev else 0
+
+            # elapsed 秒用当前分钟累积，剩余 (60-elapsed) 秒用上一分钟按比例估算
+            remaining = max(60.0 - elapsed, 0.0)
+            window_msg = cur_msg + prev_msg * (remaining / 60.0)
+            window_rec = cur_rec + prev_rec * (remaining / 60.0)
+            window_bytes = cur_bytes + prev_bytes * (remaining / 60.0)
 
             result[topic] = {
-                "msg_count_current": cur.msg_count if cur else 0,
-                "record_count_current": cur.record_count if cur else 0,
-                "bytes_total_current": cur.bytes_total if cur else 0,
-                "msg_rate_1min": round(recent_rate, 2),
+                "msg_count_current": cur_msg,
+                "record_count_current": cur_rec,
+                "bytes_total_current": cur_bytes,
+                "msg_rate_1min": round(window_msg / 60.0, 2),
+                "record_rate_1min": round(window_rec / 60.0, 2),
+                "bytes_rate_1min": round(window_bytes / 60.0, 2),
                 "history_minutes": len(slots),
             }
         return result

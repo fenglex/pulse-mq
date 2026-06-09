@@ -11,7 +11,7 @@
 - **可选压缩** — `none`（默认）、`snappy`、`lz4`、`zstd`
 - **PLAIN 认证** — ZeroMQ PLAIN 协议 + ZAP handler，api_key 白名单机制
 - **实时监控** — 分钟粒度流量统计，内存 8 小时窗口 + SQLite 持久化
-- **可视化后台** — 内置深色 Web UI（HTTP + SSE 1 秒帧率），零依赖 stdlib 实现
+- **可视化后台** — 内置深色 Web UI（ECharts 折线图 + SSE 实时推送），支持 1H/6H 时间范围切换，60 秒滚动均值
 - **优雅关闭** — Producer 任务 drain、Admin 停止、PUB socket linger 后退出
 - **纳秒时间戳** — 帧级时间戳独立成帧，端到端延迟可精确测量
 
@@ -193,19 +193,24 @@ Publisher 启动后，Admin 后台默认监听 `0.0.0.0:9090`，提供深色 Web
 
 ### Web UI
 
-浏览器打开 `http://localhost:9090/` 即可看到实时面板：所有 topic 的速率、记录数、缓存用量、版本与运行时长。
+浏览器打开 `http://localhost:9090/` 即可看到实时监控面板：
+
+- **顶部指标卡片**：Topics 数量、Messages/s（60 秒滚动均值）、Data/s（60 秒滚动均值）、Uptime
+- **ECharts 流量折线图**：点击 topic 卡片叠加折线（最多 5 个，LRU 淘汰），支持 **1H / 6H** 时间范围切换，30 秒自动刷新历史数据
+- **Topic 列表**：实时显示每个 topic 的速率和缓存用量
 
 ### REST API
 
 ```bash
-# 实时指标快照
+# 实时指标快照（含 60 秒滚动均值）
 curl http://localhost:9090/api/v1/stats/realtime
 
 # 所有 topic 列表
 curl http://localhost:9090/api/v1/topics
 
-# 单个 topic 最近 60 分钟历史
+# 单个 topic 分钟级历史（支持 minutes 参数）
 curl http://localhost:9090/api/v1/topics/sh_market/history?minutes=60
+curl http://localhost:9090/api/v1/topics/sh_market/history?minutes=360
 
 # 系统状态
 curl http://localhost:9090/api/v1/system/status
@@ -239,13 +244,63 @@ curl -N http://localhost:9090/api/v1/stats/stream
 
 ## 性能基准
 
-`scripts/bench_burst.py` 提供 burst 极限性能测试场景：100,000 条记录，1,000 条/批，64 字节/记录，2 个 subscriber 并发订阅。
+### Burst 极限测试
 
-运行方式：
+`scripts/bench_burst.py` 提供单场景 burst 极限性能测试：
 
 ```bash
 python scripts/bench_burst.py
 ```
+
+### 全矩阵 Benchmark
+
+`scripts/bench_pubsub_matrix.py` 对所有合法的 (序列化 × 压缩 × 数据形态) 组合做全面测试：
+
+```bash
+python scripts/bench_pubsub_matrix.py
+```
+
+覆盖 48 个合法组合，同时测试：
+- 纯编解码性能（序列化 + 压缩，不经过网络）
+- 端到端 pub→sub 性能（吞吐量、延迟 p50/p90/p99、压缩率）
+- 正确性验证（pub 端发送数据在 sub 端完整还原）
+
+### v2.1.0 典型测试结果
+
+**纯编解码性能**（200 次迭代平均）：
+
+| 组合 | 编码 ops/s | 解码 ops/s | 编码 μs | 压缩率 |
+|------|-----------|-----------|---------|--------|
+| bytes+none | 14.6M | 29.9M | 0.07 | 1.00x |
+| msgpack+none | 5.6M | 9.3M | 0.18 | 1.00x |
+| msgpack+lz4+list_dict | 172K | 96K | 5.8 | 0.12x |
+| msgpack+zstd+large_dict | 27K | 209K | 37.6 | 0.00x |
+
+**端到端 pub→sub**（经过 ZMQ 网络，单 subscriber，50 条消息/组合）：
+
+| 组合 | 记录吞吐/s | 延迟 p50 | 延迟 p99 |
+|------|-----------|---------|---------|
+| json+none+list_dict | 880,514 | 2.68ms | 3.51ms |
+| msgpack+none+list_dict | 825,900 | 2.74ms | 3.05ms |
+| msgpack+none+dataframe | 135,096 | 17.8ms | 34.2ms |
+| pyarrow+none+dataframe | 86,663 | 27.6ms | 53.7ms |
+
+> 测试环境：Windows 11，Python 3.13，单机 localhost
+
+## 更新日志
+
+### v2.1.0
+
+- **监控 UI 全面升级**：深色渐变主题，ECharts 折线图支持 1H/6H 时间范围切换
+- **60 秒滚动均值**：Messages/s 和 Data/s 改为近 60 秒的加权均值，不再每分钟重置
+- **折线图交互优化**：首次进入自动选中第一个 topic，30 秒自动刷新历史，hover tooltip 不再闪烁
+- **后端去重**：history API 合并内存 + SQLite 数据，按 timestamp 去重
+- **全矩阵 Benchmark**：新增 `scripts/bench_pubsub_matrix.py`，覆盖 48 种组合的性能与正确性测试
+
+### v2.0.2
+
+- 协议帧 record_count 从 uint16 扩展到 uint32，单帧上限 1,000,000 条
+- 重写 README 对齐 v2 架构
 
 ## 许可证
 
