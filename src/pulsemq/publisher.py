@@ -35,6 +35,9 @@ from pulsemq.transport.zmq_pub import ZmqPubTransport
 
 logger = logging.getLogger(__name__)
 
+# 包版本：与 pyproject.toml 同步
+__version__ = "2.0.2"
+
 
 class PulsePublisher:
     """PulseMQ v2 Publisher 入口类。"""
@@ -140,10 +143,12 @@ class PulsePublisher:
 
     def start(self) -> None:
         """阻塞启动 publisher。"""
+        print(format_startup_table(self._config, self._explicit_api_keys), file=__import__("sys").stderr)
         asyncio.run(self._run())
 
     async def start_async(self) -> None:
         """异步启动 publisher（方便嵌入其他 asyncio 程序）。"""
+        print(format_startup_table(self._config, self._explicit_api_keys), file=__import__("sys").stderr)
         await self._run()
 
     async def _run(self) -> None:
@@ -314,6 +319,40 @@ def main() -> None:
         stream=sys.stderr,
     )
     pub = PulsePublisher()
-    print("PulseMQ Publisher v2 — 零配置模式启动", file=sys.stderr)
+    print(format_startup_table(pub._config, pub._explicit_api_keys), file=sys.stderr)
     print("用法: 参考 PulsePublisher 文档注册 producer", file=sys.stderr)
     pub.start()
+
+
+def format_startup_table(
+    cfg: PublisherConfig,
+    api_keys: dict[str, str] | None = None,
+    version: str = __version__,
+) -> str:
+    """生成启动配置表格字符串（不打印，便于测试）。
+
+    字段: bind、admin_bind、auth 状态（用户列表脱敏，最多展示 10 个）。
+    """
+    keys = api_keys or cfg.api_keys
+    if keys:
+        names = sorted(keys)
+        if len(names) > 10:
+            shown = ", ".join(names[:5])
+            user_str = f"{len(names)} users: {shown}, ... +{len(names) - 5} more"
+        else:
+            user_str = f"enabled ({len(names)} users: {', '.join(names)})"
+    else:
+        user_str = "disabled"
+
+    bar = "=" * 43
+    return "\n".join(
+        [
+            bar,
+            f"  PulseMQ Publisher v{version}",
+            bar,
+            f"  bind              {cfg.bind}",
+            f"  admin             {cfg.admin_bind}",
+            f"  auth              {user_str}",
+            bar,
+        ]
+    )

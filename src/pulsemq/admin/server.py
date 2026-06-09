@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import time
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -21,12 +23,16 @@ logger = logging.getLogger(__name__)
 
 SERVER_VERSION: str = "2.0.0"
 
+# 静态资源根目录（与本文件同级的 static/）
+STATIC_ROOT: Path = Path(__file__).resolve().parent / "static"
+
 
 class AdminServer:
     """后台管理 HTTP 服务: REST + SSE + Web UI。
 
     端点:
       GET  /                              深色 Web UI 首页
+      GET  /static/{path}                 静态资源（ECharts 等）
       GET  /api/v1/stats/realtime         实时指标 JSON
       GET  /api/v1/stats/stream           SSE 实时推送（1s 一帧）
       GET  /api/v1/topics                 所有 topic 列表 + 当前指标
@@ -184,6 +190,10 @@ class AdminServer:
             await self._respond_json(writer, 200, {"status": "ok"})
             return
 
+        if method == "GET" and path.startswith("/static/"):
+            await self._route_static(writer, path)
+            return
+
         await self._respond_json(writer, 404, {"error": "not found"})
 
     # ---- 数据方法 ----
@@ -330,6 +340,37 @@ class AdminServer:
         ).encode("utf-8") + body
         try:
             writer.write(response)
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
+    async def _route_static(self, writer: asyncio.StreamWriter, path: str) -> None:
+        """GET /static/{path} — 静态资源（JS/CSS 等）。
+
+        安全: 拒绝包含 .. 或绝对路径的资源。
+        """
+        rel = path[len("/static/"):]
+        if ".." in rel.split("/") or rel.startswith("/") or "\\" in rel:
+            await self._respond_json(writer, 400, {"error": "bad path"})
+            return
+
+        full = STATIC_ROOT / rel
+        if not full.is_file() or not full.resolve().is_relative_to(STATIC_ROOT):
+            await self._respond_json(writer, 404, {"error": "not found"})
+            return
+
+        body = full.read_bytes()
+        ctype, _ = mimetypes.guess_type(rel)
+        ctype = ctype or "application/octet-stream"
+        header = (
+            f"HTTP/1.1 200 OK\r\n"
+            f"Content-Type: {ctype}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Cache-Control: public, max-age=3600\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        try:
+            writer.write(header + body)
             await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             pass

@@ -1,10 +1,14 @@
 """PulseMQ v2 深色卡片式 Web UI。
 
-单文件 HTML，内嵌 CSS + JS + SVG 绘图。
+单文件 HTML，内嵌 CSS + JS。
 - 顶部：4 个指标卡片
-- 中部：选中 topic 的流量折线图（SVG，最近 60 分钟）
-- 底部：topic 列表，点击切换图表
-- 数据源：EventSource('/api/v1/stats/stream') 实时刷新
+- 中部：ECharts 多 topic 流量曲线（最近 60 分钟，msg/s）
+  - 高度 400px
+  - tooltip、dataZoom、时间轴
+  - 最多叠加 5 个 topic，LRU 淘汰
+- 底部：topic 列表，点击切换图表叠加
+- 数据源：EventSource('/api/v1/stats/stream') 实时刷新 + 选中时拉 history
+- 静态资源：<script src="/static/echarts.min.js">
 """
 
 from __future__ import annotations
@@ -33,12 +37,16 @@ main{padding:24px;max-width:1400px;margin:0 auto}
 .card .value.amber{color:#fbbf24}
 .card .value.purple{color:#c084fc}
 .chart-section{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:24px}
-.chart-title{font-size:14px;color:#94a3b8;margin-bottom:12px}
+.chart-title{font-size:14px;color:#94a3b8;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.chart-title .hint{font-size:11px;color:#64748b}
+#chart{width:100%;height:400px}
 .topic-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
-.topic-card{background:#16213e;border:1px solid #334155;border-radius:8px;padding:14px;cursor:pointer;transition:border-color .2s}
-.topic-card:hover,.topic-card.active{border-color:#38bdf8}
+.topic-card{background:#16213e;border:1px solid #334155;border-radius:8px;padding:14px;cursor:pointer;transition:border-color .2s;position:relative}
+.topic-card:hover{border-color:#94a3b8}
+.topic-card.selected{border-color:#38bdf8;background:#1e3a5f}
 .topic-card .name{color:#38bdf8;font-weight:600;font-size:14px;margin-bottom:4px}
 .topic-card .info{color:#94a3b8;font-size:12px}
+.topic-card .dot{position:absolute;top:14px;right:14px;width:10px;height:10px;border-radius:50%}
 .empty{text-align:center;padding:40px;color:#64748b}
 </style>
 </head>
@@ -55,24 +63,29 @@ main{padding:24px;max-width:1400px;margin:0 auto}
     <div class="card"><div class="label">Uptime</div><div class="value purple" id="v-uptime">0s</div></div>
   </div>
 
-  <div class="chart-section" id="chart-section" style="display:none">
-    <div class="chart-title" id="chart-title">选择一个 topic 查看流量曲线</div>
-    <svg id="chart" viewBox="0 0 600 120" style="width:100%;height:120px"></svg>
-    <div style="display:flex;gap:16px;font-size:11px;color:#94a3b8;margin-top:8px">
-      <span><span style="color:#38bdf8">━</span> msg/s</span>
-      <span><span style="color:#fbbf24">╌</span> bytes/s (KB)</span>
+  <div class="chart-section">
+    <div class="chart-title">
+      <span>流量曲线 (msg/s) — 点击 topic 卡片叠加（最多 5 个，LRU 淘汰）</span>
+      <span class="hint" id="chart-hint">未选中任何 topic</span>
     </div>
+    <div id="chart"></div>
   </div>
 
   <div class="chart-section">
-    <div class="chart-title">Topic 列表</div>
+    <div class="chart-title"><span>Topic 列表</span></div>
     <div class="topic-list" id="topic-list"></div>
   </div>
 </main>
 
+<script src="/static/echarts.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
-let state = { topics: {}, cache_sizes: {}, history_cache: {}, selected_topic: null, uptime: 0 };
+const COLORS = ['#38bdf8','#fbbf24','#6ee7b7','#c084fc','#f87171'];
+const MAX_SELECTED = 5;
+let state = { topics: {}, cache_sizes: {}, history_cache: {}, selected: [], uptime: 0 };
+let chart = null;
+
+// ECharts dark 主题内置；不依赖外部主题文件
 
 // SSE 连接
 function connectSSE() {
@@ -103,54 +116,92 @@ function render() {
   // Topic 列表
   const list = $('topic-list');
   if (topics.length === 0) { list.innerHTML = '<div class="empty">暂无 topic</div>'; return; }
-  list.innerHTML = topics.map(([name, t]) =>
-    `<div class="topic-card ${state.selected_topic===name?'active':''}" onclick="selectTopic('${esc(name)}')">
+  list.innerHTML = topics.map(([name, t]) => {
+    const selIdx = state.selected.indexOf(name);
+    const isSel = selIdx >= 0;
+    const dotColor = isSel ? COLORS[selIdx % COLORS.length] : 'transparent';
+    return `<div class="topic-card ${isSel?'selected':''}" onclick="toggleTopic('${esc(name)}')">
+      <div class="dot" style="background:${dotColor}"></div>
       <div class="name">${esc(name)}</div>
       <div class="info">${(t.msg_rate_1min||0).toFixed(1)} msg/s · cache ${state.cache_sizes[name]||0}</div>
-    </div>`
-  ).join('');
+    </div>`;
+  }).join('');
 
-  // 如果选中了 topic，刷新图表
-  if (state.selected_topic) renderChart(state.selected_topic);
+  // 刷新图表
+  renderChart();
 }
 
-async function selectTopic(name) {
-  state.selected_topic = name;
-  $('chart-section').style.display = 'block';
-  $('chart-title').textContent = name + ' — 最近 60 分钟流量';
+async function toggleTopic(name) {
+  const idx = state.selected.indexOf(name);
+  if (idx >= 0) {
+    state.selected.splice(idx, 1);
+  } else {
+    if (state.selected.length >= MAX_SELECTED) state.selected.shift();  // LRU 淘汰
+    state.selected.push(name);
+    // 拉历史
+    if (!state.history_cache[name]) {
+      try {
+        const r = await fetch('/api/v1/topics/' + encodeURIComponent(name) + '/history?minutes=60');
+        const d = await r.json();
+        state.history_cache[name] = d.history || [];
+      } catch(e) { state.history_cache[name] = []; }
+    }
+  }
   render();
-  // 拉历史数据
-  try {
-    const r = await fetch('/api/v1/topics/' + encodeURIComponent(name) + '/history?minutes=60');
-    const d = await r.json();
-    state.history_cache[name] = d.history || [];
-    renderChart(name);
-  } catch(e) {}
 }
 
-function renderChart(name) {
-  const history = state.history_cache[name] || [];
-  if (history.length < 2) { $('chart').innerHTML = '<text x="300" y="60" text-anchor="middle" fill="#64748b" font-size="13">数据不足 (需运行 ≥ 1 分钟)</text>'; return; }
+function renderChart() {
+  if (state.selected.length === 0) {
+    $('chart-hint').textContent = '未选中任何 topic';
+    if (chart) { chart.clear(); }
+    return;
+  }
+  $('chart-hint').textContent = `已选 ${state.selected.length}/${MAX_SELECTED}: ${state.selected.join(', ')}`;
 
-  const W = 600, H = 120, PAD = 10;
-  const maxMsg = Math.max(...history.map(h => h.msg_count), 1);
-  const maxBytes = Math.max(...history.map(h => h.bytes_total), 1);
+  if (!chart) {
+    chart = echarts.init($('chart'), 'dark', { renderer: 'canvas' });
+    window.addEventListener('resize', () => chart && chart.resize());
+  }
 
-  const xStep = (W - 2 * PAD) / Math.max(history.length - 1, 1);
-
-  let msgPts = '', bytePts = '';
-  history.forEach((h, i) => {
-    const x = PAD + i * xStep;
-    const yMsg = H - PAD - ((h.msg_count / maxMsg) * (H - 2 * PAD));
-    const yByte = H - PAD - ((h.bytes_total / maxBytes) * (H - 2 * PAD));
-    msgPts += `${x},${yMsg} `;
-    bytePts += `${x},${yByte} `;
+  const series = state.selected.map((name, i) => {
+    const hist = state.history_cache[name] || [];
+    // msg_count → msg_rate（条/秒 = msg_count / 60）
+    const data = hist
+      .filter(h => h.timestamp != null)
+      .map(h => [h.timestamp * 1000, +(h.msg_count / 60).toFixed(2)]);
+    // 用当前 traffic 实时值覆盖最后一点
+    const liveRate = state.topics[name] ? (state.topics[name].msg_rate_1min || 0) : 0;
+    if (data.length > 0) data[data.length - 1] = [Date.now(), +liveRate.toFixed(2)];
+    else if (liveRate > 0) data.push([Date.now(), +liveRate.toFixed(2)]);
+    return {
+      name, type: 'line', data, smooth: true, showSymbol: false,
+      lineStyle: { width: 2, color: COLORS[i % COLORS.length] },
+      itemStyle: { color: COLORS[i % COLORS.length] },
+    };
   });
 
-  $('chart').innerHTML =
-    `<line x1="${PAD}" y1="${H/2}" x2="${W-PAD}" y2="${H/2}" stroke="#334155" stroke-width="0.5"/>` +
-    `<polyline fill="none" stroke="#38bdf8" stroke-width="2" points="${msgPts}"/>` +
-    `<polyline fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4,2" points="${bytePts}"/>`;
+  chart.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis', valueFormatter: v => v.toFixed(2) },
+    legend: { type: 'scroll', top: 0, textStyle: { color: '#94a3b8' } },
+    grid: { left: 60, right: 30, top: 40, bottom: 60 },
+    xAxis: {
+      type: 'time',
+      axisLine: { lineStyle: { color: '#334155' } },
+      axisLabel: { color: '#94a3b8' },
+    },
+    yAxis: {
+      type: 'value', name: 'msg/s', nameTextStyle: { color: '#94a3b8' },
+      axisLine: { lineStyle: { color: '#334155' } },
+      axisLabel: { color: '#94a3b8' },
+      splitLine: { lineStyle: { color: '#1e293b' } },
+    },
+    dataZoom: [
+      { type: 'inside' },
+      { type: 'slider', height: 20, bottom: 10, backgroundColor: '#0f172a', borderColor: '#334155' },
+    ],
+    series,
+  }, true);
 }
 
 function formatUptime(s) {
