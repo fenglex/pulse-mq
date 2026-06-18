@@ -6,6 +6,8 @@ dist/
 .pytest_cache/
 *.db
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 htmlcov/
 .coverage
 *.db-shm

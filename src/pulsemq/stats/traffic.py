@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -96,9 +95,12 @@ class TrafficStats:
         ]
 
     def snapshot(self) -> dict[str, dict]:
-        """所有 topic 实时快照（给 Admin 卡片指标用）。"""
+        """所有 topic 实时快照（给 Admin 卡片指标用）。
+
+        对 items() 做快照，避免迭代中 roll_minute 的 clear() 触发 RuntimeError。
+        """
         result: dict[str, dict] = {}
-        for topic, cur in self._current.items():
+        for topic, cur in list(self._current.items()):
             result[topic] = {
                 "msg_count": cur.msg_count,
                 "record_count": cur.record_count,
@@ -107,15 +109,20 @@ class TrafficStats:
         return result
 
     def all_topics_snapshot(self) -> dict[str, dict]:
-        """所有 topic 完整快照（含历史信息）。"""
+        """所有 topic 完整快照（含历史信息）。
+
+        读路径可能被 admin 线程并发调用，而 roll_minute() 会 clear() 字典。
+        这里对 key 集合做快照，避免迭代中 dict 变更触发 RuntimeError。
+        """
         result: dict[str, dict] = {}
         all_topics = set(self._current.keys()) | set(self._slots.keys())
         now_ts = time.time()
         elapsed = max(now_ts - self._current_minute, 1.0)
 
         for topic in all_topics:
+            # 每次单独 .get()，避免持有 dict view 跨 yield/迭代
             cur = self._current.get(topic)
-            slots = self._slots.get(topic, deque())
+            slots = self._slots.get(topic)
             cur_msg = cur.msg_count if cur else 0
             cur_rec = cur.record_count if cur else 0
             cur_bytes = cur.bytes_total if cur else 0
@@ -139,12 +146,19 @@ class TrafficStats:
                 "msg_rate_1min": round(window_msg / 60.0, 2),
                 "record_rate_1min": round(window_rec / 60.0, 2),
                 "bytes_rate_1min": round(window_bytes / 60.0, 2),
-                "history_minutes": len(slots),
+                "history_minutes": len(slots) if slots else 0,
             }
         return result
 
     def _ensure_current(self, topic: str) -> None:
-        """确保当前分钟累积器存在。"""
+        """确保当前分钟累积器存在。
+
+        若检测到分钟切换（_current_minute 落后），先 roll_minute() 归档上一分钟
+        再建立新分钟的 slot。注意：roll_minute 内部会 clear() self._current，
+        但本方法随后立即 self._current[topic] = MinuteSlot(...) 重建，
+        而 record() 在调用本方法后会重新 self._current[topic] 取值，
+        因此 clear 与重建之间不存在外部持有的悬空引用，统计不会丢失。
+        """
         now_minute = self._minute_now()
         if now_minute != self._current_minute:
             # 分钟切换时自动归档（兜底，正常由 roll_minute 触发）

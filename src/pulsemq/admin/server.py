@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from pulsemq._version import __version__ as _PKG_VERSION
 from pulsemq.admin.web_ui import INDEX_HTML
 from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.stats.storage import StatsStorage
@@ -21,7 +22,16 @@ from pulsemq.stats.traffic import TrafficStats
 
 logger = logging.getLogger(__name__)
 
-SERVER_VERSION: str = "2.0.0"
+# 版本号：从 pulsemq._version 统一读取，避免与包版本脱节
+SERVER_VERSION: str = _PKG_VERSION
+
+# HTTP 状态码 → 状态文本
+_STATUS_TEXT: dict[int, str] = {
+    200: "OK",
+    400: "Bad Request",
+    404: "Not Found",
+    500: "Internal Server Error",
+}
 
 # 静态资源根目录（与本文件同级的 static/）
 STATIC_ROOT: Path = Path(__file__).resolve().parent / "static"
@@ -132,7 +142,7 @@ class AdminServer:
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception:
-            pass
+            logger.debug("请求处理异常 path=%s", locals().get("path", "?"), exc_info=True)
         finally:
             if not getattr(writer, "_sse_takeover", False):
                 try:
@@ -235,8 +245,9 @@ class AdminServer:
         if self._traffic is not None:
             mem_history = self._traffic.get_history(topic, minutes)
 
-        if mem_history and len(mem_history) >= minutes:
-            # 内存数据已覆盖请求范围，直接返回
+        if mem_history and len(mem_history) >= minutes - 1:
+            # 内存数据已覆盖请求范围（当前正在累积的分钟尚未归档进 slots，
+            # 故 slots 内最多 minutes-1 条），直接返回
             return {"topic": topic, "minutes": minutes, "history": mem_history}
 
         # SQLite 补充更早的数据
@@ -327,11 +338,15 @@ class AdminServer:
             try:
                 data = self._realtime_snapshot()
                 frame = f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
-                for _cid, (q, _task) in list(self._sse_clients.items()):
+                for cid, (q, task) in list(self._sse_clients.items()):
                     try:
                         q.put_nowait(frame)
                     except asyncio.QueueFull:
-                        pass
+                        # 队列堆积（客户端断开或消费过慢）：主动取消该连接，
+                        # 避免死客户端在字典中残留造成内存泄漏。
+                        task.cancel()
+                        self._sse_clients.pop(cid, None)
+                        logger.debug("SSE 客户端 %d 队列满，已断开", cid)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -342,9 +357,7 @@ class AdminServer:
 
     async def _respond_json(self, writer: asyncio.StreamWriter, status: int, data: dict) -> None:
         body = json.dumps(data, ensure_ascii=False, indent=2)
-        status_text = {
-            200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error",
-        }.get(status, "OK")
+        status_text = _STATUS_TEXT.get(status, "OK")
         response = (
             f"HTTP/1.1 {status} {status_text}\r\n"
             f"Content-Type: application/json; charset=utf-8\r\n"
@@ -359,8 +372,9 @@ class AdminServer:
 
     async def _respond_html(self, writer: asyncio.StreamWriter, status: int, html: str) -> None:
         body = html.encode("utf-8")
+        status_text = _STATUS_TEXT.get(status, "OK")
         response = (
-            f"HTTP/1.1 {status} OK\r\n"
+            f"HTTP/1.1 {status} {status_text}\r\n"
             f"Content-Type: text/html; charset=utf-8\r\n"
             f"Content-Length: {len(body)}\r\n"
             f"Connection: close\r\n\r\n"

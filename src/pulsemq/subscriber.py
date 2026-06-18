@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import AsyncIterator
 
@@ -64,7 +65,14 @@ class PulseSubscriber:
                 if len(frames) == 4:
                     yield decode(frames)
             except zmq.ZMQError:
+                # socket 关闭 / 断连：正常结束迭代
                 break
+            except asyncio.CancelledError:
+                # 调用方取消迭代：清理 socket 后重新抛出，遵守 asyncio 取消协议
+                if self._sub is not None:
+                    self._sub.close(linger=0)
+                    self._sub = None
+                raise
 
     async def close(self) -> None:
         """关闭连接。"""

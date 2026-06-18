@@ -24,6 +24,7 @@ import time
 from functools import wraps
 from typing import Any, Callable, Awaitable
 
+from pulsemq._version import __version__
 from pulsemq.admin.server import AdminServer
 from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.config import PublisherConfig, load_config
@@ -35,8 +36,8 @@ from pulsemq.transport.zmq_pub import ZmqPubTransport
 
 logger = logging.getLogger(__name__)
 
-# 包版本：与 pyproject.toml 同步
-__version__ = "2.2.0"
+# 包版本：从 pulsemq._version 统一读取，保持向后兼容的导入路径
+__all__ = ["__version__"]
 
 
 class PulsePublisher:
@@ -356,3 +357,7 @@ def format_startup_table(
             bar,
         ]
     )
+
+
+if __name__ == "__main__":
+    main()
