@@ -20,7 +20,7 @@
 > 要求 Python >= 3.13
 
 ```bash
-pip install pulsemq
+pip install pulse-mq
 ```
 
 依赖项：ZeroMQ、msgspec、python-snappy、lz4、zstandard、pyarrow、pandas 全部开箱即用。
@@ -195,9 +195,9 @@ Publisher 启动后，Admin 后台默认监听 `0.0.0.0:9090`，提供深色 Web
 
 浏览器打开 `http://localhost:9090/` 即可看到实时监控面板：
 
-- **顶部指标卡片**：Topics 数量、Messages/s（60 秒滚动均值）、Data/s（60 秒滚动均值）、Uptime
-- **ECharts 流量折线图**：点击 topic 卡片叠加折线（最多 5 个，LRU 淘汰），支持 **1H / 6H** 时间范围切换，30 秒自动刷新历史数据
-- **Topic 列表**：实时显示每个 topic 的速率和缓存用量
+- **顶部指标卡片**：活跃主题数、消息量/秒（记录数口径，60 秒滚动均值）、流量/秒（压缩后字节，60 秒滚动均值）、运行时间
+- **ECharts 流量折线图**：点击 topic 卡片叠加折线（最多 5 个，LRU 淘汰），支持 **1H / 6H** 时间范围切换，30 秒自动刷新历史数据，玻璃态美化 + 渐变填充
+- **Topic 列表**：实时显示每个 topic 的记录速率、当前分钟记录数和缓存用量
 
 ### REST API
 
@@ -289,10 +289,32 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v2.2.2
+
+- **文档修正**：README 安装命令包名 `pulsemq` → `pulse-mq`（PyPI 实际包名）
+- **文档同步**：监控卡片描述对齐 v2.2.0 的记录数口径与玻璃态 UI；补全 v2.2.0/v2.2.1 更新日志
+
+### v2.2.1
+
+- **启动修复**：`publisher.py` 补 `if __name__ == "__main__"` 守卫，修复 `python -m pulsemq.publisher` 无法启动的问题
+- **版本号统一**：新增 `pulsemq/_version.py` 作为版本号单一来源，`publisher.__version__` 与 `/api/v1/system/status` 的 `SERVER_VERSION` 动态读取一致（修复后者写死 2.0.0）
+- **健壮性增强**：
+  - `subscriber` 遵守 asyncio 取消协议，`CancelledError` 时清理 socket 后重新抛出
+  - admin 路由异常补 `logger.debug` 日志（不再静默吞掉）
+  - `_respond_html` / `_respond_json` 复用 `_STATUS_TEXT` 状态文本映射
+  - `TrafficStats` 读路径快照迭代，规避并发 `clear()` 的 `RuntimeError`
+  - SSE 队列满时主动断开死客户端，避免内存泄漏
+  - `_topic_history` off-by-one 修正（`>= minutes` → `>= minutes - 1`）
+
+### v2.2.0
+
+- **消息量口径变更**：监控指标从"帧数"（发送次数）切换为"记录数"（record_count）。卡片速率、折线图、topic 列表全部改用 `record_rate_1min`，一条带 N 条记录的批量消息现在如实显示为 N 条/秒
+- **监控 UI 美化与中文化**：玻璃态卡片 + 渐变发光 + ECharts 渐变填充 + 全面中文文案 + emoji 图标
+
 ### v2.1.0
 
 - **监控 UI 全面升级**：深色渐变主题，ECharts 折线图支持 1H/6H 时间范围切换
-- **60 秒滚动均值**：Messages/s 和 Data/s 改为近 60 秒的加权均值，不再每分钟重置
+- **60 秒滚动均值**：Messages/s 和 Data/s 改为近 60 秒的加权均值，不再每分钟重置（注：v2.2.0 起 Messages/s 改用记录数口径）
 - **折线图交互优化**：首次进入自动选中第一个 topic，30 秒自动刷新历史，hover tooltip 不再闪烁
 - **后端去重**：history API 合并内存 + SQLite 数据，按 timestamp 去重
 - **全矩阵 Benchmark**：新增 `scripts/bench_pubsub_matrix.py`，覆盖 48 种组合的性能与正确性测试
