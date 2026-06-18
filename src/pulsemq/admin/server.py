@@ -234,7 +234,7 @@ class AdminServer:
                 "msg_count_current": data["msg_count_current"],
                 "record_count_current": data["record_count_current"],
                 "bytes_total_current": data["bytes_total_current"],
-                "cache_size": cache_sizes.get(topic, 0),
+                "cache": cache_sizes.get(topic, {"current": 0, "max": 0}),
             })
         return {"topic_count": len(topics), "topics": topics}
 

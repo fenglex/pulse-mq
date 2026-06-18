@@ -64,6 +64,13 @@ class JsonSerializer(Serializer):
     def serialize(self, obj: Any) -> bytes:
         import msgspec
 
+        if isinstance(obj, (bytes, bytearray)):
+            # msgspec.json 会把 bytes 编码为 base64 字符串，但解码后变成 str，
+            # 类型不一致。明确拒绝，提示改用 bytes 序列化器或 msgpack。
+            raise TypeError(
+                "json 序列化不支持 bytes（解码后类型会变形为 str）。"
+                "请改用 serializer='bytes'（二进制透传）或 'msgpack'（通用）。"
+            )
         return msgspec.json.encode(obj)
 
     def deserialize(self, data: bytes) -> Any:
@@ -81,6 +88,7 @@ class PyArrowSerializer(Serializer):
     def serialize(self, obj: Any) -> bytes:
         import pyarrow as pa
 
+        table = None
         if isinstance(obj, pa.Table):
             table = obj
         else:
@@ -94,10 +102,16 @@ class PyArrowSerializer(Serializer):
             elif isinstance(obj, dict):
                 df = pd.DataFrame([obj])
                 table = pa.Table.from_pandas(df, preserve_index=False)
-            else:
-                import msgspec
 
-                return msgspec.msgpack.encode(obj)
+        if table is None:
+            # 不支持的类型：避免静默退回 msgpack 导致 flags 标记与实际编码不一致
+            # （订阅端按 pyarrow 解码会失败）。明确报错，提示用户换序列化器。
+            raise TypeError(
+                f"pyarrow 序列化只支持 pa.Table / pd.DataFrame / dict / list[dict]，"
+                f"收到 {type(obj).__name__}。"
+                f"对于 list[基础类型] 或标量，请改用 serializer='msgpack'（通用）/"
+                f"'json'（可读）/'str'（纯文本）/'bytes'（二进制透传）。"
+            )
 
         sink = BytesIO()
         writer = pa.ipc.new_stream(sink, table.schema)

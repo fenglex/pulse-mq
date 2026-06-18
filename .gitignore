@@ -8,6 +8,7 @@ dist/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+nul
 htmlcov/
 .coverage
 *.db-shm

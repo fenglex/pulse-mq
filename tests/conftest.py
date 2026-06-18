@@ -37,14 +37,15 @@ from pulsemq.subscriber import PulseSubscriber
 SERIALIZERS: list[str] = ["msgpack", "json", "str", "bytes", "pyarrow"]
 COMPRESSIONS: list[str] = ["none", "snappy", "lz4", "zstd"]
 
-# 数据形态: (name, generator, kind)
-#   kind 用于判断与序列化是否兼容
+# 数据形态: 覆盖 7 种白名单类型
 DATA_SHAPES: list[tuple[str, str]] = [
-    "scalar_str",     # str
-    "scalar_bytes",   # bytes
-    "list_dict",      # list[dict]
-    "dataframe",      # pd.DataFrame
-    "large_dict",     # dict 1.1MB
+    "scalar_str",      # str
+    "scalar_bytes",    # bytes
+    "list_dict",       # list[dict]
+    "list_str",        # list[str]
+    "dataframe",       # pd.DataFrame
+    "list_dataframe",  # list[pd.DataFrame]
+    "large_dict",      # dict 1.1MB
 ]
 
 
@@ -141,6 +142,8 @@ def make_value(shape: str, seq: int = 0) -> Any:
         return seq.to_bytes(4, "big") + b"\x00\x01\x02\x03"
     if shape == "list_dict":
         return [{"seq": seq * 10 + i, "v": float(i)} for i in range(3)]
+    if shape == "list_str":
+        return [f"msg-{seq}-{i}" for i in range(3)]
     if shape == "dataframe":
         return pd.DataFrame(
             {
@@ -149,6 +152,12 @@ def make_value(shape: str, seq: int = 0) -> Any:
                 "volume": [100 + i for i in range(3)],
             }
         )
+    if shape == "list_dataframe":
+        # 两个 DataFrame：2 行 + 3 行 = 行数和 5
+        return [
+            pd.DataFrame({"seq": [seq * 10, seq * 10 + 1], "v": [1.0, 2.0]}),
+            pd.DataFrame({"seq": [seq * 10 + 2, seq * 10 + 3, seq * 10 + 4], "v": [3.0, 4.0, 5.0]}),
+        ]
     if shape == "large_dict":
         return {"seq": seq, "payload": "x" * 1_100_000}
     raise ValueError(f"未知 data shape: {shape}")
@@ -171,24 +180,26 @@ def expected_record_count(value: Any) -> int:
 
 
 def is_compatible(ser: str, shape: str) -> bool:
-    """判断 (serializer, shape) 是否为合法组合。
+    """判断 (serializer, shape) 是否为合法组合（方案 A：强类型绑定）。
 
-    兼容性基于实际协议层的语义:
-    - str: 只接受 UTF-8 字符串
-    - bytes: 只接受原始字节
-    - json: msgspec.json 不支持 bytes（会抛 TypeError）
-    - msgpack: 接受几乎所有可序列化结构
-    - pyarrow: 订阅端按 pa.Table 反序列化，仅 DataFrame 兼容
+    收紧后的规则：
+    - str 数据（scalar_str）只允许 'str' 序列化器
+    - bytes 数据（scalar_bytes）只允许 'bytes' 序列化器
+    - 结构化数据（dataframe/list_dict/large_dict）允许 msgpack/json/pyarrow
+    - list[str] 允许 msgpack/json（pyarrow 不支持）
     """
-    if ser == "str" and shape != "scalar_str":
-        return False
-    if ser == "bytes" and shape != "scalar_bytes":
-        return False
-    if ser == "json" and shape == "scalar_bytes":
-        return False
-    if ser == "pyarrow" and shape != "dataframe":
-        return False
-    return True
+    if shape == "scalar_str":
+        # str 数据强制用 str 序列化器
+        return ser == "str"
+    if shape == "scalar_bytes":
+        # bytes 数据强制用 bytes 序列化器
+        return ser == "bytes"
+    # 结构化数据（dataframe / list_dict / large_dict / list_str）
+    if shape in ("dataframe", "list_dict", "large_dict", "list_dataframe"):
+        return ser in ("msgpack", "json", "pyarrow")
+    if shape == "list_str":
+        return ser in ("msgpack", "json")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -211,22 +222,38 @@ def assert_message_roundtrip(
         f"record_count: got {msg.record_count}, want {record_count}"
     )
     assert msg.timestamp_ns > 0, "timestamp_ns 应为正"
-    # payload 等值比较
+
+    # 把 expected 统一规整为"可比形态"：
+    # - DataFrame → list[dict]
+    # - list[DataFrame] → 展平为 list[dict]（与 publisher._prepare_payload 一致）
+    expected_normalized: Any = expected
     if isinstance(expected, pd.DataFrame):
-        # publisher 会把 DataFrame 转为 list[dict]（msgpack/json/pyarrow 都做）
-        # pyarrow 路径下 deserialize 返回 pa.Table，这里统一以 dict 列表比较
-        got = msg.payload
-        if hasattr(got, "to_pylist"):
-            got = got.to_pylist()
-        elif hasattr(got, "to_dict"):
-            got = got.to_dict(orient="records")
-        assert got == expected.to_dict(orient="records"), (
-            f"DataFrame payload 不一致: got {got[:2]}..., want {expected.to_dict(orient='records')[:2]}..."
-        )
-    else:
-        assert msg.payload == expected, (
-            f"payload 不一致: got {msg.payload!r}, want {expected!r}"
-        )
+        expected_normalized = expected.to_dict(orient="records")
+    elif isinstance(expected, list) and expected and isinstance(expected[0], pd.DataFrame):
+        expected_normalized = []
+        for df in expected:
+            expected_normalized.extend(df.to_dict(orient="records"))
+
+    # payload 等值比较
+    got = msg.payload
+    # pyarrow 反序列化返回 pa.Table，转成 list[dict] 比较
+    if hasattr(got, "to_pylist") and not isinstance(got, list):
+        got = got.to_pylist()
+    elif hasattr(got, "to_dict") and not isinstance(got, (list, dict)):
+        got = got.to_dict(orient="records")
+
+    # 形态对齐：pyarrow 对单个 dict 会返回 1 行 Table → list[dict]，
+    # 而原 expected 是 dict。两侧统一：单元素 list[dict] ↔ dict 互转。
+    if isinstance(got, list) and len(got) == 1 and isinstance(got[0], dict) \
+            and isinstance(expected_normalized, dict):
+        got = got[0]
+    elif isinstance(expected_normalized, list) and len(expected_normalized) == 1 \
+            and isinstance(expected_normalized[0], dict) and isinstance(got, dict):
+        expected_normalized = expected_normalized[0]
+
+    assert got == expected_normalized, (
+        f"payload 不一致: got {str(got)[:120]}, want {str(expected_normalized)[:120]}"
+    )
 
 
 # ---------------------------------------------------------------------------
