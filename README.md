@@ -97,51 +97,94 @@ asyncio.run(main())
 
 ## 数据类型与序列化
 
-### Producer 回调返回值
+### 支持的返回类型（白名单）
+
+Producer 回调**只接受以下 7 种返回类型**，其余一律抛 `TypeError`：
+
+`pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `list[str]` / `dict` / `str` / `bytes`
+
+### 数据类型 × 序列化器 强绑定对照表
+
+PulseMQ 采用**强类型绑定**（方案 A）：数据类型与序列化器一一对应，不匹配会在发布时抛 `TypeError`。单元格 = record_count 值（合法）或 ❌（不匹配，报错）：
+
+| 返回类型 | `msgpack` | `json` | `pyarrow` | `str` | `bytes` | record_count |
+|----------|:---------:|:------:|:---------:|:-----:|:-------:|:------------:|
+| `pd.DataFrame`（N 行） | ✅ | ✅ | ✅ | ❌ | ❌ | N（行数）|
+| `list[pd.DataFrame]` | ✅ | ✅ | ✅ | ❌ | ❌ | **行数和** |
+| `list[dict]`（N 个） | ✅ | ✅ | ✅ | ❌ | ❌ | N |
+| `list[str]`（N 个） | ✅ | ✅ | ❌ | ❌ | ❌ | N |
+| `dict` | ✅ | ✅ | ✅ | ❌ | ❌ | 1 |
+| `str` | ❌ | ❌ | ❌ | **✅** | ❌ | 1 |
+| `bytes` | ❌ | ❌ | ❌ | ❌ | **✅** | 1 |
+
+**绑定规则**：
+- `str` 数据 → **只能用 `str` 序列化器**（纯 UTF-8，最快）
+- `bytes` 数据 → **只能用 `bytes` 序列化器**（零拷贝透传，最快）
+- `pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `dict` → 可选 `msgpack` / `json` / `pyarrow`
+- `list[str]` → 可选 `msgpack` / `json`
 
 ```python
-# 单条数据
-return "hello"             # str → 1 record
-return b"\x00\x01\x02"     # bytes → 1 record
-return df                  # DataFrame → N records (行数)
-
-# 批量数据
-return ["a", "b", "c"]                # list[str] → N records
-return [b"\x01", b"\x02"]            # list[bytes] → N records
-return [df1, df2]                    # list[DataFrame] → sum(行数) records
-return [{"a": 1}, {"a": 2}]          # list[dict] → N records
+return "hello"                              # str            → 1 record,  用 str
+return b"\x00\x01"                          # bytes          → 1 record,  用 bytes
+return {"a": 1}                             # dict           → 1 record,  用 msgpack/json/pyarrow
+return [{"a": 1}, {"a": 2}]                 # list[dict]     → 2 records, 用 msgpack/json/pyarrow
+return ["a", "b", "c"]                      # list[str]      → 3 records, 用 msgpack/json
+return pd.DataFrame({"a": [1, 2]})          # DataFrame      → 2 records, 用 msgpack/json/pyarrow
+return [df1, df2]                           # list[DataFrame]→ 行数和,    用 msgpack/json/pyarrow
 ```
 
-`record_count` 由发布端自动推断并写入帧头，单帧上限 **1,000,000** 条。
+> **record_count 推断**：DataFrame/Table 按行数；`list[dict]`/`list[str]` 按 list 长度；`list[DataFrame]` 按**各 DataFrame 行数之和**；`dict`/`str`/`bytes` 按 1。单帧上限 **1,000,000** 条。
+>
+> **list 元素必须类型一致**：`list[dict]` 要求所有元素都是 dict，`list[str]` 要求都是 str。混合类型（如 `[{"a":1}, "hello"]`）会抛 `TypeError`。
+>
+> **白名单外类型全部报错**：标量（int/float/bool）、`pa.Table`、`list[bytes]`、`list[int]`、`set`、`tuple` 等均不支持。
 
-### 序列化与压缩
+### 序列化格式（5 种）
 
-通过 producer 装饰器参数声明：
+通过 producer 装饰器的 `serializer` 参数声明。**序列化器会根据数据类型自动校验**，无需手动匹配（配错会报错提示）：
 
 ```python
 @pub.producer(name="market", serializer="msgpack", compression="none")
 async def market():
-    return {...}
+    return {"symbol": "600000", "price": 10.5}
 
 @pub.producer(name="ticks", serializer="pyarrow", compression="zstd")
 async def ticks():
     return pd.DataFrame(...)
+
+@pub.producer(name="log", serializer="str")       # str 数据必须用 str
+async def log():
+    return "some log line"
+
+@pub.producer(name="raw", serializer="bytes")     # bytes 数据必须用 bytes
+async def raw():
+    return b"\x01\x02\x03"
 ```
 
-| 序列化 | 适用场景 |
-|--------|----------|
-| `msgpack`（默认） | 通用结构化数据 |
-| `json` | 人类可读、跨语言 |
-| `pyarrow` | DataFrame、列存 |
-| `str` | 纯文本 / UTF-8 字符串 |
-| `bytes` | 二进制透传 |
+| 格式 | 后端 | 适用数据类型 | 特点 |
+|------|------|--------------|------|
+| `msgpack` | `msgspec.msgpack` | dict / list[dict] / list[str] / DataFrame / list[DataFrame] | 通用结构化，二进制紧凑 |
+| `json` | `msgspec.json` | 同 msgpack（不含 bytes） | 人类可读、跨语言 |
+| `pyarrow` | `pyarrow` IPC | dict / list[dict] / DataFrame / list[DataFrame] | 列存 IPC，分析场景（可选依赖）|
+| `str` | UTF-8 | **仅 str** | 纯文本透传，最快 |
+| `bytes` | 透传 | **仅 bytes** | 二进制透传，最快 |
 
-| 压缩 | 适用场景 |
-|------|----------|
-| `none`（默认） | 调试 / 极小数据 |
-| `snappy` | 速度优先 |
-| `lz4` | 速度优先，压缩比略高 |
-| `zstd` | 压缩比优先 |
+> **`pyarrow` 为可选依赖**：未安装时该格式不注册，使用会抛 `KeyError`。其余 4 种为硬依赖，始终可用。
+>
+> **`pyarrow` 类型严格**：返回 `list[str]` 或标量时会抛 `TypeError`，提示改用 `msgpack`/`json`。
+
+### 压缩算法（4 种）
+
+通过 `compression` 参数声明，默认 `none`：
+
+| 算法 | 后端 | 压缩比 | 速度 | 适用场景 |
+|------|------|--------|------|----------|
+| `none`（默认） | — | 1.00x | 最快 | 调试 / 极小数据 |
+| `snappy` | `python-snappy` | 低 | 极快 | 速度优先 |
+| `lz4` | `lz4.frame` | 中 | 极快 | 速度与压缩比平衡，金融行情常用 |
+| `zstd` | `zstandard` | 高 | 中 | 压缩比优先，带宽受限场景 |
+
+4 种压缩算法可与任意序列化格式自由组合（5×4 = 20 种合法组合）。
 
 ### Burst 模式
 
@@ -288,6 +331,20 @@ python scripts/bench_pubsub_matrix.py
 > 测试环境：Windows 11，Python 3.13，单机 localhost
 
 ## 更新日志
+
+### v2.3.0
+
+⚠️ **Breaking Change**：数据类型收紧为白名单，序列化器改为强类型绑定。
+
+- **数据类型白名单**：producer 回调只接受 7 种类型——`pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `list[str]` / `dict` / `str` / `bytes`。其余（标量、`pa.Table`、`list[bytes]`/`list[int]`、混合 list、set/tuple 等）一律抛 `TypeError`
+- **序列化器强绑定**（方案 A）：`str` 数据只能用 `str` 序列化器，`bytes` 数据只能用 `bytes` 序列化器，结构化数据（DataFrame/dict/list）用 msgpack/json/pyarrow。配错会在发布时报错
+- **修复 `list[pd.DataFrame]` 的 record_count bug**：原按 list 长度（DataFrame 个数）计，现按各 DataFrame 行数之和（与 payload 展平后的实际记录数一致）
+- **`bytes × json` 报错**：json 序列化器明确拒绝 bytes（避免 base64 编码后解码类型变形为 str 的语义不一致）
+- **缓存按记录数淘汰**：`TopicBuffer` 从"按帧数（deque maxlen）"改为"按累计记录数"淘汰，DataFrame 一批 N 条占 N 配额。监控显示 `N / 上限（满）` 格式
+- **pyarrow 序列化器严格化**：遇到不支持的类型（list[str]、标量等）抛 `TypeError`，而非静默退回 msgpack 导致编解码不一致
+- **监控 UI 文案精确化**：消息量/流量卡片副标题标注"近60秒估算"，tooltip 说明算法口径；主题卡片去掉 record_count_current，缓存显示 `N/M(满)`
+- **文档**：新增「数据类型 × 序列化器 强绑定对照表」；更新序列化器/压缩算法表格
+- **测试**：新增 `tests/test_data_types.py`（59 个专项用例）；e2e 矩阵扩展至 7 种数据形态；修复 burst 测试跨分钟 flaky
 
 ### v2.2.2
 

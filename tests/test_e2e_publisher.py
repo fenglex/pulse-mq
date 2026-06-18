@@ -117,7 +117,8 @@ class TestPublisherMatrix:
             live = data["msg_count_current"] + data.get("msg_rate_1min", 0)
             assert live > 0, f"未检测到推送: {data}"
             # 缓存确有写入（不受分钟切换影响）
-            assert pub._buffers.snapshot().get(topic, 0) >= 1
+            cache_snap = pub._buffers.snapshot().get(topic, {"current": 0})
+            assert cache_snap["current"] >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -159,11 +160,21 @@ class TestPublisherBurst:
                 await asyncio.sleep(0.1)
             await asyncio.sleep(0.5)  # 让最后一批落库
 
-        # 至少 total_batches 条消息
+        # 至少 total_batches 条消息（当前分钟 + 已归档历史，避免跨分钟清零导致 flaky）
         snap = pub._traffic.all_topics_snapshot()
         assert topic in snap, f"burst topic 未出现: {list(snap)}"
-        assert snap[topic]["msg_count_current"] >= total_batches
-        assert snap[topic]["record_count_current"] >= total_batches * 10
+        # 累计 msg_count = 当前分钟 + 所有历史归档分钟
+        history_slots = pub._traffic._slots.get(topic)
+        history_msg = sum(s.msg_count for s in history_slots) if history_slots else 0
+        total_msg = snap[topic]["msg_count_current"] + history_msg
+        assert total_msg >= total_batches, (
+            f"burst 消息数不足: current={snap[topic]['msg_count_current']}, history={history_msg}"
+        )
+        history_rec = sum(s.record_count for s in history_slots) if history_slots else 0
+        total_rec = snap[topic]["record_count_current"] + history_rec
+        assert total_rec >= total_batches * 10, (
+            f"burst 记录数不足: current={snap[topic]['record_count_current']}, history={history_rec}"
+        )
 
 
 # ---------------------------------------------------------------------------

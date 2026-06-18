@@ -229,11 +229,13 @@ class PulsePublisher:
     async def _on_produce(self, spec: Any, data: Any) -> None:
         """Producer 回调返回数据后的处理流程。"""
         try:
-            # 1. 推断类型 + record_count
+            # 1. 类型白名单校验 + record_count 推断
             record_count = self._infer_record_count(data)
+            # 2. 数据类型 ↔ 序列化器强绑定校验（str→str, bytes→bytes 等）
+            self._validate_serializer(data, spec.serializer)
             payload_obj = self._prepare_payload(data)
 
-            # 2. 序列化 + 压缩 + 编码帧
+            # 3. 序列化 + 压缩 + 编码帧
             encoded_frames = frame_codec.encode(
                 topic=spec.name,
                 data=payload_obj,
@@ -247,7 +249,9 @@ class PulsePublisher:
 
             # 4. 同步操作：缓存 + 统计
             ts_ns = frame_codec._TS_STRUCT.unpack(encoded_frames[2])[0]
-            self._buffers.get_or_create(spec.name, spec.cache_size).append(ts_ns, encoded_frames)
+            self._buffers.get_or_create(spec.name, spec.cache_size).append(
+                ts_ns, encoded_frames, record_count
+            )
             self._traffic.record(spec.name, record_count, len(encoded_frames[3]))
 
         except Exception:
@@ -255,13 +259,116 @@ class PulsePublisher:
 
     @staticmethod
     def _infer_record_count(data: Any) -> int:
-        """推断记录数。"""
+        """推断记录数。
+
+        仅支持 7 种白名单类型，其余抛 TypeError：
+        - pd.DataFrame → 行数 len(df)
+        - list[pd.DataFrame] → 行数和 sum(len(df))
+        - list[dict] / list[str] → list 长度（要求元素类型一致）
+        - dict / str / bytes → 1
+
+        list 元素必须类型一致（全 dict / 全 str / 全 DataFrame），
+        混合类型或非白名单元素（int/bytes/标量等）抛 TypeError。
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            pd = None  # type: ignore[assignment]
+
+        # 单个 DataFrame
+        if pd is not None and isinstance(data, pd.DataFrame):
+            return len(data)
+
+        # list：按元素类型分发
         if isinstance(data, list):
-            return len(data)
-        if hasattr(data, "__len__") and hasattr(data, "columns"):
-            # DataFrame
-            return len(data)
-        return 1
+            if len(data) == 0:
+                raise TypeError("空 list 不被支持，请返回非空 list[dict]/list[str]/list[pd.DataFrame]")
+            # 判断元素类型一致性
+            elem_types = {type(item) for item in data}
+            first = data[0]
+            # list[dict]
+            if isinstance(first, dict) and all(isinstance(x, dict) for x in data):
+                return len(data)
+            # list[str]
+            if isinstance(first, str) and all(isinstance(x, str) for x in data):
+                return len(data)
+            # list[pd.DataFrame]：行数和
+            if pd is not None and isinstance(first, pd.DataFrame) and all(
+                isinstance(x, pd.DataFrame) for x in data
+            ):
+                return sum(len(x) for x in data)
+            # 非白名单 list（list[bytes]/list[int]/list[混合]/list[标量] 等）
+            types_desc = ", ".join(sorted(t.__name__ for t in elem_types))
+            raise TypeError(
+                f"不支持的 list 元素类型: list[{types_desc}]。"
+                f"仅支持 list[dict] / list[str] / list[pd.DataFrame]（元素类型须一致）。"
+            )
+
+        # dict / str / bytes → 1
+        if isinstance(data, (dict, str, bytes)):
+            return 1
+
+        # 白名单外（标量 int/float/bool、pa.Table、set、tuple 等）
+        raise TypeError(
+            f"不支持的返回类型: {type(data).__name__}。"
+            f"仅支持 pd.DataFrame / list[pd.DataFrame] / list[dict] / list[str] / dict / str / bytes。"
+        )
+
+    @staticmethod
+    def _validate_serializer(data: Any, serializer: str) -> None:
+        """校验数据类型与序列化器的匹配（方案 A：强类型绑定）。
+
+        规则（收紧后）：
+        - str 数据 → 只允许 'str' 序列化器
+        - bytes 数据 → 只允许 'bytes' 序列化器
+        - pd.DataFrame / list[pd.DataFrame] / list[dict] / dict → 允许 msgpack/json/pyarrow
+        - list[str] → 允许 msgpack/json（pyarrow 不支持 list[str]）
+
+        不匹配抛 TypeError，提示正确的序列化器。
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            pd = None  # type: ignore[assignment]
+
+        # str / bytes：各自唯一序列化器
+        if isinstance(data, str) and serializer != "str":
+            raise TypeError(
+                f"str 数据必须用 serializer='str'，当前为 '{serializer}'。"
+            )
+        if isinstance(data, bytes) and serializer != "bytes":
+            raise TypeError(
+                f"bytes 数据必须用 serializer='bytes'，当前为 '{serializer}'。"
+            )
+        if isinstance(data, str) or isinstance(data, bytes):
+            return  # str/bytes 已匹配，通过
+
+        # 结构化数据：判断数据族系
+        is_dataframe_family = (
+            (pd is not None and isinstance(data, pd.DataFrame))
+            or (isinstance(data, list) and len(data) > 0
+                and pd is not None and isinstance(data[0], pd.DataFrame))
+            or isinstance(data, dict)
+            or (isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict))
+        )
+        is_list_str = (
+            isinstance(data, list) and len(data) > 0
+            and isinstance(data[0], str) and all(isinstance(x, str) for x in data)
+        )
+
+        if is_dataframe_family:
+            allowed = {"msgpack", "json", "pyarrow"}
+            if serializer not in allowed:
+                raise TypeError(
+                    f"结构化数据（DataFrame/dict/list[dict]）应使用 msgpack/json/pyarrow，"
+                    f"当前为 '{serializer}'。"
+                )
+        elif is_list_str:
+            allowed = {"msgpack", "json"}
+            if serializer not in allowed:
+                raise TypeError(
+                    f"list[str] 数据应使用 msgpack/json，当前为 '{serializer}'。"
+                )
 
     @staticmethod
     def _prepare_payload(data: Any) -> Any:

@@ -232,21 +232,21 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
       <div class="value" id="v-topics">0</div>
       <div class="sub">近 8 小时内有流量</div>
     </div>
-    <div class="card amber">
+    <div class="card amber" title="近 60 秒平均值（估算）：当前分钟实测 + 上一分钟按比例外推。流量稳定时接近真实滑动窗口；突变时分钟开始处会有偏差。">
       <div class="head">
         <div class="label">消息量 / 秒</div>
         <div class="icon">⚡</div>
       </div>
       <div class="value" id="v-msgs">0.0</div>
-      <div class="sub" id="v-msgs-sub">本分钟记录数</div>
+      <div class="sub" id="v-msgs-sub">近60秒估算 · 本分钟实测 0 条</div>
     </div>
-    <div class="card green">
+    <div class="card green" title="近 60 秒平均值（估算）：当前分钟实测 + 上一分钟按比例外推。统计的是压缩后的实际传输字节数（不含帧头开销）。">
       <div class="head">
         <div class="label">流量 / 秒</div>
         <div class="icon">🌐</div>
       </div>
       <div class="value" id="v-bytes">0 B/s</div>
-      <div class="sub">60 秒均值（压缩后）</div>
+      <div class="sub">近60秒估算（压缩后）</div>
     </div>
     <div class="card purple">
       <div class="head">
@@ -262,7 +262,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
     <div class="chart-header">
       <div class="chart-title">
         <div class="dot-indicator"></div>
-        <span>流量趋势（记录数 / 秒）</span>
+        <span>流量趋势（记录数 / 秒）<span class="chart-hint" style="margin-left:6px">分钟级精确值</span></span>
       </div>
       <div class="chart-controls">
         <button class="time-btn active" onclick="setTimeRange(60, this)">1 小时</button>
@@ -384,7 +384,7 @@ function render() {
     totalRecordsCurrent += t.record_count_current || 0;
   }
   $('v-msgs').textContent = totalRate.toFixed(1);
-  $('v-msgs-sub').textContent = '本分钟 ' + totalRecordsCurrent.toLocaleString() + ' 条记录';
+  $('v-msgs-sub').textContent = '近60秒估算 · 本分钟实测 ' + totalRecordsCurrent.toLocaleString() + ' 条';
   $('v-bytes').textContent = formatBytesRate(totalBytesRate);
   $('v-uptime').textContent = formatUptime(state.uptime);
 
@@ -405,8 +405,7 @@ function render() {
       <div class="name"><span class="dot" style="background:${color};color:${color}"></span>${esc(name)}</div>
       <div class="info">
         <span class="rate">⚡ ${(t.record_rate_1min||0).toFixed(1)} 条/秒</span>
-        <span class="rec">📤 ${(t.record_count_current||0).toLocaleString()} 条</span>
-        <span class="cache">💾 缓存 ${state.cache_sizes[name]||0}</span>
+        <span class="cache">💾 缓存 ${formatCache(state.cache_sizes[name])}</span>
       </div>
     </div>`;
   }).join('');
@@ -528,6 +527,17 @@ function formatBytesRate(bps) {
   if (bps < 1048576) return (bps/1024).toFixed(1) + ' KB/s';
   if (bps < 1073741824) return (bps/1048576).toFixed(1) + ' MB/s';
   return (bps/1073741824).toFixed(2) + ' GB/s';
+}
+
+function formatCache(c) {
+  // c: {current, max} 或旧版数字
+  if (c == null) return '0';
+  if (typeof c === 'number') return c.toLocaleString();
+  const cur = c.current || 0, max = c.max || 0;
+  if (max <= 0) return cur.toLocaleString();
+  const pct = cur / max;
+  const suffix = pct >= 0.99 ? '（满）' : (pct >= 0.9 ? '（接近满）' : '');
+  return cur.toLocaleString() + ' / ' + max.toLocaleString() + suffix;
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }

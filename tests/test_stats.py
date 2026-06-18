@@ -138,4 +138,29 @@ class TestTopicBufferRegistry:
         reg.get_or_create("a", 10).append(1, [b"f"])
         reg.get_or_create("b", 10).append(1, [b"f"])
         snap = reg.snapshot()
-        assert snap == {"a": 1, "b": 1}
+        # snapshot 现在返回 {topic: {current, max}}
+        assert snap == {
+            "a": {"current": 1, "max": 10},
+            "b": {"current": 1, "max": 10},
+        }
+
+    def test_evict_by_record_count(self) -> None:
+        """缓存按累计记录数淘汰，而非帧数。
+
+        DataFrame 一批 N 条占 N 的配额：append 两帧（各 60 条记录），
+        上限 100，则第一帧被淘汰，只留第二帧。
+        """
+        buf = TopicBuffer("t", max_size=100)
+        buf.append(1, [b"f1"], record_count=60)
+        buf.append(2, [b"f2"], record_count=60)
+        # 60+60=120 > 100，淘汰第一帧（60 条），剩第二帧（60 条）
+        assert buf.size == 1                      # 只剩 1 帧
+        assert buf.total_records == 60            # 累计 60 条记录
+        assert buf.max_records == 100
+
+    def test_single_frame_exceeds_limit_kept(self) -> None:
+        """单帧就超限时仍保留该帧（避免缓存为空）。"""
+        buf = TopicBuffer("t", max_size=10)
+        buf.append(1, [b"big"], record_count=1000)
+        assert buf.size == 1
+        assert buf.total_records == 1000
