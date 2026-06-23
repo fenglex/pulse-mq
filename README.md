@@ -344,6 +344,26 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v2.4.1
+
+🔧 **bugfix**：修复 SUB 端 PLAIN 认证失败时卡死不退出的问题。
+
+- **🔴 修复 SUB 认证失败卡死（致命）**：pyzmq 的 SUB socket 在 PLAIN 认证被服务端 ZAP 拒绝时，`recv()` 不会抛错，而是在后台无限重连，导致用户的 `await sub.recv_multipart()` **永久阻塞**，程序卡死无任何提示。现在 `PulseSubscriber` 通过 ZMQ monitor 检测 `EVENT_HANDSHAKE_FAILED_AUTH` 事件，一旦发生就**自行打 error 日志并静默结束迭代**，`async for` 自然退出，**用户无需 try/except**：
+
+  ```python
+  async with PulseSubscriber(addr, username="alice", password="wrong") as sub:
+      async for msg in sub.subscribe("topic"):
+          print(msg.payload)
+      # 认证失败时：async for 自动结束，无需异常处理
+  # 日志会显示：[SUB 认证失败] PLAIN 握手被服务端拒绝，已停止订阅 (user='alice', ...)。
+  ```
+
+- **零 API 负担**：库自行处理认证失败，不抛异常、不需要用户捕获，看日志即可定位是凭证问题
+- **仅认证场景启用**：无认证（`username=""`）时完全不启用 monitor，零开销零误报
+- **测试强化**：认证失败测试从弱断言（"2秒内无消息"）改为强断言（收到 0 条 + 有 error 日志），加 timeout 防回归
+
+> **升级建议**：所有开启 PLAIN 认证的用户强烈建议立即升级（避免错误凭证导致程序卡死）。
+
 ### v2.4.0
 
 🔧 **关键 bugfix + 可观测性增强**：修复 Windows 平台 SUB 端收不到消息的致命问题，并新增 SUB 连接日志。

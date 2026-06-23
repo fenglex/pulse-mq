@@ -5,11 +5,20 @@
     async with sub:
         async for msg in sub.subscribe("sh_market_data"):
             print(msg.topic, msg.payload, msg.timestamp_ns)
+
+认证失败（凭证错误）时，subscribe() 会打 error 日志并自动结束迭代，
+``async for`` 自然退出，**无需用户 try/except**：
+
+    async with sub:
+        async for msg in sub.subscribe(...):   # 认证失败时这里会自动结束
+            ...
+    # 看到 [SUB 认证失败] 日志即知道是凭证问题
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import AsyncIterator
 
@@ -36,6 +45,10 @@ class PulseSubscriber:
         self._password = password
         self._ctx: zmq.asyncio.Context | None = None
         self._sub: zmq.asyncio.Socket | None = None
+        # 认证监控 socket：仅开启 PLAIN 认证时启用，监听握手失败事件
+        self._mon: zmq.asyncio.Socket | None = None
+        # 认证失败通知事件：后台 monitor task 置位，主循环 recv 时竞争检测
+        self._auth_failed_evt: asyncio.Event | None = None
 
     async def connect(self) -> None:
         """连接 PUB socket，PLAIN 认证。"""
@@ -49,6 +62,9 @@ class PulseSubscriber:
 
         self._sub.connect(self._address)
         if self._username:
+            # 仅开启认证时启用 monitor：监听 PLAIN 握手失败事件。
+            # pyzmq 在 ZAP 拒绝时 recv 不抛错，只能靠 monitor 检测，否则会卡死。
+            self._mon = self._sub.get_monitor_socket(zmq.EVENT_HANDSHAKE_FAILED_AUTH)
             logger.info(
                 "Subscriber 连接到 %s (auth=on, user=%s)", self._address, self._username
             )
@@ -56,7 +72,11 @@ class PulseSubscriber:
             logger.info("Subscriber 连接到 %s (auth=off)", self._address)
 
     async def subscribe(self, *topics: str) -> AsyncIterator[PulseMessage]:
-        """订阅 topic，返回异步迭代器。"""
+        """订阅 topic，返回异步迭代器。
+
+        认证失败（凭证错误）时：打 error 日志后自动结束迭代，
+        ``async for`` 自然退出，**无需用户 try/except**。
+        """
         if self._sub is None:
             raise RuntimeError("Subscriber 未连接")
 
@@ -64,23 +84,87 @@ class PulseSubscriber:
             self._sub.setsockopt(zmq.SUBSCRIBE, t.encode("utf-8"))
             logger.info("订阅 topic: %s", t)
 
-        while True:
-            try:
-                frames = await self._sub.recv_multipart()
+        # 认证场景：启动后台 monitor 监听，检测到握手失败就 set 事件
+        mon_task: asyncio.Task | None = None
+        if self._mon is not None:
+            self._auth_failed_evt = asyncio.Event()
+            mon_task = asyncio.create_task(self._watch_auth_failure())
+
+        try:
+            while True:
+                if self._auth_failed_evt is not None:
+                    # 认证场景：recv 和"认证失败"事件竞争，谁先就绪处理谁。
+                    # 否则 recv 会无限阻塞，认证失败无法被检查到。
+                    recv_task = asyncio.ensure_future(self._sub.recv_multipart())
+                    evt_task = asyncio.ensure_future(self._auth_failed_evt.wait())
+                    try:
+                        await asyncio.wait(
+                            [recv_task, evt_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if self._auth_failed_evt.is_set():
+                            # 认证失败：打 error 日志后静默结束迭代。
+                            # 不抛异常，让用户的 ``async for`` 自然退出，
+                            # 看日志即可定位是认证问题，无需 try/except。
+                            logger.error(
+                                "[SUB 认证失败] PLAIN 握手被服务端拒绝，"
+                                "已停止订阅 (user=%r, addr=%r)。"
+                                "请检查 username/password 或联系 publisher 管理员。",
+                                self._username, self._address,
+                            )
+                            break
+                        frames = recv_task.result()
+                    finally:
+                        # 清理未完成的 task，避免 awaitable 泄漏
+                        for t in (recv_task, evt_task):
+                            if not t.done():
+                                t.cancel()
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
+                                    await t
+                else:
+                    # 无认证场景：直接 recv
+                    try:
+                        frames = await self._sub.recv_multipart()
+                    except zmq.ZMQError:
+                        break
+                    except asyncio.CancelledError:
+                        if self._sub is not None:
+                            self._sub.close(linger=0)
+                            self._sub = None
+                        raise
+
                 if len(frames) == 4:
                     yield decode(frames)
-            except zmq.ZMQError:
-                # socket 关闭 / 断连：正常结束迭代
-                break
-            except asyncio.CancelledError:
-                # 调用方取消迭代：清理 socket 后重新抛出，遵守 asyncio 取消协议
-                if self._sub is not None:
-                    self._sub.close(linger=0)
-                    self._sub = None
-                raise
+        finally:
+            if mon_task is not None:
+                mon_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await mon_task
+            self._auth_failed_evt = None
+
+    async def _watch_auth_failure(self) -> None:
+        """后台监听 monitor socket，收到认证失败事件就 set 通知事件。
+
+        仅负责检测与通知；error 日志与结束迭代的动作由 subscribe() 主循环
+        在收到事件后统一处理（避免重复打日志）。
+        """
+        assert self._mon is not None
+        assert self._auth_failed_evt is not None
+        try:
+            await self._mon.recv_multipart()  # 收到即 AUTH_FAILED（已过滤事件类型）
+            # 仅置位事件，error 日志由 subscribe() 主循环在 break 前统一打印
+            self._auth_failed_evt.set()
+        except (zmq.ZMQError, asyncio.CancelledError):
+            # socket 关闭或任务取消：正常退出
+            return
 
     async def close(self) -> None:
         """关闭连接。"""
+        # ⚠️ monitor socket 必须在它监控的 SUB socket 之前关闭，
+        # 否则 ctx.term() 会卡死（pyzmq 已知行为）
+        if self._mon is not None:
+            self._mon.close(linger=0)
+            self._mon = None
         if self._sub is not None:
             self._sub.close(linger=1000)
             self._sub = None

@@ -236,38 +236,47 @@ class TestSubscriberErrors:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
+        caplog,
     ) -> None:
-        """错误凭证应被 ZAP 拒绝。"""
+        """错误凭证：subscribe() 打 error 日志后静默结束迭代（不卡死、不抛异常）。
+
+        pyzmq 的 SUB 在 PLAIN 认证被拒绝时 recv 不抛错、无限重连，
+        会让用户代码卡死。PulseSubscriber 通过 monitor 检测到
+        EVENT_HANDSHAKE_FAILED_AUTH 后，自行打 error 日志并结束迭代，
+        ``async for`` 自然退出，用户无需 try/except。
+        """
         pub_port, admin_port = random_port_pair
         pub = make_publisher(
             pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
             api_keys={"alice": "right_pwd"},
         )
 
-        async with running_publisher(pub):
-            sub = PulseSubscriber(
-                f"tcp://127.0.0.1:{pub_port}",
-                username="alice", password="wrong_pwd",
-            )
-            await sub.connect()
-            try:
-                # 错误凭证下，订阅后尝试接收一段时间内不应能成功收到任何消息
-                # (ZAP 拒绝后 PUB 不会向该连接发送)
-                # 在 zmq 层面用 setsockopt(SUBSCRIBE) 不抛异常，但 recv 会因为断连而失败
-                # 这里做"足够短时间无消息收到"的弱断言
-                got: list = []
+        import logging
+        with caplog.at_level(logging.ERROR, logger="pulsemq.subscriber"):
+            async with running_publisher(pub):
+                sub = PulseSubscriber(
+                    f"tcp://127.0.0.1:{pub_port}",
+                    username="alice", password="wrong_pwd",
+                )
+                await sub.connect()
+                try:
+                    received: list = []
 
-                async def _consume_briefly() -> None:
-                    async for _msg in sub.subscribe(topic_for_auth()):
-                        got.append(_msg)
-                        if len(got) > 0:
-                            break
+                    async def _consume() -> None:
+                        async for _msg in sub.subscribe(topic_for_auth()):
+                            received.append(_msg)
 
-                with pytest.raises(Exception):
-                    # 2 秒内尝试收消息，错误凭证下 zmq 应断开
-                    await asyncio.wait_for(_consume_briefly(), timeout=2.0)
-            finally:
-                await sub.close()
+                    # 错误凭证下，subscribe() 应在握手完成后很快静默结束，
+                    # 而非无限阻塞。加 timeout 防止回归（卡死时测试会超时失败）。
+                    await asyncio.wait_for(_consume(), timeout=5.0)
+                finally:
+                    await sub.close()
+
+        # 不应收到任何消息
+        assert received == [], f"错误凭证不应收到消息，实际 {len(received)} 条"
+        # 应有认证失败的 error 日志
+        auth_logs = [r for r in caplog.records if "认证失败" in r.message]
+        assert len(auth_logs) >= 1, "应有 [SUB 认证失败] error 日志"
 
 
 def topic_for_auth() -> str:
