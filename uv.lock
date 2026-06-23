@@ -316,7 +316,7 @@ wheels = [
 
 [[package]]
 name = "pulse-mq"
-version = "0.6.0"
+version = "2.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "lz4" },

@@ -76,22 +76,34 @@ class AsyncZAPHandler:
             version = msg[0]
             request_id = msg[1]
             # domain = msg[2]
-            # address = msg[3]
+            # address = msg[3] —— 客户端 ip:port
             # identity = msg[4]
             mechanism = msg[5]
+            client_addr = msg[3].decode("utf-8", errors="replace") if len(msg) > 3 else "unknown"
             username = msg[6].decode("utf-8", errors="replace") if len(msg) > 6 else ""
             password = msg[7].decode("utf-8", errors="replace") if len(msg) > 7 else ""
 
             if mechanism != b"PLAIN":
+                logger.warning(
+                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=not-PLAIN mechanism=%s",
+                    username or "<empty>", client_addr, mechanism.decode("utf-8", "replace"),
+                )
                 self._zap.send_multipart([version, request_id, b"400", b"Not PLAIN", b"", b""])
                 continue
 
             # 白名单校验
             expected = self._api_keys.get(username)
             if expected is not None and expected == password:
+                logger.info(
+                    "[SUB 上线] user=%s addr=%s auth=OK",
+                    username, client_addr,
+                )
                 self._zap.send_multipart([version, request_id, b"200", b"OK", username.encode(), b""])
             else:
-                logger.warning("ZAP 拒绝: username=%s", username)
+                logger.warning(
+                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=invalid-credentials",
+                    username or "<empty>", client_addr,
+                )
                 self._zap.send_multipart([version, request_id, b"400", b"Invalid credentials", b"", b""])
 
 

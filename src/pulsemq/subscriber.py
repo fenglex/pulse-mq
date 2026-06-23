@@ -48,7 +48,12 @@ class PulseSubscriber:
             self._sub.setsockopt(zmq.PLAIN_PASSWORD, self._password.encode())
 
         self._sub.connect(self._address)
-        logger.info("Subscriber 连接到 %s (auth=%s)", self._address, "on" if self._username else "off")
+        if self._username:
+            logger.info(
+                "Subscriber 连接到 %s (auth=on, user=%s)", self._address, self._username
+            )
+        else:
+            logger.info("Subscriber 连接到 %s (auth=off)", self._address)
 
     async def subscribe(self, *topics: str) -> AsyncIterator[PulseMessage]:
         """订阅 topic，返回异步迭代器。"""

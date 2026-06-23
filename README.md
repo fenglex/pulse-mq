@@ -14,6 +14,8 @@
 - **可视化后台** — 内置深色 Web UI（ECharts 折线图 + SSE 实时推送），支持 1H/6H 时间范围切换，60 秒滚动均值
 - **优雅关闭** — Producer 任务 drain、Admin 停止、PUB socket linger 后退出
 - **纳秒时间戳** — 帧级时间戳独立成帧，端到端延迟可精确测量
+- **跨平台** — Windows / macOS / Linux 开箱即用；`import pulsemq` 自动修正 Windows 事件循环策略，SUB 端无需任何额外配置即可正常收消息
+- **连接可观测** — SUB 连接时 publisher 端打印 `[SUB 上线] user=xxx addr=1.2.3.4 auth=OK`，认证失败打印 `[SUB 认证失败] ... reason=...`，便于排查谁连进来、为什么连不上
 
 ## 安装
 
@@ -331,6 +333,22 @@ python scripts/bench_pubsub_matrix.py
 > 测试环境：Windows 11，Python 3.13，单机 localhost
 
 ## 更新日志
+
+### v2.4.0
+
+🔧 **关键 bugfix + 可观测性增强**：修复 Windows 平台 SUB 端收不到消息的致命问题，并新增 SUB 连接日志。
+
+- **🔴 修复 Windows SUB 收不到消息（致命）**：Windows 上 Python 默认使用 `ProactorEventLoop`，但 pyzmq 的 asyncio 集成只支持 `SelectorEventLoop`，导致 SUB 端 `recv` 永远不返回（或抛 `RuntimeError: Proactor event loop does not implement add_reader family`）。现在 `import pulsemq` 时会在 win32 上自动 `set_event_loop_policy(WindowsSelectorEventLoopPolicy)`，用户**零配置**即可正常收消息（与 pyzmq / aiohttp / tornado 等库的通用做法一致）
+- **SUB 连接可观测性增强**：ZAP handler 此前只在认证失败时打 `warning`，认证成功完全静默。现在三种情况都打印结构化日志：
+  - 认证成功：`[SUB 上线] user=alice addr=192.168.1.5 auth=OK`
+  - 凭证错误：`[SUB 认证失败] user=alice addr=192.168.1.5 auth=FAIL reason=invalid-credentials`
+  - 非 PLAIN 机制：`[SUB 认证失败] user=... addr=... auth=FAIL reason=not-PLAIN mechanism=...`
+  - 含 **用户名 + 客户端 IP + 认证结果 + 失败原因**，便于排查谁连进来、为什么连不上
+- **SUB 端连接日志完善**：`PulseSubscriber.connect()` 现在打印自身用户名，开启认证时为 `Subscriber 连接到 xxx (auth=on, user=alice)`，便于 sub 端自己确认连上的是谁
+- **回归测试**：新增 `test_event_loop_policy_on_windows`，防止 Windows 事件循环策略回归
+- **诊断脚本**：新增 `scripts/_diag_sub_problem.py`（启动真实 pub 服务 + sub 收消息端到端验证）和 `scripts/_diag_auth_fail.py`（认证失败场景验证）
+
+> **升级建议**：Windows 用户强烈建议立即升级；Linux/macOS 用户无影响但可享受新增的连接日志。
 
 ### v2.3.0
 
