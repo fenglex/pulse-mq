@@ -124,3 +124,19 @@ def decode_payload(data: bytes, serializer: str = "msgpack", compression: str = 
     compressor = comp_mod.get(compression)
     serializer_obj = ser_mod.get(serializer)
     return serializer_obj.deserialize(compressor.decompress(data))
+
+
+def encode_heartbeat() -> list[bytes]:
+    """编码心跳帧（PING 类型，空载荷）。
+
+    4 帧格式：
+      Frame 1: topic = b"__pulse_hb__"
+      Frame 2: meta (6B) = [PING, flags(msgpack|none), record_count=0]
+      Frame 3: timestamp (8B) = 当前纳秒
+      Frame 4: payload = b""（空）
+    """
+    flags_byte = encode_flags("msgpack", "none")
+    rc_bytes = _RC_STRUCT.pack(0)
+    meta = bytes([MsgType.PING, flags_byte]) + rc_bytes
+    ts_bytes = _TS_STRUCT.pack(time.time_ns())
+    return [b"__pulse_hb__", meta, ts_bytes, b""]

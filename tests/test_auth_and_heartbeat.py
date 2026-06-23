@@ -334,3 +334,41 @@ class TestAuthCallback:
                 assert msg.payload == {"x": 1}
                 break
             await sub.close()
+
+
+class TestHeartbeatEncoding:
+    """模块 4a：心跳帧编码。"""
+
+    def test_encode_heartbeat_format(self) -> None:
+        """心跳帧格式正确。"""
+        from pulsemq.protocol.frames import encode_heartbeat
+        from pulsemq.protocol.msg_type import MsgType
+        import struct
+
+        frames = encode_heartbeat()
+        assert len(frames) == 4, f"应为 4 帧，实际 {len(frames)}"
+        # Frame 1: topic
+        assert frames[0] == b"__pulse_hb__"
+        # Frame 2: meta (6 bytes)
+        assert len(frames[1]) == 6
+        assert frames[1][0] == MsgType.PING
+        # record_count = 0 (bytes 2-5, big-endian uint32)
+        rc = struct.unpack(">I", frames[1][2:6])[0]
+        assert rc == 0
+        # Frame 3: timestamp (8 bytes)
+        assert len(frames[2]) == 8
+        ts = struct.unpack(">q", frames[2])[0]
+        assert ts > 0
+        # Frame 4: empty payload
+        assert frames[3] == b""
+
+    def test_encode_heartbeat_idempotent(self) -> None:
+        """连续两次调用生成的时间戳递增。"""
+        from pulsemq.protocol.frames import encode_heartbeat
+        import struct
+
+        f1 = encode_heartbeat()
+        f2 = encode_heartbeat()
+        ts1 = struct.unpack(">q", f1[2])[0]
+        ts2 = struct.unpack(">q", f2[2])[0]
+        assert ts2 >= ts1
