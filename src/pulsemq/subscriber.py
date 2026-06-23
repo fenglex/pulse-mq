@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import AsyncIterator
 
 import zmq
@@ -19,6 +20,28 @@ import zmq.asyncio
 from pulsemq.protocol.frames import PulseMessage, decode
 
 logger = logging.getLogger(__name__)
+
+
+class PulseSubscriberError(Exception):
+    """订阅端异常基类。"""
+
+
+class AuthenticationError(PulseSubscriberError):
+    """PLAIN 认证被拒绝（ZAP 返回 400）。
+
+    Attributes:
+        username: 尝试认证的用户名。
+        address: 发布端地址（tcp://host:port）。
+    """
+
+    def __init__(self, message: str, username: str = "", address: str = "") -> None:
+        super().__init__(message)
+        self.username = username
+        self.address = address
+
+
+class ConnectionLostError(PulseSubscriberError):
+    """连接意外断开（心跳超时或 TCP 断开）。"""
 
 
 class PulseSubscriber:
@@ -30,18 +53,23 @@ class PulseSubscriber:
         *,
         username: str = "",
         password: str = "",
+        receive_timeout: int | None = None,
     ) -> None:
         self._address = address
         self._username = username
         self._password = password
+        self._receive_timeout = receive_timeout
         self._ctx: zmq.asyncio.Context | None = None
         self._sub: zmq.asyncio.Socket | None = None
+        self._closed_by_user = False
 
     async def connect(self) -> None:
         """连接 PUB socket，PLAIN 认证。"""
         self._ctx = zmq.asyncio.Context()
         self._sub = self._ctx.socket(zmq.SUB)
         self._sub.setsockopt(zmq.RCVHWM, 0)  # 0=无上限
+        if self._receive_timeout is not None:
+            self._sub.setsockopt(zmq.RCVTIMEO, self._receive_timeout)
 
         if self._username:
             self._sub.setsockopt(zmq.PLAIN_USERNAME, self._username.encode())
@@ -65,11 +93,13 @@ class PulseSubscriber:
                 if len(frames) == 4:
                     yield decode(frames)
             except zmq.ZMQError:
-                # socket 关闭 / 断连：正常结束迭代
-                break
+                if self._closed_by_user:
+                    break
+                raise ConnectionLostError("与 Publisher 的连接已断开")
             except asyncio.CancelledError:
                 # 调用方取消迭代：清理 socket 后重新抛出，遵守 asyncio 取消协议
                 if self._sub is not None:
+                    self._closed_by_user = True
                     self._sub.close(linger=0)
                     self._sub = None
                 raise
@@ -77,6 +107,7 @@ class PulseSubscriber:
     async def close(self) -> None:
         """关闭连接。"""
         if self._sub is not None:
+            self._closed_by_user = True
             self._sub.close(linger=1000)
             self._sub = None
         if self._ctx is not None:
