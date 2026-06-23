@@ -289,13 +289,16 @@ curl -N http://localhost:9090/api/v1/stats/stream
 | 帧序号 | 内容 | 说明 |
 |--------|------|------|
 | 1 | topic | UTF-8 字节串 |
-| 2 | meta | 6 字节：`[msg_type(1)][flags(1)][record_count(4, big-endian uint32)]` |
+| 2 | meta | 7 字节：`[msg_type(1)][flags(1)][data_type(1)][record_count(4, big-endian uint32)]` |
 | 3 | timestamp | 8 字节 big-endian int64，纳秒 |
 | 4 | payload | 序列化 + 压缩后的字节 |
 
 - `msg_type`：`0x01` = DATA，`0x02` = PING
 - `flags`：`bit[0:2]` 序列化格式编码，`bit[3:4]` 压缩算法编码
+- `data_type`（v3 新增）：原始数据类型标记，让 sub 端还原 pub 端原始 Python 类型（DataFrame → DataFrame，而非 list[dict]）。取值：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
 - 单帧 `record_count` 上限 **1,000,000**
+
+> **v3 Breaking**：meta 帧从 6 字节扩展到 7 字节（新增 data_type 字节），record_count 位置从 `[2:6]` 后移到 `[3:7]`。v3 与 v2.x 不兼容（record_count 读取错位）。
 
 ## 性能基准
 
@@ -343,6 +346,29 @@ python scripts/bench_pubsub_matrix.py
 > 测试环境：Windows 11，Python 3.13，单机 localhost
 
 ## 更新日志
+
+### v3.0.0
+
+⚠️ **Breaking Change**：meta 帧从 6 字节扩展到 7 字节，实现 pub→sub 全链路类型保真。**v3 与 v2.x 不兼容，pub/sub 两端必须同时升级。**
+
+- **🔴 修复类型变形（致命）**：此前 pub 端发送 `DataFrame` / `list[DataFrame]` 时，sub 端收到的类型被降级——msgpack/json 路径变成 `list[dict]`，pyarrow 路径变成 `pa.Table`，且 `dict` / `list[dict]` 经 pyarrow 也统一变成 `pa.Table`。实测 16 个合法组合中有 **8 个类型变形**。现在协议层记录原始数据类型，sub 端自动还原：
+
+  | pub 端发送 | sub 端收到（v2.x） | sub 端收到（v3.0） |
+  |---|---|---|
+  | `DataFrame` | `list[dict]` / `Table` | **`DataFrame`** ✅ |
+  | `list[DataFrame]` | `list[dict]` / `Table` | **`list[DataFrame]`** ✅ |
+  | `dict`（pyarrow）| `Table` | **`dict`** ✅ |
+  | `list[dict]`（pyarrow）| `Table` | **`list[dict]`** ✅ |
+
+- **meta 帧扩展（Breaking）**：新增 Byte 2 = `data_type`（原始数据类型标记），record_count 位置从 `[2:6]` 后移到 `[3:7]`。`DataType` 常量：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
+- **类型还原机制**：pub 端 `_infer_data_type()` 推断原始类型写入 meta；sub 端 `decode()` 据此把反序列化结果（list[dict] / pa.Table）还原为原始 Python 类型。`PulseMessage` 新增 `data_type` 字段
+- **测试强化**：`assert_message_roundtrip` 从"两侧降级为 list[dict] 比较值"升级为"类型保真 + 值相等"双断言（DataFrame 用 `assert_frame_equal`）
+- **诊断脚本**：新增 `scripts/_diag_type_fidelity.py`，覆盖 16 个合法组合的类型+值保真验证
+
+> **升级注意**：
+> - v3 与 v2.x **协议不兼容**，pub/sub 两端必须同时升级到 v3.0.0
+> - `list[DataFrame]` 因多个分片在序列化时展平，sub 端还原为 `[单个合并后的 DataFrame]`（行数据完全一致，仅丢失原分片个数信息）
+> - 用户代码无需改动（`PulseMessage.payload` 现在直接是原始类型，如 DataFrame 而非 list[dict]）
 
 ### v2.4.1
 

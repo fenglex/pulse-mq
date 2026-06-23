@@ -207,6 +207,26 @@ def is_compatible(ser: str, shape: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _type_tag(obj: Any) -> str:
+    """返回用于类型保真比较的简短类型标签。
+
+    统一处理 DataFrame / list[DataFrame] / list[dict] / list[str] 等，
+    让 pub 端原始类型与 sub 端还原后的类型可比。
+    """
+    import pandas as _pd
+    if isinstance(obj, _pd.DataFrame):
+        return "DataFrame"
+    if isinstance(obj, list) and obj:
+        if isinstance(obj[0], _pd.DataFrame):
+            return "list[DataFrame]"
+        if isinstance(obj[0], dict):
+            return "list[dict]"
+        if isinstance(obj[0], str):
+            return "list[str]"
+        return f"list[{type(obj[0]).__name__}]"
+    return type(obj).__name__
+
+
 def assert_message_roundtrip(
     msg: PulseMessage,
     expected: Any,
@@ -215,7 +235,12 @@ def assert_message_roundtrip(
     comp: str,
     record_count: int,
 ) -> None:
-    """端到端消息一致性核心断言。"""
+    """端到端消息一致性核心断言（v3：类型保真）。
+
+    v3 起 sub 端 payload 应还原为 pub 端原始类型，本断言：
+    1. 类型保真：sub 端 payload 类型标签 == 原始 expected 类型标签
+    2. 值相等：DataFrame 用 assert_frame_equal，其余直接 ==
+    """
     assert msg.serializer == ser, f"serializer: got {msg.serializer}, want {ser}"
     assert msg.compression == comp, f"compression: got {msg.compression}, want {comp}"
     assert msg.record_count == record_count, (
@@ -223,37 +248,43 @@ def assert_message_roundtrip(
     )
     assert msg.timestamp_ns > 0, "timestamp_ns 应为正"
 
-    # 把 expected 统一规整为"可比形态"：
-    # - DataFrame → list[dict]
-    # - list[DataFrame] → 展平为 list[dict]（与 publisher._prepare_payload 一致）
-    expected_normalized: Any = expected
-    if isinstance(expected, pd.DataFrame):
-        expected_normalized = expected.to_dict(orient="records")
-    elif isinstance(expected, list) and expected and isinstance(expected[0], pd.DataFrame):
-        expected_normalized = []
-        for df in expected:
-            expected_normalized.extend(df.to_dict(orient="records"))
-
-    # payload 等值比较
     got = msg.payload
-    # pyarrow 反序列化返回 pa.Table，转成 list[dict] 比较
-    if hasattr(got, "to_pylist") and not isinstance(got, list):
-        got = got.to_pylist()
-    elif hasattr(got, "to_dict") and not isinstance(got, (list, dict)):
-        got = got.to_dict(orient="records")
 
-    # 形态对齐：pyarrow 对单个 dict 会返回 1 行 Table → list[dict]，
-    # 而原 expected 是 dict。两侧统一：单元素 list[dict] ↔ dict 互转。
-    if isinstance(got, list) and len(got) == 1 and isinstance(got[0], dict) \
-            and isinstance(expected_normalized, dict):
-        got = got[0]
-    elif isinstance(expected_normalized, list) and len(expected_normalized) == 1 \
-            and isinstance(expected_normalized[0], dict) and isinstance(got, dict):
-        expected_normalized = expected_normalized[0]
-
-    assert got == expected_normalized, (
-        f"payload 不一致: got {str(got)[:120]}, want {str(expected_normalized)[:120]}"
+    # 1. 类型保真断言
+    got_tag = _type_tag(got)
+    expected_tag = _type_tag(expected)
+    assert got_tag == expected_tag, (
+        f"类型不保真: pub={expected_tag}, sub={got_tag} "
+        f"(data_type={msg.data_type}, serializer={ser})"
     )
+
+    # 2. 值相等断言（按类型分别处理）
+    import pandas as pd
+
+    if isinstance(expected, pd.DataFrame):
+        # DataFrame：列顺序/类型可能因序列化路径略有差异，用 assert_frame_equal 宽松比较
+        pd.testing.assert_frame_equal(
+            got.reset_index(drop=True), expected.reset_index(drop=True),
+            check_dtype=False, check_like=True,  # 忽略列顺序与 dtype 差异
+        )
+    elif isinstance(expected, list) and expected and isinstance(expected[0], pd.DataFrame):
+        # list[DataFrame]：pub 端多个分片展平后还原为单个 DataFrame 包在 list 里，
+        # 把 expected 也合并为单个 DataFrame 后比较。
+        merged_expected = pd.concat(
+            [df.reset_index(drop=True) for df in expected], ignore_index=True
+        )
+        assert isinstance(got, list) and len(got) == 1 and isinstance(got[0], pd.DataFrame), (
+            f"list[DataFrame] 应还原为 [DataFrame]，实际 {got_tag}"
+        )
+        pd.testing.assert_frame_equal(
+            got[0].reset_index(drop=True), merged_expected,
+            check_dtype=False, check_like=True,
+        )
+    else:
+        # dict / list[dict] / list[str] / str / bytes：直接 ==（pyarrow 路径已还原）
+        assert got == expected, (
+            f"payload 不一致: got {str(got)[:120]}, want {str(expected)[:120]}"
+        )
 
 
 # ---------------------------------------------------------------------------
