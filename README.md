@@ -27,6 +27,16 @@ pip install pulse-mq
 
 依赖项：ZeroMQ、msgspec、python-snappy、lz4、zstandard、pyarrow、pandas 全部开箱即用。
 
+> **关于包名**：PyPI 分发名是 `pulse-mq`（`pip install` 用），而 Python import 名是 `pulsemq`（`import` 用，无连字符，因 Python 标识符不允许连字符）。这是 Python 生态的常见双名模式，与 `pip install python-dateutil` → `import dateutil`、`pip install scikit-learn` → `import sklearn` 一致。
+>
+> ```bash
+> pip install pulse-mq      # 安装
+> ```
+> ```python
+> import pulsemq            # 使用
+> from pulsemq import PulsePublisher, PulseSubscriber
+> ```
+
 ## 快速开始
 
 ### 启动 Publisher
