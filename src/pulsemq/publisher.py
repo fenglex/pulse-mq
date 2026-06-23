@@ -32,7 +32,7 @@ from pulsemq.producers.manager import ProducerManager
 from pulsemq.protocol import frames as frame_codec
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
-from pulsemq.transport.zmq_pub import ZmqPubTransport
+from pulsemq.transport.zmq_pub import AuthCallback, ZmqPubTransport
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ class PulsePublisher:
         bind: str | None = None,
         admin_bind: str | None = None,
         api_keys: dict[str, str] | None = None,
+        on_auth: AuthCallback | None = None,
     ) -> None:
         self._config = config or load_config()
         # 参数覆盖
@@ -58,6 +59,7 @@ class PulsePublisher:
         if admin_bind:
             self._config.admin_bind = admin_bind
         self._explicit_api_keys = api_keys
+        self._on_auth = on_auth
 
         # 内部组件
         self._transport: ZmqPubTransport | None = None
@@ -140,6 +142,16 @@ class PulsePublisher:
             self._explicit_api_keys = {}
         self._explicit_api_keys[username] = password
 
+    def set_auth_callback(self, callback: AuthCallback | None) -> None:
+        """设置认证事件回调（可运行时动态替换）。
+
+        回调签名为 async def(username, client_address, success)。
+        需在 start() 前调用，或在 start() 后通过 transport 自动传递。
+        """
+        self._on_auth = callback
+        if self._transport is not None:
+            self._transport.set_auth_callback(callback)
+
     # ---- 启动 ----
 
     def start(self) -> None:
@@ -164,6 +176,7 @@ class PulsePublisher:
         self._transport = ZmqPubTransport(
             bind=self._config.bind,
             api_keys=api_keys,
+            on_auth=self._on_auth,
         )
         await self._transport.start()
 

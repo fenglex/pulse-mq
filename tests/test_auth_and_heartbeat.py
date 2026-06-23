@@ -132,3 +132,205 @@ class TestSubscriberExceptions:
                 async for _msg in sub.subscribe(topic):
                     pass
             await sub.close()
+
+
+class TestZapLogging:
+    """模块 2：Pub 端 ZAP 日志增强。"""
+
+    async def test_zap_success_log_contains_client_address(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+        caplog,
+    ) -> None:
+        """认证成功日志包含客户端 IP。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"alice": "pwd"},
+        )
+
+        topic = "log_topic_1"
+
+        async def _factory() -> dict:
+            return {"x": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.2)
+
+        caplog.set_level(logging.INFO, logger="pulsemq.transport.zmq_pub")
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="pwd",
+            )
+            await sub.connect()
+            async for msg in sub.subscribe(topic):
+                if msg.payload == {"x": 1}:
+                    break
+            await sub.close()
+
+        success_logs = [r.message for r in caplog.records if "ZAP 认证成功" in r.message]
+        assert len(success_logs) >= 1, f"应有至少一条成功日志，实际: {caplog.record_tuples}"
+        assert "client=" in success_logs[0], f"日志应包含客户端地址: {success_logs[0]}"
+        assert "username=alice" in success_logs[0]
+
+    async def test_zap_failure_log_contains_client_address(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+        caplog,
+    ) -> None:
+        """认证失败日志包含客户端 IP。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"alice": "pwd"},
+        )
+
+        topic = "log_topic_2"
+
+        async def _factory() -> dict:
+            return {"x": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.2)
+
+        caplog.set_level(logging.WARNING, logger="pulsemq.transport.zmq_pub")
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="WRONG", receive_timeout=3000,
+            )
+            await sub.connect()
+            with pytest.raises(ConnectionLostError):
+                async for _msg in sub.subscribe(topic):
+                    pass
+            await sub.close()
+
+        fail_logs = [r.message for r in caplog.records if "ZAP 认证失败" in r.message]
+        assert len(fail_logs) >= 1, f"应有至少一条失败日志，实际: {caplog.record_tuples}"
+        assert "client=" in fail_logs[0], f"日志应包含客户端地址: {fail_logs[0]}"
+
+
+class TestAuthCallback:
+    """模块 3：认证事件回调钩子。"""
+
+    async def test_on_auth_callback_success(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """认证成功时回调被调用，参数正确。"""
+        pub_port, admin_port = random_port_pair
+        events: list[dict] = []
+
+        async def on_auth(username: str, addr: str, success: bool) -> None:
+            events.append({"username": username, "addr": addr, "success": success})
+
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"bob": "secret"},
+        )
+        pub._on_auth = on_auth
+
+        topic = "cb_topic_1"
+
+        async def _factory() -> dict:
+            return {"x": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.2)
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="bob", password="secret",
+            )
+            await sub.connect()
+            async for msg in sub.subscribe(topic):
+                if msg.payload == {"x": 1}:
+                    break
+            await sub.close()
+
+        assert len(events) >= 1, f"回调应至少被调用一次，实际: {events}"
+        evt = events[0]
+        assert evt["username"] == "bob"
+        assert evt["success"] is True
+        assert "127.0.0.1" in evt["addr"] or "::1" in evt["addr"]
+
+    async def test_on_auth_callback_failure(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """认证失败时回调被调用，参数正确。"""
+        pub_port, admin_port = random_port_pair
+        events: list[dict] = []
+
+        async def on_auth(username: str, addr: str, success: bool) -> None:
+            events.append({"username": username, "addr": addr, "success": success})
+
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"bob": "secret"},
+        )
+        pub._on_auth = on_auth
+
+        topic = "cb_topic_2"
+
+        async def _factory() -> dict:
+            return {"x": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.2)
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="bob", password="BAD_PWD", receive_timeout=3000,
+            )
+            await sub.connect()
+            with pytest.raises(ConnectionLostError):
+                async for _msg in sub.subscribe(topic):
+                    pass
+            await sub.close()
+
+        assert len(events) >= 1, f"回调应至少被调用一次，实际: {events}"
+        evt = events[0]
+        assert evt["username"] == "bob"
+        assert evt["success"] is False
+
+    async def test_on_auth_callback_exception_does_not_crash(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """回调抛出异常不影响认证流程。"""
+        pub_port, admin_port = random_port_pair
+
+        async def bad_callback(username: str, addr: str, success: bool) -> None:
+            raise RuntimeError("回调内部错误")
+
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"carol": "pwd"},
+        )
+        pub._on_auth = bad_callback
+
+        topic = "cb_topic_3"
+
+        async def _factory() -> dict:
+            return {"x": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.2)
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="carol", password="pwd",
+            )
+            await sub.connect()
+            # 回调异常不应阻止认证 — 消息应正常到达
+            async for msg in sub.subscribe(topic):
+                assert msg.payload == {"x": 1}
+                break
+            await sub.close()
