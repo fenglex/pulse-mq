@@ -72,13 +72,17 @@ pub.start()  # 阻塞运行
 如果需要在 producer 内部手动控制发送，可开启 `inject_sender`：
 
 ```python
+from pulsemq import PulsePublisher, PublisherSender
+
+pub = PulsePublisher()
+
 @pub.producer(name="market", interval=1.0, inject_sender=True)
-async def market(sender):
+async def market(sender: PublisherSender) -> None:
     await sender.send({"symbol": "600000", "price": 10.5})
     await sender.send({"symbol": "000001", "price": 12.3}, topic="sz_market")
 ```
 
-`sender.send()` 默认沿用当前 producer 的 topic、serializer、compression，也可以通过参数覆盖。
+开启 `inject_sender=True` 后，装饰器会向回调注入 `PublisherSender` 实例，类型检查器/IDE 能自动识别 `sender` 的类型并校验 `send()` 的数据类型。`sender.send()` 的 `data` 参数只接受白名单类型（`pd.DataFrame` / `dict` / `str` / `bytes`，可用 `PubData` 别名标注），默认沿用当前 producer 的 topic、serializer、compression，也可以通过参数覆盖。
 
 `PulsePublisher` 也提供 `start_async()` 方便嵌入其他 asyncio 程序。
 
