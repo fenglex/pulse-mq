@@ -353,6 +353,17 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v3.2.0
+
+🔔 **feature**：sub 端认证可见性增强 —— 上线（成功/失败）双向都有提示，失败自动停止。
+
+- **认证成功有提示**：此前订阅端认证成功时完全静默，用户无法判断是否连上。现在 monitor 监听 `EVENT_HANDSHAKE_SUCCEEDED`，握手通过后打 info 日志 `[SUB 上线] 认证成功，订阅就绪 (user=xxx, addr=xxx)`。
+- **认证失败全覆盖**：此前只处理凭证错误（`EVENT_HANDSHAKE_FAILED_AUTH`），非 PLAIN 机制失败、协议失败（`HANDSHAKE_FAILED_PROTOCOL`/`NO_DETAIL`）既无提示也不停止。现在所有握手失败事件统一处理：打 error 日志 `[SUB 认证失败] PLAIN 握手被服务端拒绝，已停止订阅`，并自动结束迭代。
+- **双向可见性**：pub 端早有 `[SUB 上线] auth=OK/FAIL` 和 `[SUB 认证失败] reason=...`，现在 sub 端也有对应的上线/失败日志，两端双向可观测。
+- **自动停止**：任意握手失败都让 `async for` 自然退出，用户无需 try/except（避免无限重连卡死）。
+
+> **升级建议**：开启 PLAIN 认证的用户建议升级，可显著改善连接诊断体验。
+
 ### v3.1.1
 
 🔧 **bugfix**：修复心跳功能端到端不可用 + 认证成功路径挂死 + setup 失败资源泄漏。
