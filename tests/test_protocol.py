@@ -120,3 +120,28 @@ class TestFrameCodec:
             frames = encode("topic", {"x": 1}, record_count=rc)
             msg = decode(frames)
             assert msg.record_count == rc
+
+
+class TestHeartbeat:
+    """心跳帧编解码。
+
+    回归：v3 meta 帧统一为 7 字节（Byte 2 = data_type），
+    但 encode_heartbeat 漏了 data_type 字节，编码出 6 字节 meta，
+    导致 decode 时 struct.unpack 读 meta[3:7]（仅 3 字节）报
+    "Input data was truncated"，心跳功能端到端不可用。
+    """
+
+    def test_heartbeat_meta_is_7_bytes(self) -> None:
+        """心跳帧 meta 必须与 DATA 帧一致为 7 字节。"""
+        from pulsemq.protocol.frames import encode_heartbeat
+        frames = encode_heartbeat()
+        meta = frames[1]
+        assert len(meta) == 7, f"心跳 meta 应为 7 字节，实际 {len(meta)}"
+        assert meta[0] == MsgType.PING
+
+    def test_heartbeat_is_pure_control_frame(self) -> None:
+        """心跳帧 topic 为 __pulse_hb__，空 payload，record_count=0。"""
+        from pulsemq.protocol.frames import encode_heartbeat
+        frames = encode_heartbeat()
+        assert frames[0] == b"__pulse_hb__"
+        assert frames[3] == b""

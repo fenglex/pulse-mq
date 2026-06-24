@@ -26,6 +26,7 @@ import zmq
 import zmq.asyncio
 
 from pulsemq.protocol.frames import PulseMessage, decode
+from pulsemq.protocol.msg_type import MsgType
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class PulseSubscriber:
                         raise
 
                 if len(frames) == 4:
+                    # 过滤心跳帧（PING 控制帧）：meta[0] 为消息类型，PING 不交付给用户。
+                    # 心跳是协议控制帧，空 payload 经反序列化会崩，也不属于业务消息流。
+                    if frames[1][0] == MsgType.PING:
+                        continue
                     yield decode(frames)
         finally:
             if mon_task is not None:

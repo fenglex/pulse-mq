@@ -282,3 +282,64 @@ class TestSubscriberErrors:
 
 def topic_for_auth() -> str:
     return "auth_topic"
+
+
+# ---------------------------------------------------------------------------
+# 心跳帧过滤：订阅端不应把 PING 心跳帧交付给用户迭代器
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatFiltered:
+    """回归：publisher 每隔 heartbeat_interval 发 PING 心跳帧（topic=__pulse_hb__）。
+
+    订阅端必须过滤掉心跳帧，不能交付给用户的 async for 循环。
+    历史 bug：subscribe() 无条件 decode+yield 所有 4 帧，心跳帧导致：
+      1) decode 读 6 字节 meta（B1 修复前）报 truncated；
+      2) 即使尺寸修对，空 payload 经 msgpack 反序列化也会崩；
+      3) 语义上心跳是协议控制帧，不该混入业务消息流。
+    """
+
+    async def test_heartbeat_not_delivered(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        from pulsemq.config import PublisherConfig
+        from pulsemq.publisher import PulsePublisher
+
+        pub_port, admin_port = random_port_pair
+        # heartbeat_interval=0.3s，确保 1.5s 收集窗口内会发出多次心跳
+        pub = PulsePublisher(
+            config=PublisherConfig(
+                bind=f"tcp://127.0.0.1:{pub_port}",
+                admin_bind=f"127.0.0.1:{admin_port}",
+                stats_db=tmp_sqlite_url,
+                heartbeat_interval=0.3,
+            ),
+        )
+        # 一个业务 producer，保证订阅器有真实消息可收（不至于只收心跳）
+        async def _probe() -> Any:
+            return {"v": 1}
+
+        pub.register_producer(fn=_probe, name="hb_probe", interval=0.1)
+
+        received: list = []
+        async with running_publisher(pub):
+            sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+            await sub.connect()
+            try:
+                # subscribe("") = 订阅所有 topic（含 __pulse_hb__）
+                async for msg in sub.subscribe(""):
+                    received.append(msg)
+                    # 收到若干业务消息或超时即停
+                    if sum(1 for m in received if m.topic == "hb_probe") >= 3:
+                        break
+            finally:
+                await sub.close()
+
+        # 核心断言：交付给用户的消息里绝不能有心跳帧
+        hb = [m for m in received if m.topic == "__pulse_hb__"]
+        assert hb == [], f"心跳帧不应交付给用户迭代器，实际收到 {len(hb)} 条"
+        # 至少应收到业务消息，证明迭代器本身工作正常
+        biz = [m for m in received if m.topic == "hb_probe"]
+        assert biz, "应至少收到一条业务消息（证明迭代器正常，而非静默丢弃全部）"

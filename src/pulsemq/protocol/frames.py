@@ -186,12 +186,15 @@ def encode_heartbeat() -> list[bytes]:
 
     4 帧格式：
       Frame 1: topic = b"__pulse_hb__"
-      Frame 2: meta (6B) = [PING, flags(msgpack|none), record_count=0]
+      Frame 2: meta (7B) = [PING, flags(msgpack|none), data_type=UNKNOWN, record_count=0]
       Frame 3: timestamp (8B) = 当前纳秒
       Frame 4: payload = b""（空）
+
+    meta 帧布局与 DATA 帧一致（v3 统一 7 字节，Byte 2 = data_type），
+    保证 decode() 读取 meta[2]/meta[3:7] 时不会越界。
     """
     flags_byte = encode_flags("msgpack", "none")
     rc_bytes = _RC_STRUCT.pack(0)
-    meta = bytes([MsgType.PING, flags_byte]) + rc_bytes
+    meta = bytes([MsgType.PING, flags_byte, DataType.UNKNOWN]) + rc_bytes
     ts_bytes = _TS_STRUCT.pack(time.time_ns())
     return [b"__pulse_hb__", meta, ts_bytes, b""]
