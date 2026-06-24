@@ -353,6 +353,14 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v3.2.2
+
+🔧 **bugfix**：修复 pub 端 sub 上线/认证失败提示看不到（v3.2.1 遗漏）。
+
+- **🔴 修复 pub 端认证提示看不到（致命）**：v3.2.1 只把 sub 端的连接事件改成 `print` 到 stderr，**遗漏了 pub 端**——pub 端 ZAP handler 仍用 `logging.info`/`logger.warning` 打 `[SUB 上线] auth=OK` 和 `[SUB 认证失败] auth=FAIL`，用户没配 `logging.basicConfig()` 时同样被 Python 默认 lastResort 吞掉。修复：pub 端 3 处认证事件（上线成功 / 凭证错误 / 非 PLAIN 机制失败）也改用 `print(..., file=sys.stderr)` 直接输出，与 sub 端对称，保证始终可见。
+
+> **升级建议**：v3.2.1 用户建议升级——v3.2.1 的 pub 端仍看不到 sub 上线提示。
+
 ### v3.2.1
 
 🔧 **bugfix**：修复认证/上线信息看不到 + pub 停止后 sub 卡死。

@@ -543,3 +543,46 @@ class TestConnectionNotice:
         assert "上线" in combined or "auth=OK" in combined or "认证成功" in combined, (
             f"认证成功应输出到 stderr 可见，实际捕获: {combined!r}"
         )
+
+    async def test_pub_logs_sub_online_to_stderr(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+        capsys,
+    ) -> None:
+        """sub 上线时，pub 端（ZAP handler）应有可见提示输出到 stderr。
+
+        背景：pub 端 ZAP handler 此前用 logging.info 打 [SUB 上线] auth=OK，
+        用户没配 basicConfig() 时被吞掉，完全看不到。改用 print 到 stderr。
+        本测试断言 pub 端专属格式「auth=OK」（区别于 sub 端的「认证成功」）。
+        """
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"alice": "right_pwd"},
+        )
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="right_pwd",
+            )
+            await sub.connect()
+            try:
+                async def _probe():
+                    async for _msg in sub.subscribe(topic_for_auth()):
+                        break
+                try:
+                    await asyncio.wait_for(_probe(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                await sub.close()
+
+        captured = capsys.readouterr()
+        combined = captured.err + captured.out
+        # pub 端 ZAP 输出格式：[SUB 上线] user=alice addr=... auth=OK
+        assert "auth=OK" in combined, (
+            f"sub 上线时 pub 端应输出 [SUB 上线] auth=OK 到 stderr，"
+            f"实际捕获: {combined!r}"
+        )

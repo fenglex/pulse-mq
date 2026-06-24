@@ -389,7 +389,7 @@ class AsyncZAPHandler:
 **关键设计**：
 - ZAP handler 与 PUB socket 共享同一 `zmq.asyncio.Context`，在同一事件循环运行，避免跨线程 inproc 问题
 - ZAP 响应通过 `_send_zap_reply()` 统一 `await` + `try/except`：单次 send 失败仅记日志、不影响循环（避免一次失败导致认证全线瘫痪）
-- SUB 连接日志：`[SUB 上线] user=xxx addr=xxx auth=OK` / `[SUB 认证失败] ... reason=...`
+- 认证事件（上线成功 / 凭证错误 / 非 PLAIN）**直接 `print` 到 stderr**（不依赖用户配置 logging，保证 `[SUB 上线] user=xxx addr=xxx auth=OK` / `[SUB 认证失败] auth=FAIL reason=...` 始终可见）
 
 **依赖**：pyzmq（asyncio）。
 

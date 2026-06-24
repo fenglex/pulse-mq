@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Awaitable, Callable
 
 import zmq
@@ -19,6 +20,16 @@ import zmq.asyncio
 logger = logging.getLogger(__name__)
 
 AuthCallback = Callable[[str, str, bool], Awaitable[None]]
+
+
+def _notice(msg: str) -> None:
+    """关键认证事件直接输出到 stderr，不依赖用户配置 logging。
+
+    Python 默认 logging 无 handler 时，info/warning 级日志会被 lastResort
+    吞掉，导致用户看不到 sub 上线/认证失败提示。这些是面向运维的关键可观测
+    输出，应始终可见，故用 print 而非 logging。
+    """
+    print(msg, file=sys.stderr, flush=True)
 
 
 class AsyncZAPHandler:
@@ -90,9 +101,9 @@ class AsyncZAPHandler:
             password = msg[7].decode("utf-8", errors="replace") if len(msg) > 7 else ""
 
             if mechanism != b"PLAIN":
-                logger.warning(
-                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=not-PLAIN mechanism=%s",
-                    username or "<empty>", client_addr, mechanism.decode("utf-8", "replace"),
+                _notice(
+                    f"[SUB 认证失败] user={username or '<empty>'} addr={client_addr} "
+                    f"auth=FAIL reason=not-PLAIN mechanism={mechanism.decode('utf-8', 'replace')}"
                 )
                 await self._send_zap_reply(request_id, b"400", b"Not PLAIN")
                 continue
@@ -100,18 +111,15 @@ class AsyncZAPHandler:
             # 白名单校验
             expected = self._api_keys.get(username)
             if expected is not None and expected == password:
-                logger.info(
-                    "[SUB 上线] user=%s addr=%s auth=OK",
-                    username, client_addr,
-                )
+                _notice(f"[SUB 上线] user={username} addr={client_addr} auth=OK")
                 await self._notify_auth(username, client_addr, True)
                 await self._send_zap_reply(
                     request_id, b"200", b"OK", user_id=username.encode(),
                 )
             else:
-                logger.warning(
-                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=invalid-credentials",
-                    username or "<empty>", client_addr,
+                _notice(
+                    f"[SUB 认证失败] user={username or '<empty>'} addr={client_addr} "
+                    f"auth=FAIL reason=invalid-credentials"
                 )
                 await self._notify_auth(username, client_addr, False)
                 await self._send_zap_reply(request_id, b"400", b"Invalid credentials")
