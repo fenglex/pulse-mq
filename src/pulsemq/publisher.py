@@ -281,47 +281,53 @@ class PulsePublisher:
         # 确定最终 api_keys
         api_keys = self._explicit_api_keys or self._config.api_keys
 
-        # 初始化传输层
-        self._transport = ZmqPubTransport(
-            bind=self._config.bind,
-            api_keys=api_keys,
-            on_auth=self._on_auth,
-        )
-        await self._transport.start()
-
-        # 初始化统计存储
-        self._storage = StatsStorage(self._config.stats_db)
-        self._storage.connect()
-
-        # 为所有 producer 创建 topic 缓存
-        for name, spec in self._producer_mgr.specs.items():
-            self._buffers.get_or_create(name, spec.cache_size)
-
-        # 初始化 Admin 后台
-        self._admin = AdminServer(
-            bind=self._config.admin_bind,
-            traffic_stats=self._traffic,
-            topic_buffers=self._buffers,
-            stats_storage=self._storage,
-            snapshot_fn=self._system_snapshot,
-            start_time=self._start_time,
-        )
-        await self._admin.start()
-
-        # 启动分钟滚动任务
-        roll_task = asyncio.create_task(self._minute_roll_loop())
-
-        # 启动心跳循环（默认 30s 间隔）
+        # 初始化阶段创建的资源（transport/storage/admin/tasks）必须在 try 块内，
+        # 这样任一初始化步骤抛异常时 finally 的 _shutdown() 仍会执行，
+        # 释放已创建的 ZMQ context / PUB socket / SQLite 连接 / asyncio 任务，
+        # 避免资源泄漏（尤其是 start_async() 嵌入其他 asyncio 程序的场景）。
+        roll_task: asyncio.Task | None = None
         hb_task: asyncio.Task | None = None
-        if self._config.heartbeat_interval > 0:
-            hb_task = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
-
-        # 启动所有 producer
-        await self._producer_mgr.start_all(self._on_produce, self._make_sender)
-
-        logger.info("PulsePublisher 运行中 (bind=%s, admin=%s)", self._config.bind, self._config.admin_bind)
 
         try:
+            # 初始化传输层
+            self._transport = ZmqPubTransport(
+                bind=self._config.bind,
+                api_keys=api_keys,
+                on_auth=self._on_auth,
+            )
+            await self._transport.start()
+
+            # 初始化统计存储
+            self._storage = StatsStorage(self._config.stats_db)
+            self._storage.connect()
+
+            # 为所有 producer 创建 topic 缓存
+            for name, spec in self._producer_mgr.specs.items():
+                self._buffers.get_or_create(name, spec.cache_size)
+
+            # 初始化 Admin 后台
+            self._admin = AdminServer(
+                bind=self._config.admin_bind,
+                traffic_stats=self._traffic,
+                topic_buffers=self._buffers,
+                stats_storage=self._storage,
+                snapshot_fn=self._system_snapshot,
+                start_time=self._start_time,
+            )
+            await self._admin.start()
+
+            # 启动分钟滚动任务
+            roll_task = asyncio.create_task(self._minute_roll_loop())
+
+            # 启动心跳循环（默认 30s 间隔）
+            if self._config.heartbeat_interval > 0:
+                hb_task = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
+
+            # 启动所有 producer
+            await self._producer_mgr.start_all(self._on_produce, self._make_sender)
+
+            logger.info("PulsePublisher 运行中 (bind=%s, admin=%s)", self._config.bind, self._config.admin_bind)
+
             # 等待运行结束
             while self._running:
                 await asyncio.sleep(1)
@@ -336,15 +342,16 @@ class PulsePublisher:
                     pass
             await self._shutdown(roll_task)
 
-    async def _shutdown(self, roll_task: asyncio.Task) -> None:
-        """优雅关闭。"""
+    async def _shutdown(self, roll_task: asyncio.Task | None) -> None:
+        """优雅关闭。roll_task 可能为 None（初始化中途失败、未来得及创建任务）。"""
         self._running = False
         await self._producer_mgr.stop_all()
-        roll_task.cancel()
-        try:
-            await roll_task
-        except asyncio.CancelledError:
-            pass
+        if roll_task is not None:
+            roll_task.cancel()
+            try:
+                await roll_task
+            except asyncio.CancelledError:
+                pass
 
         # 最后一次分钟滚动 + 落库
         archived = self._traffic.roll_minute()
