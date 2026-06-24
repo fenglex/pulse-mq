@@ -411,12 +411,17 @@ class PulseSubscriber:
 
 **订阅循环**（`subscribe()`）：
 1. 设置 SUBSCRIBE 过滤器（topic 前缀匹配）
-2. 认证场景：启动后台 monitor task 监听 `EVENT_HANDSHAKE_FAILED_AUTH`
-3. 循环 `recv_multipart`：认证场景下 recv 与「认证失败事件」竞争（`asyncio.wait` FIRST_COMPLETED）
+2. 认证场景：启动后台 monitor task 监听握手结果（成功 + 各类失败事件掩码）
+3. 循环 `recv_multipart`：认证场景下 recv 与「握手结果事件」竞争（`asyncio.wait` FIRST_COMPLETED）
 4. 收到 4 帧后**过滤 PING 心跳帧**（`meta[0]==MsgType.PING` 的跳过，不交付用户）
 5. `yield decode(frames)` 给用户
 
-**认证失败处理**：检测到握手失败后打 error 日志、**静默结束迭代**（`async for` 自然退出，用户无需 try/except）。
+**握手可见性**（认证场景）：monitor 监听 `EVENT_HANDSHAKE_SUCCEEDED | EVENT_HANDSHAKE_FAILED_AUTH | EVENT_HANDSHAKE_FAILED_PROTOCOL | EVENT_HANDSHAKE_FAILED_NO_DETAIL`。
+`_watch_handshake()` 解析事件码：
+- 成功 → 打 info `[SUB 上线] 认证成功`，主循环继续接收
+- 任意失败 → 打 error `[SUB 认证失败]`，**自动结束迭代**（`async for` 自然退出，用户无需 try/except）
+
+这样 pub 端（`[SUB 上线] user=... auth=OK/FAIL`）和 sub 端（`[SUB 上线]`/`[SUB 认证失败]`）双向都有可见性。
 
 **依赖**：pyzmq（asyncio）、`protocol.frames.decode`、`protocol.msg_type.MsgType`。
 

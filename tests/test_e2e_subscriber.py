@@ -285,6 +285,69 @@ def topic_for_auth() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 认证可见性：sub 端上线（成功/失败）都应有提示，失败要自动停止
+# ---------------------------------------------------------------------------
+
+
+class TestAuthVisibility:
+    """sub 端认证可见性。
+
+    需求：sub 连接 publisher 时，认证成功/失败都应在 sub 端有明确提示，
+    认证失败要自动停止订阅（不让用户代码卡在无限重连上）。
+
+    背景：此前 sub 端 monitor 只监听 EVENT_HANDSHAKE_FAILED_AUTH，
+    导致：
+    - 认证成功时 sub 端无任何感知（无上线日志）；
+    - 非 PLAIN 机制失败（HANDSHAKE_FAILED_PROTOCOL 等）无提示也不停止。
+    现在扩展监听到 HANDSHAKE_SUCCEEDED + 所有 FAILED 事件。
+    """
+
+    async def test_auth_success_logs_online(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+        caplog,
+    ) -> None:
+        """正确凭证：sub 端应打印上线成功日志（info）。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"alice": "right_pwd"},
+        )
+
+        import logging
+        with caplog.at_level(logging.INFO, logger="pulsemq.subscriber"):
+            async with running_publisher(pub):
+                sub = PulseSubscriber(
+                    f"tcp://127.0.0.1:{pub_port}",
+                    username="alice", password="right_pwd",
+                )
+                await sub.connect()
+                try:
+                    # 触发 subscribe() 启动 monitor 并完成握手；
+                    # 正确凭证下会收到 HANDSHAKE_SUCCEEDED。
+                    async def _probe():
+                        async for _msg in sub.subscribe(topic_for_auth()):
+                            break
+
+                    try:
+                        await asyncio.wait_for(_probe(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass  # 超时无所谓，只关心握手结果日志
+                finally:
+                    await sub.close()
+
+        # 核心断言：sub 端应有认证成功的上线日志
+        online_logs = [
+            r for r in caplog.records
+            if "上线" in r.message or "auth=OK" in r.message or "握手成功" in r.message
+        ]
+        assert online_logs, (
+            "认证成功时 sub 端应打印上线日志，实际未捕获到任何上线/握手成功日志"
+        )
+
+
+# ---------------------------------------------------------------------------
 # 心跳帧过滤：订阅端不应把 PING 心跳帧交付给用户迭代器
 # ---------------------------------------------------------------------------
 
