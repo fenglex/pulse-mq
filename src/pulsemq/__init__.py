@@ -15,7 +15,8 @@ if _sys.platform == "win32":  # pragma: no cover - 平台相关
     if hasattr(_asyncio, "WindowsSelectorEventLoopPolicy"):
         _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
 
-from pulsemq.publisher import PulsePublisher
+from pulsemq.publisher import PulsePublisher, PublisherSender
+from pulsemq.producers.types import PubData
 from pulsemq.subscriber import PulseSubscriber
 from pulsemq.protocol.frames import PulseMessage
 from pulsemq.config import PublisherConfig, load_config
@@ -25,5 +26,7 @@ __all__ = [
     "PulseSubscriber",
     "PulseMessage",
     "PublisherConfig",
+    "PublisherSender",
+    "PubData",
     "load_config",
 ]
