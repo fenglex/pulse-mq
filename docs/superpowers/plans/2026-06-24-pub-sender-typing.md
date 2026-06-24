@@ -203,7 +203,7 @@ SenderFactory = Callable[[ProducerSpec], "PublisherSender"]
 Run: `python -m pytest tests/test_e2e_publisher.py tests/test_data_types.py -q`
 Expected: 全部 PASS（运行时逻辑零变化，仅类型注解变更）。
 
-> 注：`ProducerSpec` 在本文件内定义（dataclass），`OnMessageCallback`/`SenderFactory` 引用它在前——得益于 `from __future__ import annotations`，所有注解为字符串惰性求值，前向引用无问题。
+> 注：`ProducerSpec` 在本文件内定义（dataclass），`OnMessageCallback`/`SenderFactory` 的定义**必须放在 `ProducerSpec` 之后**——`TypeAlias` 右侧表达式在模块加载时立即求值，`from __future__ import annotations` 只让**函数注解**惰性求值，不影响模块级别名赋值。所以 Step 1 的 import 区块不再含别名定义，别名移到 ProducerSpec 之后（见下方 ProducerSpec 定义之后）。
 
 - [ ] **Step 6: 提交**
 
