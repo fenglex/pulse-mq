@@ -144,7 +144,7 @@ class TestPublisherBurst:
             counter["n"] += 1
             if counter["n"] > total_batches:
                 return None
-            return [{"seq": counter["n"], "i": i} for i in range(10)]
+            return pd.DataFrame({"seq": [counter["n"] for _ in range(10)], "i": list(range(10))})
 
         pub._producer_mgr.register_burst(
             callback=_burst_factory, name=topic,

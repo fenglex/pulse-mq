@@ -5,7 +5,7 @@ v2 简化：无 broker 不需要 AUTH/SUB/UNSUB/QUERY 等控制消息，
 
 v3：meta 帧扩展为 7 字节，新增 Byte 2 = data_type（原始数据类型标记），
 让 sub 端能把反序列化结果还原为 pub 端的原始 Python 类型
-（如 DataFrame → DataFrame，而非降级为 list[dict]）。
+（如 DataFrame → DataFrame）。
 """
 
 from __future__ import annotations
@@ -25,11 +25,8 @@ class DataType:
     把反序列化结果还原为原始类型，实现全链路类型保真。
     """
 
-    UNKNOWN = 0x00          # 兜底（未知/不可还原）
-    DICT = 0x01             # dict
-    LIST_DICT = 0x02        # list[dict]
-    LIST_STR = 0x03         # list[str]
-    DATAFRAME = 0x04        # pd.DataFrame
-    LIST_DATAFRAME = 0x05   # list[pd.DataFrame]
-    STR = 0x06              # str
-    BYTES = 0x07            # bytes
+    UNKNOWN = 0x00    # 兜底（未知/不可还原）
+    DICT = 0x01       # dict
+    DATAFRAME = 0x02  # pd.DataFrame
+    STR = 0x03        # str
+    BYTES = 0x04      # bytes

@@ -6,7 +6,7 @@
 
 - **单进程架构** — publisher 即服务，无独立 broker，部署极简
 - **高性能** — 基于 ZeroMQ PUB，SNDHWM=0 无丢消息；burst 模式可压榨到硬件极限
-- **多数据格式** — `str` / `bytes` / `DataFrame` / `list[dict]` 等类型，发布端零配置自动推断 record_count
+- **多数据格式** — `str` / `bytes` / `DataFrame` / `dict` 类型，发布端零配置自动推断 record_count
 - **多种序列化** — `str`、`msgpack`（默认）、`json`、`pyarrow` IPC、`bytes` 透传
 - **可选压缩** — `none`（默认）、`snappy`、`lz4`、`zstd`
 - **PLAIN 认证** — ZeroMQ PLAIN 协议 + ZAP handler，api_key 白名单机制
@@ -69,6 +69,17 @@ async def deep_quote():
 pub.start()  # 阻塞运行
 ```
 
+如果需要在 producer 内部手动控制发送，可开启 `inject_sender`：
+
+```python
+@pub.producer(name="market", interval=1.0, inject_sender=True)
+async def market(sender):
+    await sender.send({"symbol": "600000", "price": 10.5})
+    await sender.send({"symbol": "000001", "price": 12.3}, topic="sz_market")
+```
+
+`sender.send()` 默认沿用当前 producer 的 topic、serializer、compression，也可以通过参数覆盖。
+
 `PulsePublisher` 也提供 `start_async()` 方便嵌入其他 asyncio 程序。
 
 ### 订阅消息
@@ -111,9 +122,9 @@ asyncio.run(main())
 
 ### 支持的返回类型（白名单）
 
-Producer 回调**只接受以下 7 种返回类型**，其余一律抛 `TypeError`：
+Producer 回调**只接受以下 4 种返回类型**，其余一律抛 `TypeError`：
 
-`pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `list[str]` / `dict` / `str` / `bytes`
+`pd.DataFrame` / `dict` / `str` / `bytes`
 
 ### 数据类型 × 序列化器 强绑定对照表
 
@@ -122,9 +133,6 @@ PulseMQ 采用**强类型绑定**（方案 A）：数据类型与序列化器一
 | 返回类型 | `msgpack` | `json` | `pyarrow` | `str` | `bytes` | record_count |
 |----------|:---------:|:------:|:---------:|:-----:|:-------:|:------------:|
 | `pd.DataFrame`（N 行） | ✅ | ✅ | ✅ | ❌ | ❌ | N（行数）|
-| `list[pd.DataFrame]` | ✅ | ✅ | ✅ | ❌ | ❌ | **行数和** |
-| `list[dict]`（N 个） | ✅ | ✅ | ✅ | ❌ | ❌ | N |
-| `list[str]`（N 个） | ✅ | ✅ | ❌ | ❌ | ❌ | N |
 | `dict` | ✅ | ✅ | ✅ | ❌ | ❌ | 1 |
 | `str` | ❌ | ❌ | ❌ | **✅** | ❌ | 1 |
 | `bytes` | ❌ | ❌ | ❌ | ❌ | **✅** | 1 |
@@ -132,24 +140,18 @@ PulseMQ 采用**强类型绑定**（方案 A）：数据类型与序列化器一
 **绑定规则**：
 - `str` 数据 → **只能用 `str` 序列化器**（纯 UTF-8，最快）
 - `bytes` 数据 → **只能用 `bytes` 序列化器**（零拷贝透传，最快）
-- `pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `dict` → 可选 `msgpack` / `json` / `pyarrow`
-- `list[str]` → 可选 `msgpack` / `json`
+- `pd.DataFrame` / `dict` → 可选 `msgpack` / `json` / `pyarrow`
 
 ```python
 return "hello"                              # str            → 1 record,  用 str
 return b"\x00\x01"                          # bytes          → 1 record,  用 bytes
 return {"a": 1}                             # dict           → 1 record,  用 msgpack/json/pyarrow
-return [{"a": 1}, {"a": 2}]                 # list[dict]     → 2 records, 用 msgpack/json/pyarrow
-return ["a", "b", "c"]                      # list[str]      → 3 records, 用 msgpack/json
 return pd.DataFrame({"a": [1, 2]})          # DataFrame      → 2 records, 用 msgpack/json/pyarrow
-return [df1, df2]                           # list[DataFrame]→ 行数和,    用 msgpack/json/pyarrow
 ```
 
-> **record_count 推断**：DataFrame/Table 按行数；`list[dict]`/`list[str]` 按 list 长度；`list[DataFrame]` 按**各 DataFrame 行数之和**；`dict`/`str`/`bytes` 按 1。单帧上限 **1,000,000** 条。
+> **record_count 推断**：DataFrame 按行数；`dict`/`str`/`bytes` 按 1。单帧上限 **1,000,000** 条。
 >
-> **list 元素必须类型一致**：`list[dict]` 要求所有元素都是 dict，`list[str]` 要求都是 str。混合类型（如 `[{"a":1}, "hello"]`）会抛 `TypeError`。
->
-> **白名单外类型全部报错**：标量（int/float/bool）、`pa.Table`、`list[bytes]`、`list[int]`、`set`、`tuple` 等均不支持。
+> **白名单外类型全部报错**：标量（int/float/bool）、`pa.Table`、任何 `list`、`set`、`tuple` 等均不支持。
 
 ### 序列化格式（5 种）
 
@@ -175,15 +177,15 @@ async def raw():
 
 | 格式 | 后端 | 适用数据类型 | 特点 |
 |------|------|--------------|------|
-| `msgpack` | `msgspec.msgpack` | dict / list[dict] / list[str] / DataFrame / list[DataFrame] | 通用结构化，二进制紧凑 |
-| `json` | `msgspec.json` | 同 msgpack（不含 bytes） | 人类可读、跨语言 |
-| `pyarrow` | `pyarrow` IPC | dict / list[dict] / DataFrame / list[DataFrame] | 列存 IPC，分析场景（可选依赖）|
+| `msgpack` | `msgspec.msgpack` | dict / DataFrame | 通用结构化，二进制紧凑 |
+| `json` | `msgspec.json` | dict / DataFrame | 人类可读、跨语言 |
+| `pyarrow` | `pyarrow` IPC | dict / DataFrame | 列存 IPC，分析场景（可选依赖）|
 | `str` | UTF-8 | **仅 str** | 纯文本透传，最快 |
 | `bytes` | 透传 | **仅 bytes** | 二进制透传，最快 |
 
 > **`pyarrow` 为可选依赖**：未安装时该格式不注册，使用会抛 `KeyError`。其余 4 种为硬依赖，始终可用。
 >
-> **`pyarrow` 类型严格**：返回 `list[str]` 或标量时会抛 `TypeError`，提示改用 `msgpack`/`json`。
+> **`pyarrow` 类型严格**：返回标量或 list 时会抛 `TypeError`，提示改用受支持的数据类型。
 
 ### 压缩算法（4 种）
 
@@ -295,7 +297,7 @@ curl -N http://localhost:9090/api/v1/stats/stream
 
 - `msg_type`：`0x01` = DATA，`0x02` = PING
 - `flags`：`bit[0:2]` 序列化格式编码，`bit[3:4]` 压缩算法编码
-- `data_type`（v3 新增）：原始数据类型标记，让 sub 端还原 pub 端原始 Python 类型（DataFrame → DataFrame，而非 list[dict]）。取值：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
+- `data_type`（v3 新增）：原始数据类型标记，让 sub 端还原 pub 端原始 Python 类型（如 DataFrame）。取值：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=DataFrame, `0x03`=str, `0x04`=bytes
 - 单帧 `record_count` 上限 **1,000,000**
 
 > **v3 Breaking**：meta 帧从 6 字节扩展到 7 字节（新增 data_type 字节），record_count 位置从 `[2:6]` 后移到 `[3:7]`。v3 与 v2.x 不兼容（record_count 读取错位）。
@@ -318,7 +320,7 @@ python scripts/bench_burst.py
 python scripts/bench_pubsub_matrix.py
 ```
 
-覆盖 48 个合法组合，同时测试：
+覆盖所有合法组合，同时测试：
 - 纯编解码性能（序列化 + 压缩，不经过网络）
 - 端到端 pub→sub 性能（吞吐量、延迟 p50/p90/p99、压缩率）
 - 正确性验证（pub 端发送数据在 sub 端完整还原）
@@ -331,15 +333,15 @@ python scripts/bench_pubsub_matrix.py
 |------|-----------|-----------|---------|--------|
 | bytes+none | 14.6M | 29.9M | 0.07 | 1.00x |
 | msgpack+none | 5.6M | 9.3M | 0.18 | 1.00x |
-| msgpack+lz4+list_dict | 172K | 96K | 5.8 | 0.12x |
+| msgpack+lz4+dataframe | 172K | 96K | 5.8 | 0.12x |
 | msgpack+zstd+large_dict | 27K | 209K | 37.6 | 0.00x |
 
 **端到端 pub→sub**（经过 ZMQ 网络，单 subscriber，50 条消息/组合）：
 
 | 组合 | 记录吞吐/s | 延迟 p50 | 延迟 p99 |
 |------|-----------|---------|---------|
-| json+none+list_dict | 880,514 | 2.68ms | 3.51ms |
-| msgpack+none+list_dict | 825,900 | 2.74ms | 3.05ms |
+| json+none+dataframe | 880,514 | 2.68ms | 3.51ms |
+| msgpack+none+dataframe | 825,900 | 2.74ms | 3.05ms |
 | msgpack+none+dataframe | 135,096 | 17.8ms | 34.2ms |
 | pyarrow+none+dataframe | 86,663 | 27.6ms | 53.7ms |
 
@@ -347,27 +349,35 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v3.1.0
+
+⚠️ **Breaking Change**：收紧 producer 返回类型并新增手动发送端注入能力。
+
+- **移除 list payload 支持**：producer 回调不再支持 `list[pd.DataFrame]` / `list[dict]` / `list[str]`，白名单收缩为 `pd.DataFrame` / `dict` / `str` / `bytes`。任何 list 返回值都会抛 `TypeError`
+- **精简 `DataType` 协议标记**：移除 `LIST_DICT` / `LIST_STR` / `LIST_DATAFRAME`，当前取值为 `0x00`=UNKNOWN, `0x01`=dict, `0x02`=DataFrame, `0x03`=str, `0x04`=bytes
+- **新增 sender 注入模式**：`producer(..., inject_sender=True)` / `register_producer(..., inject_sender=True)` / `burst_producer(..., inject_sender=True)` 会向回调传入 `sender`，支持在回调内部 `await sender.send(...)` 手动发送，并可按次覆盖 `topic` / `serializer` / `compression`
+- **发送路径复用**：return 发送和 `sender.send()` 都走同一套白名单校验、序列化、压缩、缓存和流量统计逻辑
+- **脚本与测试同步**：benchmark、诊断脚本、e2e 矩阵更新为 4 种白名单数据形态；burst 场景使用 DataFrame 表达批量记录
+- **认证回调补齐**：补齐 transport 层 `AuthCallback` / `set_auth_callback()`，与 publisher 已公开的认证回调入口保持一致
+
 ### v3.0.0
 
 ⚠️ **Breaking Change**：meta 帧从 6 字节扩展到 7 字节，实现 pub→sub 全链路类型保真。**v3 与 v2.x 不兼容，pub/sub 两端必须同时升级。**
 
-- **🔴 修复类型变形（致命）**：此前 pub 端发送 `DataFrame` / `list[DataFrame]` 时，sub 端收到的类型被降级——msgpack/json 路径变成 `list[dict]`，pyarrow 路径变成 `pa.Table`，且 `dict` / `list[dict]` 经 pyarrow 也统一变成 `pa.Table`。实测 16 个合法组合中有 **8 个类型变形**。现在协议层记录原始数据类型，sub 端自动还原：
+- **🔴 修复类型变形（致命）**：此前 pub 端发送 `DataFrame` 时，sub 端收到的类型被降级——msgpack/json 路径变成 `list[dict]`，pyarrow 路径变成 `pa.Table`，且 `dict` 经 pyarrow 也统一变成 `pa.Table`。现在协议层记录原始数据类型，sub 端自动还原：
 
   | pub 端发送 | sub 端收到（v2.x） | sub 端收到（v3.0） |
   |---|---|---|
   | `DataFrame` | `list[dict]` / `Table` | **`DataFrame`** ✅ |
-  | `list[DataFrame]` | `list[dict]` / `Table` | **`list[DataFrame]`** ✅ |
   | `dict`（pyarrow）| `Table` | **`dict`** ✅ |
-  | `list[dict]`（pyarrow）| `Table` | **`list[dict]`** ✅ |
 
-- **meta 帧扩展（Breaking）**：新增 Byte 2 = `data_type`（原始数据类型标记），record_count 位置从 `[2:6]` 后移到 `[3:7]`。`DataType` 常量：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
+- **meta 帧扩展（Breaking）**：新增 Byte 2 = `data_type`（原始数据类型标记），record_count 位置从 `[2:6]` 后移到 `[3:7]`。`DataType` 常量：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=DataFrame, `0x03`=str, `0x04`=bytes
 - **类型还原机制**：pub 端 `_infer_data_type()` 推断原始类型写入 meta；sub 端 `decode()` 据此把反序列化结果（list[dict] / pa.Table）还原为原始 Python 类型。`PulseMessage` 新增 `data_type` 字段
 - **测试强化**：`assert_message_roundtrip` 从"两侧降级为 list[dict] 比较值"升级为"类型保真 + 值相等"双断言（DataFrame 用 `assert_frame_equal`）
-- **诊断脚本**：新增 `scripts/_diag_type_fidelity.py`，覆盖 16 个合法组合的类型+值保真验证
+- **诊断脚本**：新增 `scripts/_diag_type_fidelity.py`，覆盖合法组合的类型+值保真验证
 
 > **升级注意**：
 > - v3 与 v2.x **协议不兼容**，pub/sub 两端必须同时升级到 v3.0.0
-> - `list[DataFrame]` 因多个分片在序列化时展平，sub 端还原为 `[单个合并后的 DataFrame]`（行数据完全一致，仅丢失原分片个数信息）
 > - 用户代码无需改动（`PulseMessage.payload` 现在直接是原始类型，如 DataFrame 而非 list[dict]）
 
 ### v2.4.1
@@ -410,15 +420,14 @@ python scripts/bench_pubsub_matrix.py
 
 ⚠️ **Breaking Change**：数据类型收紧为白名单，序列化器改为强类型绑定。
 
-- **数据类型白名单**：producer 回调只接受 7 种类型——`pd.DataFrame` / `list[pd.DataFrame]` / `list[dict]` / `list[str]` / `dict` / `str` / `bytes`。其余（标量、`pa.Table`、`list[bytes]`/`list[int]`、混合 list、set/tuple 等）一律抛 `TypeError`
-- **序列化器强绑定**（方案 A）：`str` 数据只能用 `str` 序列化器，`bytes` 数据只能用 `bytes` 序列化器，结构化数据（DataFrame/dict/list）用 msgpack/json/pyarrow。配错会在发布时报错
-- **修复 `list[pd.DataFrame]` 的 record_count bug**：原按 list 长度（DataFrame 个数）计，现按各 DataFrame 行数之和（与 payload 展平后的实际记录数一致）
+- **数据类型白名单**：producer 回调只接受 4 种类型——`pd.DataFrame` / `dict` / `str` / `bytes`。其余（标量、`pa.Table`、任何 list、set/tuple 等）一律抛 `TypeError`
+- **序列化器强绑定**（方案 A）：`str` 数据只能用 `str` 序列化器，`bytes` 数据只能用 `bytes` 序列化器，结构化数据（DataFrame/dict）用 msgpack/json/pyarrow。配错会在发布时报错
 - **`bytes × json` 报错**：json 序列化器明确拒绝 bytes（避免 base64 编码后解码类型变形为 str 的语义不一致）
 - **缓存按记录数淘汰**：`TopicBuffer` 从"按帧数（deque maxlen）"改为"按累计记录数"淘汰，DataFrame 一批 N 条占 N 配额。监控显示 `N / 上限（满）` 格式
-- **pyarrow 序列化器严格化**：遇到不支持的类型（list[str]、标量等）抛 `TypeError`，而非静默退回 msgpack 导致编解码不一致
+- **pyarrow 序列化器严格化**：遇到不支持的类型（list、标量等）抛 `TypeError`，而非静默退回 msgpack 导致编解码不一致
 - **监控 UI 文案精确化**：消息量/流量卡片副标题标注"近60秒估算"，tooltip 说明算法口径；主题卡片去掉 record_count_current，缓存显示 `N/M(满)`
 - **文档**：新增「数据类型 × 序列化器 强绑定对照表」；更新序列化器/压缩算法表格
-- **测试**：新增 `tests/test_data_types.py`（59 个专项用例）；e2e 矩阵扩展至 7 种数据形态；修复 burst 测试跨分钟 flaky
+- **测试**：新增 `tests/test_data_types.py`；e2e 矩阵覆盖 4 种白名单数据形态；修复 burst 测试跨分钟 flaky
 
 ### v2.2.2
 

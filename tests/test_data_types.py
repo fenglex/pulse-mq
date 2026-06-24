@@ -1,12 +1,11 @@
 """数据类型白名单与序列化器强绑定的专项测试。
 
 覆盖：
-1. 7 种白名单类型的 record_count 推断正确性
+1. 4 种白名单类型的 record_count 推断正确性
 2. 白名单外类型全部抛 TypeError
-3. list 元素类型一致性检查（混合 list 报错）
-4. 数据类型 ↔ 序列化器强绑定（str→str, bytes→bytes 等）
-5. bytes × json 报错
-6. 合法组合的端到端编解码往返
+3. 数据类型 ↔ 序列化器强绑定（str→str, bytes→bytes 等）
+4. bytes × json 报错
+5. 合法组合的端到端编解码往返
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ from pulsemq.protocol.serialization import get as get_serializer
 
 
 # ---------------------------------------------------------------------------
-# record_count 推断：7 种白名单
+# record_count 推断：4 种白名单
 # ---------------------------------------------------------------------------
 
 
@@ -29,26 +28,17 @@ class TestRecordCountWhitelist:
     """白名单类型的 record_count 推断。"""
 
     @pytest.mark.parametrize("data,expected", [
-        (pd.DataFrame({"a": [1, 2, 3]}), 3),                          # DataFrame → 行数
-        ([pd.DataFrame({"a": [1, 2]}), pd.DataFrame({"a": [3, 4, 5]})], 5),  # list[DataFrame] → 行数和
-        ([{"a": 1}, {"a": 2}], 2),                                    # list[dict] → len
-        (["x", "y", "z"], 3),                                         # list[str] → len
-        ({"a": 1}, 1),                                                # dict → 1
-        ("hello", 1),                                                 # str → 1
-        (b"\x00\x01", 1),                                             # bytes → 1
+        (pd.DataFrame({"a": [1, 2, 3]}), 3),  # DataFrame → 行数
+        ({"a": 1}, 1),                        # dict → 1
+        ("hello", 1),                         # str → 1
+        (b"\x00\x01", 1),                     # bytes → 1
     ])
     def test_whitelist_record_count(self, data, expected):
         assert PulsePublisher._infer_record_count(data) == expected
 
-    def test_list_dataframe_row_sum(self):
-        """list[DataFrame] 的 record_count = 各 DataFrame 行数之和（修复原 bug）。"""
-        dfs = [pd.DataFrame({"a": [1, 2]}), pd.DataFrame({"a": [3, 4, 5]})]
-        # 旧逻辑返回 len(list)=2（错误）；新逻辑返回行数和=5
-        assert PulsePublisher._infer_record_count(dfs) == 5
-
     def test_empty_list_rejected(self):
         """空 list 不被支持。"""
-        with pytest.raises(TypeError, match="空 list"):
+        with pytest.raises(TypeError, match="不支持的返回类型: list"):
             PulsePublisher._infer_record_count([])
 
 
@@ -66,6 +56,9 @@ class TestNonWhitelistRejected:
         (True, "bool"),
         (None, "NoneType"),
         (pa.Table.from_pandas(pd.DataFrame({"a": [1]})), "Table"),
+        ([pd.DataFrame({"a": [1]})], "list[DataFrame]"),
+        ([{"a": 1}, {"a": 2}], "list[dict]"),
+        (["x", "y", "z"], "list[str]"),
         ([1, 2, 3], "list[int]"),
         ([b"x", b"y"], "list[bytes]"),
         ([{"a": 1}, "hello"], "list[混合]"),       # 混合元素
@@ -79,7 +72,7 @@ class TestNonWhitelistRejected:
 
     def test_mixed_list_rejected(self):
         """list 元素类型不一致（混合）必须报错。"""
-        with pytest.raises(TypeError, match="list 元素类型"):
+        with pytest.raises(TypeError, match="不支持的返回类型: list"):
             PulsePublisher._infer_record_count([{"a": 1}, "hello", {"b": 2}])
 
 
@@ -100,14 +93,8 @@ class TestSerializerBinding:
         ({"a": 1}, "msgpack"),
         ({"a": 1}, "json"),
         ({"a": 1}, "pyarrow"),
-        ([{"a": 1}], "msgpack"),
-        ([{"a": 1}], "pyarrow"),
         (pd.DataFrame({"a": [1]}), "msgpack"),
         (pd.DataFrame({"a": [1]}), "pyarrow"),
-        ([pd.DataFrame({"a": [1]})], "pyarrow"),
-        # list[str] → msgpack/json（不含 pyarrow）
-        (["a", "b"], "msgpack"),
-        (["a", "b"], "json"),
     ])
     def test_valid_binding_passes(self, data, ser):
         """合法的类型↔序列化器组合不应抛错。"""
@@ -127,13 +114,12 @@ class TestSerializerBinding:
         # 结构化数据不允许 str/bytes
         ({"a": 1}, "str"),
         ({"a": 1}, "bytes"),
-        ([{"a": 1}], "str"),
         (pd.DataFrame({"a": [1]}), "str"),
         (pd.DataFrame({"a": [1]}), "bytes"),
-        # list[str] 不允许 pyarrow/str/bytes
-        (["a", "b"], "pyarrow"),
-        (["a", "b"], "str"),
-        (["a", "b"], "bytes"),
+        # list 不再支持任何序列化器
+        ([{"a": 1}], "msgpack"),
+        (["a"], "json"),
+        ([pd.DataFrame({"a": [1]})], "pyarrow"),
     ])
     def test_invalid_binding_raises(self, data, ser):
         """非法的类型↔序列化器组合必须抛 TypeError。"""
@@ -170,12 +156,9 @@ class TestRoundtrip:
     @pytest.mark.parametrize("data,ser", [
         (pd.DataFrame({"a": [1, 2, 3]}), "pyarrow"),
         (pd.DataFrame({"a": [1, 2, 3]}), "msgpack"),
-        ([{"a": 1}, {"a": 2}], "msgpack"),
-        ([{"a": 1}, {"a": 2}], "pyarrow"),
         ({"a": 1}, "msgpack"),
         ("hello", "str"),
         (b"\x00\x01", "bytes"),
-        (["a", "b", "c"], "msgpack"),
     ])
     def test_roundtrip(self, data, ser):
         """完整流程：_infer_record_count + _validate_serializer + encode + decode。"""

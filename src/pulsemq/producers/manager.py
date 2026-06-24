@@ -15,8 +15,8 @@ from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
-# producer 回调类型：async 函数，返回任意数据
-ProducerCallback = Callable[[], Awaitable[Any]]
+# producer 回调类型：async 函数，返回任意数据；inject_sender=True 时接收 sender 参数
+ProducerCallback = Callable[..., Awaitable[Any]]
 
 
 @dataclass
@@ -29,6 +29,7 @@ class ProducerSpec:
     cache_size: int = 100_000       # 环形缓存大小
     serializer: str = "msgpack"     # 序列化格式
     compression: str = "none"       # 压缩格式
+    inject_sender: bool = False      # 是否向回调注入手动发送端
 
 
 class ProducerManager:
@@ -47,6 +48,7 @@ class ProducerManager:
         cache_size: int = 100_000,
         serializer: str = "msgpack",
         compression: str = "none",
+        inject_sender: bool = False,
     ) -> None:
         """注册一个普通 producer。"""
         spec = ProducerSpec(
@@ -56,6 +58,7 @@ class ProducerManager:
             cache_size=cache_size,
             serializer=serializer,
             compression=compression,
+            inject_sender=inject_sender,
         )
         self._specs[name] = spec
         logger.info("Producer 注册: name=%s interval=%.1fs", name, interval)
@@ -67,6 +70,7 @@ class ProducerManager:
         cache_size: int = 100_000,
         serializer: str = "msgpack",
         compression: str = "none",
+        inject_sender: bool = False,
     ) -> None:
         """注册一个 burst producer：无间隔连续发送，用于极限性能测试。"""
         spec = ProducerSpec(
@@ -76,6 +80,7 @@ class ProducerManager:
             cache_size=cache_size,
             serializer=serializer,
             compression=compression,
+            inject_sender=inject_sender,
         )
         self._specs[name] = spec
         logger.info("Burst Producer 注册: name=%s", name)
@@ -84,18 +89,19 @@ class ProducerManager:
     def specs(self) -> dict[str, ProducerSpec]:
         return self._specs
 
-    async def start_all(self, on_message: Any) -> None:
+    async def start_all(self, on_message: Any, sender_factory: Any | None = None) -> None:
         """启动所有 producer 任务。
 
         Args:
             on_message: async callback(spec, data) 每次回调返回时调用。
+            sender_factory: callable(spec) -> sender，inject_sender=True 时使用。
         """
         self._running = True
         for name, spec in self._specs.items():
             if spec.interval == 0.0:
-                coro = self._run_burst_loop(spec, on_message)
+                coro = self._run_burst_loop(spec, on_message, sender_factory)
             else:
-                coro = self._run_loop(spec, on_message)
+                coro = self._run_loop(spec, on_message, sender_factory)
             task = asyncio.create_task(coro, name=f"producer-{name}")
             self._tasks[name] = task
             logger.info("Producer 启动: %s (burst=%s)", name, spec.interval == 0.0)
@@ -111,7 +117,7 @@ class ProducerManager:
         self._tasks.clear()
         logger.info("所有 Producer 已停止")
 
-    async def _run_loop(self, spec: ProducerSpec, on_message: Any) -> None:
+    async def _run_loop(self, spec: ProducerSpec, on_message: Any, sender_factory: Any | None) -> None:
         """固定延迟调度：执行 → sleep(interval - elapsed) → 执行 → ...
 
         - elapsed < interval: sleep 剩余时间
@@ -121,7 +127,12 @@ class ProducerManager:
         while self._running:
             start = time.monotonic()
             try:
-                data = await spec.callback()
+                if spec.inject_sender:
+                    if sender_factory is None:
+                        raise RuntimeError("inject_sender=True 需要 sender_factory")
+                    data = await spec.callback(sender_factory(spec))
+                else:
+                    data = await spec.callback()
                 if data is not None:
                     await on_message(spec, data)
             except asyncio.CancelledError:
@@ -137,7 +148,7 @@ class ProducerManager:
                 # 不积压，让出控制权
                 await asyncio.sleep(0)
 
-    async def _run_burst_loop(self, spec: ProducerSpec, on_message: Any) -> None:
+    async def _run_burst_loop(self, spec: ProducerSpec, on_message: Any, sender_factory: Any | None) -> None:
         """Burst 模式：无间隔连续发送，直到 stop 或回调返回 None。
 
         - 每次循环直接调用回调，无 sleep
@@ -145,7 +156,12 @@ class ProducerManager:
         """
         while self._running:
             try:
-                data = await spec.callback()
+                if spec.inject_sender:
+                    if sender_factory is None:
+                        raise RuntimeError("inject_sender=True 需要 sender_factory")
+                    data = await spec.callback(sender_factory(spec))
+                else:
+                    data = await spec.callback()
                 if data is None:
                     break  # 回调主动结束
                 await on_message(spec, data)

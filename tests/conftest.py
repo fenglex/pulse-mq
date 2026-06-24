@@ -37,14 +37,11 @@ from pulsemq.subscriber import PulseSubscriber
 SERIALIZERS: list[str] = ["msgpack", "json", "str", "bytes", "pyarrow"]
 COMPRESSIONS: list[str] = ["none", "snappy", "lz4", "zstd"]
 
-# 数据形态: 覆盖 7 种白名单类型
+# 数据形态: 覆盖 4 种白名单类型
 DATA_SHAPES: list[tuple[str, str]] = [
     "scalar_str",      # str
     "scalar_bytes",    # bytes
-    "list_dict",       # list[dict]
-    "list_str",        # list[str]
     "dataframe",       # pd.DataFrame
-    "list_dataframe",  # list[pd.DataFrame]
     "large_dict",      # dict 1.1MB
 ]
 
@@ -140,10 +137,6 @@ def make_value(shape: str, seq: int = 0) -> Any:
         return f"hello-{seq}"
     if shape == "scalar_bytes":
         return seq.to_bytes(4, "big") + b"\x00\x01\x02\x03"
-    if shape == "list_dict":
-        return [{"seq": seq * 10 + i, "v": float(i)} for i in range(3)]
-    if shape == "list_str":
-        return [f"msg-{seq}-{i}" for i in range(3)]
     if shape == "dataframe":
         return pd.DataFrame(
             {
@@ -152,12 +145,6 @@ def make_value(shape: str, seq: int = 0) -> Any:
                 "volume": [100 + i for i in range(3)],
             }
         )
-    if shape == "list_dataframe":
-        # 两个 DataFrame：2 行 + 3 行 = 行数和 5
-        return [
-            pd.DataFrame({"seq": [seq * 10, seq * 10 + 1], "v": [1.0, 2.0]}),
-            pd.DataFrame({"seq": [seq * 10 + 2, seq * 10 + 3, seq * 10 + 4], "v": [3.0, 4.0, 5.0]}),
-        ]
     if shape == "large_dict":
         return {"seq": seq, "payload": "x" * 1_100_000}
     raise ValueError(f"未知 data shape: {shape}")
@@ -167,15 +154,6 @@ def expected_record_count(value: Any) -> int:
     """与 publisher._infer_record_count 保持一致的 record_count 推断。"""
     if isinstance(value, pd.DataFrame):
         return len(value)
-    if isinstance(value, list):
-        # list[DataFrame] 求和；list[dict] / list[str] / list[bytes] 取 len
-        total = 0
-        for item in value:
-            if isinstance(item, pd.DataFrame):
-                total += len(item)
-            else:
-                total += 1
-        return total
     return 1
 
 
@@ -185,8 +163,7 @@ def is_compatible(ser: str, shape: str) -> bool:
     收紧后的规则：
     - str 数据（scalar_str）只允许 'str' 序列化器
     - bytes 数据（scalar_bytes）只允许 'bytes' 序列化器
-    - 结构化数据（dataframe/list_dict/large_dict）允许 msgpack/json/pyarrow
-    - list[str] 允许 msgpack/json（pyarrow 不支持）
+    - 结构化数据（dataframe/large_dict）允许 msgpack/json/pyarrow
     """
     if shape == "scalar_str":
         # str 数据强制用 str 序列化器
@@ -194,11 +171,9 @@ def is_compatible(ser: str, shape: str) -> bool:
     if shape == "scalar_bytes":
         # bytes 数据强制用 bytes 序列化器
         return ser == "bytes"
-    # 结构化数据（dataframe / list_dict / large_dict / list_str）
-    if shape in ("dataframe", "list_dict", "large_dict", "list_dataframe"):
+    # 结构化数据（dataframe / large_dict）
+    if shape in ("dataframe", "large_dict"):
         return ser in ("msgpack", "json", "pyarrow")
-    if shape == "list_str":
-        return ser in ("msgpack", "json")
     return False
 
 
@@ -210,20 +185,11 @@ def is_compatible(ser: str, shape: str) -> bool:
 def _type_tag(obj: Any) -> str:
     """返回用于类型保真比较的简短类型标签。
 
-    统一处理 DataFrame / list[DataFrame] / list[dict] / list[str] 等，
-    让 pub 端原始类型与 sub 端还原后的类型可比。
+    统一处理 DataFrame 等类型，让 pub 端原始类型与 sub 端还原后的类型可比。
     """
     import pandas as _pd
     if isinstance(obj, _pd.DataFrame):
         return "DataFrame"
-    if isinstance(obj, list) and obj:
-        if isinstance(obj[0], _pd.DataFrame):
-            return "list[DataFrame]"
-        if isinstance(obj[0], dict):
-            return "list[dict]"
-        if isinstance(obj[0], str):
-            return "list[str]"
-        return f"list[{type(obj[0]).__name__}]"
     return type(obj).__name__
 
 
@@ -267,21 +233,8 @@ def assert_message_roundtrip(
             got.reset_index(drop=True), expected.reset_index(drop=True),
             check_dtype=False, check_like=True,  # 忽略列顺序与 dtype 差异
         )
-    elif isinstance(expected, list) and expected and isinstance(expected[0], pd.DataFrame):
-        # list[DataFrame]：pub 端多个分片展平后还原为单个 DataFrame 包在 list 里，
-        # 把 expected 也合并为单个 DataFrame 后比较。
-        merged_expected = pd.concat(
-            [df.reset_index(drop=True) for df in expected], ignore_index=True
-        )
-        assert isinstance(got, list) and len(got) == 1 and isinstance(got[0], pd.DataFrame), (
-            f"list[DataFrame] 应还原为 [DataFrame]，实际 {got_tag}"
-        )
-        pd.testing.assert_frame_equal(
-            got[0].reset_index(drop=True), merged_expected,
-            check_dtype=False, check_like=True,
-        )
     else:
-        # dict / list[dict] / list[str] / str / bytes：直接 ==（pyarrow 路径已还原）
+        # dict / str / bytes：直接 ==（pyarrow 路径已还原）
         assert got == expected, (
             f"payload 不一致: got {str(got)[:120]}, want {str(expected)[:120]}"
         )

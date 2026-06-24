@@ -13,6 +13,7 @@ import asyncio
 import time
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from pulsemq.subscriber import PulseSubscriber
@@ -196,7 +197,7 @@ class TestSubscriberBurst:
             counter["n"] += 1
             if counter["n"] > total_batches:
                 return None
-            return [{"i": counter["n"] * 100 + j} for j in range(20)]
+            return pd.DataFrame({"i": [counter["n"] * 100 + j for j in range(20)]})
 
         pub._producer_mgr.register_burst(
             callback=_burst_factory, name=topic,

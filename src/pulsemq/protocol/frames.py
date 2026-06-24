@@ -10,7 +10,7 @@ Frame 3: timestamp (8 bytes, big-endian int64, 纳秒)
 Frame 4: payload (序列化+压缩后的 bytes)
 
 v3 Breaking Change：meta 帧从 6 字节扩展到 7 字节，新增 Byte 2 = data_type，
-让 sub 端能还原 pub 端的原始 Python 类型（DataFrame 不再降级为 list[dict]）。
+让 sub 端能还原 pub 端的原始 Python 类型（如 DataFrame）。
 """
 
 from __future__ import annotations
@@ -130,12 +130,11 @@ def _restore_type(payload: Any, data_type: int) -> Any:
     - pub 端 _prepare_payload 把 DataFrame 转 list[dict]（msgpack/json 路径）
     - pyarrow 反序列化统一返回 pa.Table（pyarrow 路径）
 
-    据此标记把 list[dict] / pa.Table 还原为 DataFrame / dict / list[dict]。
-    STR / BYTES / UNKNOWN / LIST_STR：原样返回（本身不变形）。
+    据此标记把 list[dict] / pa.Table 还原为 DataFrame / dict。
+    STR / BYTES / UNKNOWN：原样返回（本身不变形）。
     """
     # 无需还原的类型（序列化器天然保真）
-    if data_type in (DataType.STR, DataType.BYTES, DataType.UNKNOWN,
-                     DataType.LIST_STR):
+    if data_type in (DataType.STR, DataType.BYTES, DataType.UNKNOWN):
         return payload
 
     try:
@@ -158,24 +157,10 @@ def _restore_type(payload: Any, data_type: int) -> Any:
             return pd.DataFrame(rows)
         return payload  # pandas 缺失：退回原样
 
-    if data_type == DataType.LIST_DATAFRAME:
-        # 注意：多个 DataFrame 经 _prepare_payload 展平为一个 list[dict]，
-        # 无法无损拆回原来的分片边界。还原为单个 DataFrame 包在 list 里
-        # （行数据完全一致，语义等价，仅丢失原分片个数信息）。
-        if pd is not None and rows is not None:
-            return [pd.DataFrame(rows)]
-        return [payload] if not isinstance(payload, list) else payload
-
     if data_type == DataType.DICT:
         # pyarrow 单 dict 路径：Table(1行) → dict
         if rows is not None:
             return rows[0] if rows else {}
-        return payload
-
-    if data_type == DataType.LIST_DICT:
-        # pyarrow 路径：Table → list[dict]
-        if rows is not None and hasattr(payload, "to_pylist"):
-            return rows
         return payload
 
     return payload

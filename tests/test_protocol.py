@@ -20,8 +20,8 @@ class TestDataType:
 
     def test_constants(self):
         assert DataType.UNKNOWN == 0x00
-        assert DataType.DATAFRAME == 0x04
-        assert DataType.LIST_DATAFRAME == 0x05
+        assert DataType.DATAFRAME == 0x02
+        assert DataType.BYTES == 0x04
 
     def test_data_type_stored_in_meta(self):
         """encode 应把 data_type 写入 meta[2]，decode 应读出。"""
@@ -41,8 +41,7 @@ class TestDataType:
         assert msg.data_type == DataType.UNKNOWN
 
     @pytest.mark.parametrize("data_type", [
-        DataType.DICT, DataType.LIST_DICT, DataType.DATAFRAME,
-        DataType.LIST_DATAFRAME, DataType.STR, DataType.BYTES,
+        DataType.DICT, DataType.DATAFRAME, DataType.STR, DataType.BYTES,
     ])
     def test_data_type_roundtrip(self, data_type):
         """各种 data_type 值都能无损往返。"""

@@ -40,7 +40,7 @@ from pulsemq.subscriber import PulseSubscriber
 
 SERIALIZERS = ["msgpack", "json", "str", "bytes", "pyarrow"]
 COMPRESSIONS = ["none", "snappy", "lz4", "zstd"]
-DATA_SHAPES = ["scalar_str", "scalar_bytes", "list_dict", "dataframe", "large_dict"]
+DATA_SHAPES = ["scalar_str", "scalar_bytes", "dataframe", "large_dict"]
 
 # 每个 topic 发送多少条消息后停止
 MESSAGES_PER_TOPIC = 50
@@ -83,9 +83,6 @@ def make_value(shape: str, seq: int = 0) -> Any:
         return f"seq-{seq}-{_RANDOM_STR}"
     if shape == "scalar_bytes":
         return seq.to_bytes(4, "big") + os.urandom(PAYLOAD_BYTES)
-    if shape == "list_dict":
-        return [{"seq": seq * RECORDS_PER_MSG + i, "v": float(i), "d": _RANDOM_STR}
-                for i in range(RECORDS_PER_MSG)]
     if shape == "dataframe":
         return pd.DataFrame({
             "seq": [seq * RECORDS_PER_MSG + i for i in range(RECORDS_PER_MSG)],
@@ -100,8 +97,6 @@ def make_value(shape: str, seq: int = 0) -> Any:
 
 def infer_record_count(data: Any) -> int:
     """推断记录数（与 publisher._infer_record_count 保持一致）。"""
-    if isinstance(data, list):
-        return len(data)
     if hasattr(data, "__len__") and hasattr(data, "columns"):
         return len(data)
     return 1
@@ -116,14 +111,6 @@ def prepare_payload(data: Any) -> Any:
         import pandas as pd
         if isinstance(data, pd.DataFrame):
             return data.to_dict(orient="records")
-        if isinstance(data, list):
-            result = []
-            for item in data:
-                if isinstance(item, pd.DataFrame):
-                    result.extend(item.to_dict(orient="records"))
-                else:
-                    result.append(item)
-            return result
     except ImportError:
         pass
     return data
@@ -301,7 +288,7 @@ async def bench_one(
                 pass
         result.raw_bytes_total = total_raw
         result.records_sent = result.messages_sent * (
-            RECORDS_PER_MSG if shape in ("list_dict", "dataframe") else 1
+            RECORDS_PER_MSG if shape == "dataframe" else 1
         )
 
         # 正确性验证：对比第一条消息
@@ -347,14 +334,7 @@ def _assert_payload_match(
                 f"行数不匹配: {len(got_records)} != {len(expected_records)}"
             )
         else:
-            # msgpack/json 路径下 payload 是 list[dict]
-            expected_records = expected.to_dict(orient="records")
-            assert isinstance(got, list), f"期望 list，得到 {type(got)}"
-    elif shape == "list_dict":
-        assert isinstance(msg.payload, list), f"期望 list，得到 {type(msg.payload)}"
-        assert len(msg.payload) == RECORDS_PER_MSG, (
-            f"记录数不匹配: {len(msg.payload)} != {RECORDS_PER_MSG}"
-        )
+            raise AssertionError(f"期望 DataFrame 或 Table，得到 {type(got)}")
     elif shape == "scalar_str":
         assert isinstance(msg.payload, str), f"期望 str，得到 {type(msg.payload)}"
         assert msg.payload.startswith("seq-1-"), f"payload 前缀不对: {msg.payload[:20]}"
@@ -562,7 +542,7 @@ async def run_all() -> None:
     print(f"  数据形态:   {', '.join(DATA_SHAPES)}")
     print(f"  合法组合:   {total} 个")
     print(f"  每组合消息数: {MESSAGES_PER_TOPIC}")
-    print(f"  批量记录数:   {RECORDS_PER_MSG} (list_dict / dataframe)")
+    print(f"  批量记录数:   {RECORDS_PER_MSG} (dataframe)")
     print("=" * 80)
 
     # 2. 纯编解码 benchmark（快速，不走网络）

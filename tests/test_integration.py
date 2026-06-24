@@ -94,8 +94,8 @@ class TestPublisherSubscriber:
             pass
         await sub.close()
 
-    async def test_batch_data(self, ports, tmp_db) -> None:
-        """批量数据：list[str]。"""
+    async def test_injected_sender_manual_send(self, ports, tmp_db) -> None:
+        """注入 sender：producer 内部手动发送，可覆盖 topic。"""
         port, aport = ports
         pub = PulsePublisher(
             config=PublisherConfig(
@@ -105,9 +105,61 @@ class TestPublisherSubscriber:
             )
         )
 
+        async def producer(sender):
+            await sender.send({"msg": "default"})
+            await sender.send({"msg": "override"}, topic="manual_other")
+
+        pub.register_producer(
+            producer,
+            name="manual_default",
+            interval=0.1,
+            inject_sender=True,
+        )
+
+        pub_task = asyncio.create_task(pub._run())
+        await asyncio.sleep(0.5)
+
+        sub = PulseSubscriber(f"tcp://127.0.0.1:{port}")
+        await sub.connect()
+
+        received = {}
+        async for msg in sub.subscribe("manual_default", "manual_other"):
+            received[msg.topic] = msg.payload
+            if set(received) == {"manual_default", "manual_other"}:
+                break
+
+        assert received == {
+            "manual_default": {"msg": "default"},
+            "manual_other": {"msg": "override"},
+        }
+
+        pub._running = False
+        await asyncio.sleep(0.3)
+        pub_task.cancel()
+        try:
+            await pub_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await sub.close()
+
+    async def test_batch_data(self, ports, tmp_db) -> None:
+        """批量数据：DataFrame 多行。"""
+        import pandas as pd
+
+        port, aport = ports
+        pub = PulsePublisher(
+            config=PublisherConfig(
+                bind=f"tcp://127.0.0.1:{port}",
+                admin_bind=f"127.0.0.1:{aport}",
+                stats_db=tmp_db,
+            )
+        )
+
+        expected = pd.DataFrame({"msg": ["a", "b", "c"]})
+
         @pub.producer(name="batch_topic", interval=0.3)
         async def producer():
-            return ["a", "b", "c"]
+            return expected
 
         pub_task = asyncio.create_task(pub._run())
         await asyncio.sleep(0.5)
@@ -117,7 +169,7 @@ class TestPublisherSubscriber:
 
         async for msg in sub.subscribe("batch_topic"):
             assert msg.record_count == 3
-            assert msg.payload == ["a", "b", "c"]
+            pd.testing.assert_frame_equal(msg.payload, expected)
             break
 
         pub._running = False

@@ -1,7 +1,7 @@
 """端到端验证脚本：启动真实 pub 服务 + sub 端实际收消息。
 
 复现并验证修复效果：
-- pub 端开启 PLAIN 认证 + 一个 list[dict] producer（0.2s/条）
+- pub 端开启 PLAIN 认证 + 一个 dict producer（0.2s/条）
 - sub 端用 username/password 连接、订阅、打印收到的每条消息
 - 运行 5 秒后统计 sub 收到的条数，断言 > 0
 
@@ -49,7 +49,7 @@ PRODUCER_INTERVAL = 0.2
 
 
 async def _run_pub(stop_event: asyncio.Event) -> None:
-    """启动 publisher，每 0.2s 推一条 list[dict]。"""
+    """启动 publisher，每 0.2s 推一条 dict。"""}ាល = functions.Edit
     pub = PulsePublisher(
         config=PublisherConfig(
             bind=PUB_BIND,
@@ -62,7 +62,7 @@ async def _run_pub(stop_event: asyncio.Event) -> None:
 
     async def _factory():
         counter["n"] += 1
-        return [{"seq": counter["n"], "msg": f"hello-{counter['n']}"}]
+        return {"seq": counter["n"], "msg": f"hello-{counter['n']}"}
 
     pub.register_producer(fn=_factory, name=TOPIC, interval=PRODUCER_INTERVAL)
     logger.info("Publisher 启动: bind=%s admin=%s", PUB_BIND, ADMIN_BIND)

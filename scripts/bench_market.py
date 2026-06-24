@@ -19,6 +19,8 @@ import sys
 import time
 import statistics
 
+import pandas as pd
+
 # 确保能 import pulsemq
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -52,9 +54,9 @@ def _tick_price(base: float) -> float:
     return round(base * (1 + random.gauss(0, 0.005)), 3)
 
 
-def _gen_sh_snapshot() -> list[dict]:
+def _gen_sh_snapshot() -> pd.DataFrame:
     """沪市快照：50 只股票，每只一条。"""
-    return [
+    return pd.DataFrame([
         {
             "code": code,
             "price": _tick_price(_get_base(code)),
@@ -65,12 +67,12 @@ def _gen_sh_snapshot() -> list[dict]:
             "ts": time.time_ns(),
         }
         for code in SH_CODES
-    ]
+    ])
 
 
-def _gen_sz_snapshot() -> list[dict]:
+def _gen_sz_snapshot() -> pd.DataFrame:
     """深市快照：50 只股票。"""
-    return [
+    return pd.DataFrame([
         {
             "code": code,
             "price": _tick_price(_get_base(code)),
@@ -81,12 +83,12 @@ def _gen_sz_snapshot() -> list[dict]:
             "ts": time.time_ns(),
         }
         for code in SZ_CODES
-    ]
+    ])
 
 
-def _gen_futures_tick() -> list[dict]:
+def _gen_futures_tick() -> pd.DataFrame:
     """期货逐笔：每批 20 条。"""
-    return [
+    return pd.DataFrame([
         {
             "symbol": random.choice(FUTURES),
             "price": round(random.uniform(3000, 4500), 2),
@@ -95,7 +97,7 @@ def _gen_futures_tick() -> list[dict]:
             "ts": time.time_ns(),
         }
         for _ in range(20)
-    ]
+    ])
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """诊断：pub→sub 全链路类型保真度排查。
 
-逐一测试 7 种白名单类型 × 兼容序列化器，对比 pub 端发送类型 vs sub 端接收类型，
+逐一测试 4 种白名单类型 × 兼容序列化器，对比 pub 端发送类型 vs sub 端接收类型，
 找出所有"类型变形"的组合。
 
 运行：
@@ -28,17 +28,12 @@ ADMIN_BIND = "127.0.0.1:19093"
 
 
 def make_samples():
-    """构造 7 种类型的样本 + 兼容的序列化器。"""
+    """构造 4 种类型的样本 + 兼容的序列化器。"""
     return [
         ("str", "hello-world", ["str"]),
         ("bytes", b"\x00\x01\x02\x03", ["bytes"]),
         ("dict", {"a": 1, "b": 2.5}, ["msgpack", "json", "pyarrow"]),
-        ("list[dict]", [{"a": 1}, {"a": 2}], ["msgpack", "json", "pyarrow"]),
-        ("list[str]", ["x", "y", "z"], ["msgpack", "json"]),
         ("DataFrame", pd.DataFrame({"a": [1, 2], "b": [1.5, 2.5]}),
-         ["msgpack", "json", "pyarrow"]),
-        ("list[DataFrame]",
-         [pd.DataFrame({"a": [1, 2]}), pd.DataFrame({"a": [3, 4, 5]})],
          ["msgpack", "json", "pyarrow"]),
     ]
 
@@ -94,18 +89,6 @@ async def test_one(shape: str, sample, serializer: str, port: int) -> dict:
                 pd_test.testing.assert_frame_equal(
                     payload.reset_index(drop=True),
                     sample.reset_index(drop=True),
-                    check_dtype=False, check_like=True,
-                )
-                result["equal"] = True
-            elif isinstance(sample, list) and sample and isinstance(sample[0], pd.DataFrame):
-                # list[DataFrame]：多个分片展平后还原为 [单个DataFrame]
-                import pandas as pd_test
-                merged = pd_test.concat(
-                    [df.reset_index(drop=True) for df in sample], ignore_index=True
-                )
-                assert isinstance(payload, list) and len(payload) == 1
-                pd_test.testing.assert_frame_equal(
-                    payload[0].reset_index(drop=True), merged,
                     check_dtype=False, check_like=True,
                 )
                 result["equal"] = True

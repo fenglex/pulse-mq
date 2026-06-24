@@ -15,6 +15,8 @@ import os
 import sys
 import time
 
+import pandas as pd
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pulsemq.publisher import PulsePublisher
@@ -99,11 +101,14 @@ async def run_bench() -> None:
         if sent_batches >= total_batches:
             return None
         sent_batches += 1
-        # 返回一批消息（list[dict]）
-        return [
-            {"seq": sent_batches * BATCH_SIZE + i, "data": _RANDOM_DATA, "ts": time.time_ns()}
-            for i in range(BATCH_SIZE)
-        ]
+        # 返回一批消息（DataFrame）
+        return pd.DataFrame(
+            {
+                "seq": [sent_batches * BATCH_SIZE + i for i in range(BATCH_SIZE)],
+                "data": [_RANDOM_DATA for _ in range(BATCH_SIZE)],
+                "ts": [time.time_ns() for _ in range(BATCH_SIZE)],
+            }
+        )
 
     # ---- 创建 Publisher ----
     pub = PulsePublisher(config=PublisherConfig(
