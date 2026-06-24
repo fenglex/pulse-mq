@@ -353,6 +353,19 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v3.1.1
+
+🔧 **bugfix**：修复心跳功能端到端不可用 + 认证成功路径挂死 + setup 失败资源泄漏。
+
+- **🔴 修复心跳帧解码崩溃（致命）**：`encode_heartbeat()` 漏写 v3 新增的 `data_type` 字节，编码出 6 字节 meta，而 `decode()` 按 7 字节读取 `meta[3:7]`（仅 3 字节）报 `Input data was truncated`。心跳功能此前**端到端完全不可用**——只要 publisher 开启心跳（默认 30s），订阅端收到 PING 帧即崩溃。修复：心跳 meta 补 `data_type=UNKNOWN` 字节，与 DATA 帧统一为 7 字节。
+- **🔴 修复订阅端未过滤心跳帧（致命）**：`PulseSubscriber.subscribe()` 此前无条件 `yield decode(frames)`，心跳帧即使尺寸修对，其空 payload 经 msgpack 反序列化也会崩溃，且语义上 PING 是协议控制帧不该混入业务消息流。修复：recv 后按 `meta[0]==MsgType.PING` 过滤，PING 不交付用户迭代器。
+- **🔴 修复 ZAP 认证响应从未发送（致命）**：ZAP handler `_loop()` 中 3 处 `send_multipart` **均未 await**——`zmq.asyncio` socket 的 `send_multipart` 返回协程，未 await 则 ZAP 响应永不发送，libzmq 等不到回复，**认证成功的 SUB 永久挂死**。同时 send 异常未保护，一次失败会让 ZAP task 静默退出，后续所有 SUB 认证失效。修复：抽 `_send_zap_reply()` 统一 `await` + `try/except`，单次 send 失败仅记日志、不影响循环；顺带修正畸形错误响应（补齐 6 帧 + version 字节）。
+- **修复 setup 失败资源泄漏**：`_run()` 的初始化阶段（transport/storage/admin/tasks）此前在 `try` 块之前，任一步骤抛异常（如 admin 端口被占用）则 `_shutdown()` 不执行，导致 ZMQ context / PUB socket / SQLite 连接泄漏（尤其影响 `start_async()` 嵌入其他 asyncio 程序的场景）。修复：整个初始化 + 运行循环纳入同一 `try/finally`，`_shutdown` 兼容 `roll_task=None`。
+- **类型注解增强（延续 v3.1.0）**：补齐 pub 端 sender + producer 管线的类型——新增 `producers/types.py`（`PubData` 数据白名单别名 + 3 个回调签名），`PublisherSender` / `ProducerManager` 消除 `Any`，`producer` / `burst_producer` / `register_producer` 装饰器用 `@overload` 把 `inject_sender` 标志位与回调签名绑定。用户现在能给注入的 sender 写 `async def market(sender: PublisherSender)` 类型注解，IDE 能校验 `send()` 的数据类型。
+- **测试**：删除过时的 `test_auth_and_heartbeat.py`（停留在废弃的异常体系设计，整文件无法收集）；新增 5 个回归测试覆盖上述修复。
+
+> **升级建议**：所有用户建议立即升级。心跳默认开启，此前任何订阅端都会在首个心跳帧崩溃；开启 PLAIN 认证的用户此前认证成功也连不上。
+
 ### v3.1.0
 
 ⚠️ **Breaking Change**：收紧 producer 返回类型并新增手动发送端注入能力。

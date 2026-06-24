@@ -1,6 +1,6 @@
 [project]
 name = "pulse-mq"
-version = "3.1.0"
+version = "3.1.1"
 description = "高性能纯 pub→sub 消息系统"
 readme = "README.md"
 license = "MIT"
