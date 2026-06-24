@@ -22,13 +22,19 @@ import asyncio
 import logging
 import time
 from functools import wraps
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, overload, Literal
+
+from pulsemq.producers.types import (
+    PubData,
+    SimpleProducerCallback,
+    SenderProducerCallback,
+)
 
 from pulsemq._version import __version__
 from pulsemq.admin.server import AdminServer
 from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.config import PublisherConfig, load_config
-from pulsemq.producers.manager import ProducerManager
+from pulsemq.producers.manager import ProducerManager, ProducerSpec
 from pulsemq.protocol import frames as frame_codec
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
@@ -43,13 +49,13 @@ __all__ = ["__version__"]
 class PublisherSender:
     """注入 producer 回调的手动发送端。"""
 
-    def __init__(self, publisher: "PulsePublisher", spec: Any) -> None:
+    def __init__(self, publisher: "PulsePublisher", spec: ProducerSpec) -> None:
         self._publisher = publisher
         self._spec = spec
 
     async def send(
         self,
-        data: Any,
+        data: PubData,
         *,
         topic: str | None = None,
         serializer: str | None = None,
@@ -99,6 +105,30 @@ class PulsePublisher:
 
     # ---- Producer 注册 ----
 
+    @overload
+    def producer(
+        self,
+        name: str,
+        *,
+        interval: float = ...,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[False] = ...,
+    ) -> Callable[[SimpleProducerCallback], SimpleProducerCallback]: ...
+
+    @overload
+    def producer(
+        self,
+        name: str,
+        *,
+        interval: float = ...,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[True],
+    ) -> Callable[[SenderProducerCallback], SenderProducerCallback]: ...
+
     def producer(
         self,
         name: str,
@@ -110,7 +140,7 @@ class PulsePublisher:
         inject_sender: bool = False,
     ) -> Callable:
         """装饰器：注册 async producer。"""
-        def decorator(fn: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
+        def decorator(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
             self._producer_mgr.register(
                 callback=fn,
                 name=name,
@@ -123,6 +153,28 @@ class PulsePublisher:
             return fn
         return decorator
 
+    @overload
+    def burst_producer(
+        self,
+        name: str,
+        *,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[False] = ...,
+    ) -> Callable[[SimpleProducerCallback], SimpleProducerCallback]: ...
+
+    @overload
+    def burst_producer(
+        self,
+        name: str,
+        *,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[True],
+    ) -> Callable[[SenderProducerCallback], SenderProducerCallback]: ...
+
     def burst_producer(
         self,
         name: str,
@@ -133,7 +185,7 @@ class PulsePublisher:
         inject_sender: bool = False,
     ) -> Callable:
         """装饰器：注册 burst producer（无间隔连续发送，用于极限性能测试）。"""
-        def decorator(fn: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
+        def decorator(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
             self._producer_mgr.register_burst(
                 callback=fn,
                 name=name,
@@ -145,9 +197,35 @@ class PulsePublisher:
             return fn
         return decorator
 
+    @overload
     def register_producer(
         self,
-        fn: Callable[[], Awaitable[Any]],
+        fn: SimpleProducerCallback,
+        *,
+        name: str,
+        interval: float = ...,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[False] = ...,
+    ) -> None: ...
+
+    @overload
+    def register_producer(
+        self,
+        fn: SenderProducerCallback,
+        *,
+        name: str,
+        interval: float = ...,
+        cache_size: int = ...,
+        serializer: str = ...,
+        compression: str = ...,
+        inject_sender: Literal[True],
+    ) -> None: ...
+
+    def register_producer(
+        self,
+        fn: Callable[..., Awaitable[Any]],
         *,
         name: str,
         interval: float = 5.0,
@@ -281,11 +359,11 @@ class PulsePublisher:
             self._storage.close()
         logger.info("PulsePublisher 已关闭")
 
-    def _make_sender(self, spec: Any) -> PublisherSender:
+    def _make_sender(self, spec: ProducerSpec) -> PublisherSender:
         """为 inject_sender producer 构造手动发送端。"""
         return PublisherSender(self, spec)
 
-    async def _on_produce(self, spec: Any, data: Any) -> None:
+    async def _on_produce(self, spec: ProducerSpec, data: PubData) -> None:
         """Producer 回调返回数据后的处理流程。"""
         try:
             await self._publish_data(
