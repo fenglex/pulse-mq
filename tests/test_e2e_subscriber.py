@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from typing import Any
 
@@ -237,14 +238,14 @@ class TestSubscriberErrors:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        caplog,
+        capsys,
     ) -> None:
-        """错误凭证：subscribe() 打 error 日志后静默结束迭代（不卡死、不抛异常）。
+        """错误凭证：subscribe() 打提示后静默结束迭代（不卡死、不抛异常）。
 
         pyzmq 的 SUB 在 PLAIN 认证被拒绝时 recv 不抛错、无限重连，
         会让用户代码卡死。PulseSubscriber 通过 monitor 检测到
-        EVENT_HANDSHAKE_FAILED_AUTH 后，自行打 error 日志并结束迭代，
-        ``async for`` 自然退出，用户无需 try/except。
+        EVENT_HANDSHAKE_FAILED_AUTH 后，自行输出 [SUB 认证失败] 到 stderr
+        并结束迭代，``async for`` 自然退出，用户无需 try/except。
         """
         pub_port, admin_port = random_port_pair
         pub = make_publisher(
@@ -252,32 +253,33 @@ class TestSubscriberErrors:
             api_keys={"alice": "right_pwd"},
         )
 
-        import logging
-        with caplog.at_level(logging.ERROR, logger="pulsemq.subscriber"):
-            async with running_publisher(pub):
-                sub = PulseSubscriber(
-                    f"tcp://127.0.0.1:{pub_port}",
-                    username="alice", password="wrong_pwd",
-                )
-                await sub.connect()
-                try:
-                    received: list = []
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="wrong_pwd",
+            )
+            await sub.connect()
+            try:
+                received: list = []
 
-                    async def _consume() -> None:
-                        async for _msg in sub.subscribe(topic_for_auth()):
-                            received.append(_msg)
+                async def _consume() -> None:
+                    async for _msg in sub.subscribe(topic_for_auth()):
+                        received.append(_msg)
 
-                    # 错误凭证下，subscribe() 应在握手完成后很快静默结束，
-                    # 而非无限阻塞。加 timeout 防止回归（卡死时测试会超时失败）。
-                    await asyncio.wait_for(_consume(), timeout=5.0)
-                finally:
-                    await sub.close()
+                # 错误凭证下，subscribe() 应在握手完成后很快静默结束，
+                # 而非无限阻塞。加 timeout 防止回归（卡死时测试会超时失败）。
+                await asyncio.wait_for(_consume(), timeout=5.0)
+            finally:
+                await sub.close()
 
         # 不应收到任何消息
         assert received == [], f"错误凭证不应收到消息，实际 {len(received)} 条"
-        # 应有认证失败的 error 日志
-        auth_logs = [r for r in caplog.records if "认证失败" in r.message]
-        assert len(auth_logs) >= 1, "应有 [SUB 认证失败] error 日志"
+        # 应有认证失败的提示（输出到 stderr，不依赖 logging 配置）
+        captured = capsys.readouterr()
+        combined = captured.err + captured.out
+        assert "认证失败" in combined, (
+            f"错误凭证应输出 [SUB 认证失败] 到 stderr，实际捕获: {combined!r}"
+        )
 
 
 def topic_for_auth() -> str:
@@ -306,44 +308,40 @@ class TestAuthVisibility:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        caplog,
+        capsys,
     ) -> None:
-        """正确凭证：sub 端应打印上线成功日志（info）。"""
+        """正确凭证：sub 端应有上线提示（print 到 stderr，不依赖 logging 配置）。"""
         pub_port, admin_port = random_port_pair
         pub = make_publisher(
             pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
             api_keys={"alice": "right_pwd"},
         )
 
-        import logging
-        with caplog.at_level(logging.INFO, logger="pulsemq.subscriber"):
-            async with running_publisher(pub):
-                sub = PulseSubscriber(
-                    f"tcp://127.0.0.1:{pub_port}",
-                    username="alice", password="right_pwd",
-                )
-                await sub.connect()
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="right_pwd",
+            )
+            await sub.connect()
+            try:
+                # 触发 subscribe() 启动 monitor 并完成握手；
+                # 正确凭证下会收到 HANDSHAKE_SUCCEEDED。
+                async def _probe():
+                    async for _msg in sub.subscribe(topic_for_auth()):
+                        break
+
                 try:
-                    # 触发 subscribe() 启动 monitor 并完成握手；
-                    # 正确凭证下会收到 HANDSHAKE_SUCCEEDED。
-                    async def _probe():
-                        async for _msg in sub.subscribe(topic_for_auth()):
-                            break
+                    await asyncio.wait_for(_probe(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass  # 超时无所谓，只关心握手结果提示
+            finally:
+                await sub.close()
 
-                    try:
-                        await asyncio.wait_for(_probe(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        pass  # 超时无所谓，只关心握手结果日志
-                finally:
-                    await sub.close()
-
-        # 核心断言：sub 端应有认证成功的上线日志
-        online_logs = [
-            r for r in caplog.records
-            if "上线" in r.message or "auth=OK" in r.message or "握手成功" in r.message
-        ]
-        assert online_logs, (
-            "认证成功时 sub 端应打印上线日志，实际未捕获到任何上线/握手成功日志"
+        # 核心断言：sub 端应有认证成功的上线提示（输出到 stderr）
+        captured = capsys.readouterr()
+        combined = captured.err + captured.out
+        assert "上线" in combined or "认证成功" in combined, (
+            f"认证成功时应输出上线提示到 stderr，实际捕获: {combined!r}"
         )
 
 
@@ -406,3 +404,142 @@ class TestHeartbeatFiltered:
         # 至少应收到业务消息，证明迭代器本身工作正常
         biz = [m for m in received if m.topic == "hb_probe"]
         assert biz, "应至少收到一条业务消息（证明迭代器正常，而非静默丢弃全部）"
+
+
+# ---------------------------------------------------------------------------
+# 断线检测：pub 停止后 sub 应自动结束迭代（不卡死）
+# ---------------------------------------------------------------------------
+
+
+class TestDisconnectDetection:
+    """pub 端停止 / 网络断开后，sub 的 async for 应自动结束。
+
+    背景：此前 sub 的 monitor 只监听握手事件，不监听 EVENT_DISCONNECTED，
+    导致 pub 退出后 sub 的 recv_multipart 无限等待，用户代码卡死。
+    现在监听 EVENT_DISCONNECTED，断线即结束迭代。
+    """
+
+    async def test_sub_exits_when_pub_stops(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+        )
+
+        async def _factory() -> Any:
+            return {"v": 1}
+
+        pub.register_producer(fn=_factory, name="dc_probe", interval=0.05)
+
+        # 手动管理 pub 生命周期（不用 running_publisher，需精确控制停止时机）
+        pub._running = True
+        pub._start_time = time.time()
+        from pulsemq.transport.zmq_pub import ZmqPubTransport
+        from pulsemq.stats.storage import StatsStorage
+        from pulsemq.admin.server import AdminServer
+        pub._transport = ZmqPubTransport(
+            bind=pub._config.bind, api_keys={}, on_auth=pub._on_auth,
+        )
+        await pub._transport.start()
+        pub._storage = StatsStorage(pub._config.stats_db)
+        pub._storage.connect()
+        for nm, spec in pub._producer_mgr.specs.items():
+            pub._buffers.get_or_create(nm, spec.cache_size)
+        pub._admin = AdminServer(
+            bind=pub._config.admin_bind, traffic_stats=pub._traffic,
+            topic_buffers=pub._buffers, stats_storage=pub._storage,
+            snapshot_fn=pub._system_snapshot, start_time=pub._start_time,
+        )
+        await pub._admin.start()
+        import asyncio as _aio
+        roll_task = _aio.create_task(pub._minute_roll_loop())
+        await pub._producer_mgr.start_all(pub._on_produce, pub._make_sender)
+
+        await asyncio.sleep(0.8)  # 让 pub 跑起来
+
+        sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+        await sub.connect()
+        consume_done = asyncio.Event()
+
+        async def _consume():
+            async for _msg in sub.subscribe("dc_probe"):
+                pass
+            consume_done.set()
+
+        c = asyncio.create_task(_consume())
+        await asyncio.sleep(0.5)
+
+        # === 停止 pub（模拟 publisher 进程退出）===
+        pub._running = False
+        await asyncio.sleep(0.3)
+        await pub._shutdown(roll_task)
+
+        # 等待 sub 检测到断线并结束迭代
+        try:
+            await asyncio.wait_for(consume_done.wait(), timeout=5.0)
+            ended = True
+        except asyncio.TimeoutError:
+            ended = False
+
+        c.cancel()
+        with contextlib.suppress(Exception):
+            await c
+        with contextlib.suppress(Exception):
+            await sub.close()
+
+        assert ended, (
+            "pub 停止后 sub 的 async for 应自动结束，但 5s 后仍在运行（卡死）"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 认证可见性（不依赖 logging 配置，直接输出到 stderr）
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionNotice:
+    """连接/认证关键事件应直接输出到 stderr（print），不依赖用户配置 logging。
+
+    背景：此前用 logging 打日志，用户没配 basicConfig() 时 info 级（认证成功）
+    被 Python 默认 lastResort 吞掉，导致完全看不到。改用 print(file=stderr)
+    保证关键事件始终可见。
+    """
+
+    async def test_auth_success_notice_to_stderr(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+        capsys,
+    ) -> None:
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(
+            pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
+            api_keys={"alice": "right_pwd"},
+        )
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(
+                f"tcp://127.0.0.1:{pub_port}",
+                username="alice", password="right_pwd",
+            )
+            await sub.connect()
+            try:
+                async def _probe():
+                    async for _msg in sub.subscribe(topic_for_auth()):
+                        break
+                try:
+                    await asyncio.wait_for(_probe(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+            finally:
+                await sub.close()
+
+        captured = capsys.readouterr()
+        combined = captured.err + captured.out
+        # 关键：认证成功应有可见提示（不依赖 logging 配置）
+        assert "上线" in combined or "auth=OK" in combined or "认证成功" in combined, (
+            f"认证成功应输出到 stderr 可见，实际捕获: {combined!r}"
+        )

@@ -353,6 +353,15 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v3.2.1
+
+🔧 **bugfix**：修复认证/上线信息看不到 + pub 停止后 sub 卡死。
+
+- **🔴 修复认证信息看不到（致命）**：v3.2.0 用 `logging` 打上线/认证日志，但用户没配 `logging.basicConfig()` 时，info 级日志（认证成功 `[SUB 上线]`）被 Python 默认 lastResort（WARNING）吞掉，导致完全看不到任何认证提示。修复：**关键连接事件改用 `print(..., file=sys.stderr)` 直接输出**，绕过 logging 系统，保证 `[SUB] 连接`、`[SUB 上线] 认证成功`、`[SUB 认证失败]`、`[SUB 断线]` 始终可见，不依赖用户配置。
+- **🔴 修复 pub 停止后 sub 卡死（致命）**：此前 sub 的 monitor 只监听握手事件，不监听 `EVENT_DISCONNECTED`，导致 publisher 进程退出/网络断开后，sub 的 `recv_multipart` 无限等待，用户 `async for` 永久卡死。修复：monitor 掩码加入 `EVENT_DISCONNECTED`，后台 task 持续监听，检测到断线即输出 `[SUB 断线]` 并自动结束迭代，`async for` 自然退出。
+
+> **升级建议**：v3.2.0 用户强烈建议升级——v3.2.0 的认证可见性因 logging 配置问题实际不生效，且 pub 异常退出会让 sub 卡死。
+
 ### v3.2.0
 
 🔔 **feature**：sub 端认证可见性增强 —— 上线（成功/失败）双向都有提示，失败自动停止。

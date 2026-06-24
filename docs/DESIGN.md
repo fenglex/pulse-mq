@@ -416,12 +416,14 @@ class PulseSubscriber:
 4. 收到 4 帧后**过滤 PING 心跳帧**（`meta[0]==MsgType.PING` 的跳过，不交付用户）
 5. `yield decode(frames)` 给用户
 
-**握手可见性**（认证场景）：monitor 监听 `EVENT_HANDSHAKE_SUCCEEDED | EVENT_HANDSHAKE_FAILED_AUTH | EVENT_HANDSHAKE_FAILED_PROTOCOL | EVENT_HANDSHAKE_FAILED_NO_DETAIL`。
-`_watch_handshake()` 解析事件码：
-- 成功 → 打 info `[SUB 上线] 认证成功`，主循环继续接收
-- 任意失败 → 打 error `[SUB 认证失败]`，**自动结束迭代**（`async for` 自然退出，用户无需 try/except）
+**握手可见性**（认证场景）：monitor 始终启用（无论是否认证），监听掩码
+`HANDSHAKE_SUCCEEDED | HANDSHAKE_FAILED_AUTH | HANDSHAKE_FAILED_PROTOCOL | HANDSHAKE_FAILED_NO_DETAIL | DISCONNECTED`。
+`_watch_events()` 持续 recv 事件，按事件码分发，**关键事件直接 `print` 到 stderr**（不依赖用户配置 logging，保证始终可见）：
+- 成功 → `[SUB 上线] 认证成功`，继续接收
+- 任意失败 → `[SUB 认证失败]`，自动结束迭代
+- 断线（`DISCONNECTED`）→ `[SUB 断线]`，自动结束迭代（pub 停止时 sub 不卡死）
 
-这样 pub 端（`[SUB 上线] user=... auth=OK/FAIL`）和 sub 端（`[SUB 上线]`/`[SUB 认证失败]`）双向都有可见性。
+这样 pub 端（`[SUB 上线] user=... auth=OK/FAIL`）和 sub 端（`[SUB 上线]`/`[SUB 认证失败]`/`[SUB 断线]`）双向都有可见性，且不依赖 logging 配置。
 
 **依赖**：pyzmq（asyncio）、`protocol.frames.decode`、`protocol.msg_type.MsgType`。
 
