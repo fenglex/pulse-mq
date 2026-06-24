@@ -11,12 +11,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from typing import Callable, Awaitable
+
+from pulsemq.producers.types import ProducerCallback, PubData
 
 logger = logging.getLogger(__name__)
-
-# producer 回调类型：async 函数，返回任意数据；inject_sender=True 时接收 sender 参数
-ProducerCallback = Callable[..., Awaitable[Any]]
 
 
 @dataclass
@@ -30,6 +29,15 @@ class ProducerSpec:
     serializer: str = "msgpack"     # 序列化格式
     compression: str = "none"       # 压缩格式
     inject_sender: bool = False      # 是否向回调注入手动发送端
+
+
+# 消息分发回调：on_message(spec, data) —— ProducerManager 调用，PulsePublisher 实现
+# 必须在 ProducerSpec 定义之后（TypeAlias 右侧在模块加载时即求值，
+# from __future__ import annotations 只对函数注解惰性求值，不影响此处）
+OnMessageCallback = Callable[[ProducerSpec, PubData], Awaitable[None]]
+# sender 工厂：sender_factory(spec) -> PublisherSender —— inject_sender=True 时使用
+# PublisherSender 用字符串注解做前向引用，避免 manager → publisher 循环导入
+SenderFactory = Callable[[ProducerSpec], "PublisherSender"]
 
 
 class ProducerManager:
@@ -89,7 +97,11 @@ class ProducerManager:
     def specs(self) -> dict[str, ProducerSpec]:
         return self._specs
 
-    async def start_all(self, on_message: Any, sender_factory: Any | None = None) -> None:
+    async def start_all(
+        self,
+        on_message: OnMessageCallback,
+        sender_factory: SenderFactory | None = None,
+    ) -> None:
         """启动所有 producer 任务。
 
         Args:
@@ -117,7 +129,12 @@ class ProducerManager:
         self._tasks.clear()
         logger.info("所有 Producer 已停止")
 
-    async def _run_loop(self, spec: ProducerSpec, on_message: Any, sender_factory: Any | None) -> None:
+    async def _run_loop(
+        self,
+        spec: ProducerSpec,
+        on_message: OnMessageCallback,
+        sender_factory: SenderFactory | None,
+    ) -> None:
         """固定延迟调度：执行 → sleep(interval - elapsed) → 执行 → ...
 
         - elapsed < interval: sleep 剩余时间
@@ -148,7 +165,12 @@ class ProducerManager:
                 # 不积压，让出控制权
                 await asyncio.sleep(0)
 
-    async def _run_burst_loop(self, spec: ProducerSpec, on_message: Any, sender_factory: Any | None) -> None:
+    async def _run_burst_loop(
+        self,
+        spec: ProducerSpec,
+        on_message: OnMessageCallback,
+        sender_factory: SenderFactory | None,
+    ) -> None:
         """Burst 模式：无间隔连续发送，直到 stop 或回调返回 None。
 
         - 每次循环直接调用回调，无 sleep
