@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import sys
 import tempfile
 
 import pytest
@@ -253,6 +254,20 @@ class TestPublisherSubscriber:
         except (asyncio.CancelledError, Exception):
             pass
         await sub.close()
+
+
+    async def test_event_loop_policy_on_windows(self) -> None:
+        """import pulsemq 后，Windows 上应自动使用 SelectorEventLoopPolicy。
+
+        防止回归：用户在 Windows 上不手动设置策略也能正常收消息。
+        """
+        if sys.platform != "win32":
+            pytest.skip("仅 Windows 验证事件循环策略")
+        # pulsemq.__init__ 已在本测试模块 import pulsemq.* 时执行过
+        policy = asyncio.get_event_loop_policy()
+        assert isinstance(policy, asyncio.WindowsSelectorEventLoopPolicy), (
+            f"期望 WindowsSelectorEventLoopPolicy，实际 {type(policy).__name__}"
+        )
 
 
 # 需要 import time

@@ -6,13 +6,50 @@ import pytest
 
 from pulsemq.protocol.flags import decode_flags, encode_flags
 from pulsemq.protocol.frames import PulseMessage, decode, encode
-from pulsemq.protocol.msg_type import MsgType
+from pulsemq.protocol.msg_type import DataType, MsgType
 
 
 class TestMsgType:
     def test_constants(self):
         assert MsgType.DATA == 0x01
         assert MsgType.PING == 0x02
+
+
+class TestDataType:
+    """v3 新增：data_type 字段编解码。"""
+
+    def test_constants(self):
+        assert DataType.UNKNOWN == 0x00
+        assert DataType.DATAFRAME == 0x04
+        assert DataType.LIST_DATAFRAME == 0x05
+
+    def test_data_type_stored_in_meta(self):
+        """encode 应把 data_type 写入 meta[2]，decode 应读出。"""
+        frames = encode("t", {"x": 1}, serializer="msgpack",
+                        data_type=DataType.DICT)
+        meta = frames[1]
+        assert len(meta) == 7, f"meta 帧应为 7 字节，实际 {len(meta)}"
+        assert meta[0] == MsgType.DATA
+        assert meta[2] == DataType.DICT
+        msg = decode(frames)
+        assert msg.data_type == DataType.DICT
+
+    def test_data_type_default_unknown(self):
+        """未传 data_type 时默认 UNKNOWN，decode 读出 UNKNOWN。"""
+        frames = encode("t", {"x": 1}, serializer="msgpack")
+        msg = decode(frames)
+        assert msg.data_type == DataType.UNKNOWN
+
+    @pytest.mark.parametrize("data_type", [
+        DataType.DICT, DataType.LIST_DICT, DataType.DATAFRAME,
+        DataType.LIST_DATAFRAME, DataType.STR, DataType.BYTES,
+    ])
+    def test_data_type_roundtrip(self, data_type):
+        """各种 data_type 值都能无损往返。"""
+        frames = encode("t", {"x": 1}, serializer="msgpack",
+                        data_type=data_type)
+        msg = decode(frames)
+        assert msg.data_type == data_type
 
 
 class TestFlags:

@@ -11,15 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable
 
 import zmq
 import zmq.asyncio
 
 logger = logging.getLogger(__name__)
-
-# 认证事件回调签名: (username, client_address, success) -> None
-AuthCallback = Callable[[str, str, bool], Awaitable[None]]
 
 
 class AsyncZAPHandler:
@@ -29,21 +25,11 @@ class AsyncZAPHandler:
     在 asyncio 事件循环中处理 ZAP 请求。
     """
 
-    def __init__(
-        self,
-        api_keys: dict[str, str],
-        ctx: zmq.asyncio.Context,
-        on_auth: AuthCallback | None = None,
-    ) -> None:
+    def __init__(self, api_keys: dict[str, str], ctx: zmq.asyncio.Context) -> None:
         self._api_keys = api_keys
         self._ctx = ctx
         self._zap: zmq.asyncio.Socket | None = None
         self._task: asyncio.Task | None = None
-        self._on_auth: AuthCallback | None = on_auth
-
-    def set_auth_callback(self, callback: AuthCallback | None) -> None:
-        """设置认证事件回调（可在运行时动态替换/取消）。"""
-        self._on_auth = callback
 
     async def start(self) -> None:
         """启动 ZAP handler。"""
@@ -90,59 +76,46 @@ class AsyncZAPHandler:
             version = msg[0]
             request_id = msg[1]
             # domain = msg[2]
-            address = msg[3].decode("utf-8", errors="replace") if len(msg) > 3 else "unknown"
+            # address = msg[3] —— 客户端 ip:port
             # identity = msg[4]
             mechanism = msg[5]
+            client_addr = msg[3].decode("utf-8", errors="replace") if len(msg) > 3 else "unknown"
             username = msg[6].decode("utf-8", errors="replace") if len(msg) > 6 else ""
             password = msg[7].decode("utf-8", errors="replace") if len(msg) > 7 else ""
 
             if mechanism != b"PLAIN":
+                logger.warning(
+                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=not-PLAIN mechanism=%s",
+                    username or "<empty>", client_addr, mechanism.decode("utf-8", "replace"),
+                )
                 self._zap.send_multipart([version, request_id, b"400", b"Not PLAIN", b"", b""])
                 continue
 
             # 白名单校验
             expected = self._api_keys.get(username)
             if expected is not None and expected == password:
-                logger.info("ZAP 认证成功: username=%s client=%s", username, address)
+                logger.info(
+                    "[SUB 上线] user=%s addr=%s auth=OK",
+                    username, client_addr,
+                )
                 self._zap.send_multipart([version, request_id, b"200", b"OK", username.encode(), b""])
-                success = True
             else:
                 logger.warning(
-                    "ZAP 认证失败: username=%s client=%s reason=invalid_credentials",
-                    username, address,
+                    "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=invalid-credentials",
+                    username or "<empty>", client_addr,
                 )
                 self._zap.send_multipart([version, request_id, b"400", b"Invalid credentials", b"", b""])
-                success = False
-
-            # 回调通知
-            if self._on_auth is not None:
-                try:
-                    await self._on_auth(username, address, success)
-                except Exception:
-                    logger.warning("on_auth 回调异常", exc_info=True)
 
 
 class ZmqPubTransport:
     """ZMQ PUB socket + PLAIN 认证。"""
 
-    def __init__(
-        self,
-        bind: str = "tcp://*:5555",
-        api_keys: dict[str, str] | None = None,
-        on_auth: AuthCallback | None = None,
-    ) -> None:
+    def __init__(self, bind: str = "tcp://*:5555", api_keys: dict[str, str] | None = None) -> None:
         self._bind = bind
         self._api_keys = api_keys or {}
         self._ctx: zmq.asyncio.Context | None = None
         self._pub: zmq.asyncio.Socket | None = None
         self._zap: AsyncZAPHandler | None = None
-        self._on_auth = on_auth
-
-    def set_auth_callback(self, callback: AuthCallback | None) -> None:
-        """设置认证事件回调。需在 start() 后调用才会生效于 ZAP handler。"""
-        self._on_auth = callback
-        if self._zap is not None:
-            self._zap.set_auth_callback(callback)
 
     async def start(self) -> None:
         """启动 PUB socket，可选开启 PLAIN 认证。"""
@@ -153,7 +126,7 @@ class ZmqPubTransport:
 
         if self._api_keys:
             # ZAP handler 必须在 PUB bind 之前启动
-            self._zap = AsyncZAPHandler(self._api_keys, self._ctx, self._on_auth)
+            self._zap = AsyncZAPHandler(self._api_keys, self._ctx)
             await self._zap.start()
             self._pub.setsockopt(zmq.PLAIN_SERVER, 1)
 

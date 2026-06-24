@@ -14,6 +14,8 @@
 - **可视化后台** — 内置深色 Web UI（ECharts 折线图 + SSE 实时推送），支持 1H/6H 时间范围切换，60 秒滚动均值
 - **优雅关闭** — Producer 任务 drain、Admin 停止、PUB socket linger 后退出
 - **纳秒时间戳** — 帧级时间戳独立成帧，端到端延迟可精确测量
+- **跨平台** — Windows / macOS / Linux 开箱即用；`import pulsemq` 自动修正 Windows 事件循环策略，SUB 端无需任何额外配置即可正常收消息
+- **连接可观测** — SUB 连接时 publisher 端打印 `[SUB 上线] user=xxx addr=1.2.3.4 auth=OK`，认证失败打印 `[SUB 认证失败] ... reason=...`，便于排查谁连进来、为什么连不上
 
 ## 安装
 
@@ -24,6 +26,16 @@ pip install pulse-mq
 ```
 
 依赖项：ZeroMQ、msgspec、python-snappy、lz4、zstandard、pyarrow、pandas 全部开箱即用。
+
+> **关于包名**：PyPI 分发名是 `pulse-mq`（`pip install` 用），而 Python import 名是 `pulsemq`（`import` 用，无连字符，因 Python 标识符不允许连字符）。这是 Python 生态的常见双名模式，与 `pip install python-dateutil` → `import dateutil`、`pip install scikit-learn` → `import sklearn` 一致。
+>
+> ```bash
+> pip install pulse-mq      # 安装
+> ```
+> ```python
+> import pulsemq            # 使用
+> from pulsemq import PulsePublisher, PulseSubscriber
+> ```
 
 ## 快速开始
 
@@ -277,13 +289,16 @@ curl -N http://localhost:9090/api/v1/stats/stream
 | 帧序号 | 内容 | 说明 |
 |--------|------|------|
 | 1 | topic | UTF-8 字节串 |
-| 2 | meta | 6 字节：`[msg_type(1)][flags(1)][record_count(4, big-endian uint32)]` |
+| 2 | meta | 7 字节：`[msg_type(1)][flags(1)][data_type(1)][record_count(4, big-endian uint32)]` |
 | 3 | timestamp | 8 字节 big-endian int64，纳秒 |
 | 4 | payload | 序列化 + 压缩后的字节 |
 
 - `msg_type`：`0x01` = DATA，`0x02` = PING
 - `flags`：`bit[0:2]` 序列化格式编码，`bit[3:4]` 压缩算法编码
+- `data_type`（v3 新增）：原始数据类型标记，让 sub 端还原 pub 端原始 Python 类型（DataFrame → DataFrame，而非 list[dict]）。取值：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
 - 单帧 `record_count` 上限 **1,000,000**
+
+> **v3 Breaking**：meta 帧从 6 字节扩展到 7 字节（新增 data_type 字节），record_count 位置从 `[2:6]` 后移到 `[3:7]`。v3 与 v2.x 不兼容（record_count 读取错位）。
 
 ## 性能基准
 
@@ -331,6 +346,65 @@ python scripts/bench_pubsub_matrix.py
 > 测试环境：Windows 11，Python 3.13，单机 localhost
 
 ## 更新日志
+
+### v3.0.0
+
+⚠️ **Breaking Change**：meta 帧从 6 字节扩展到 7 字节，实现 pub→sub 全链路类型保真。**v3 与 v2.x 不兼容，pub/sub 两端必须同时升级。**
+
+- **🔴 修复类型变形（致命）**：此前 pub 端发送 `DataFrame` / `list[DataFrame]` 时，sub 端收到的类型被降级——msgpack/json 路径变成 `list[dict]`，pyarrow 路径变成 `pa.Table`，且 `dict` / `list[dict]` 经 pyarrow 也统一变成 `pa.Table`。实测 16 个合法组合中有 **8 个类型变形**。现在协议层记录原始数据类型，sub 端自动还原：
+
+  | pub 端发送 | sub 端收到（v2.x） | sub 端收到（v3.0） |
+  |---|---|---|
+  | `DataFrame` | `list[dict]` / `Table` | **`DataFrame`** ✅ |
+  | `list[DataFrame]` | `list[dict]` / `Table` | **`list[DataFrame]`** ✅ |
+  | `dict`（pyarrow）| `Table` | **`dict`** ✅ |
+  | `list[dict]`（pyarrow）| `Table` | **`list[dict]`** ✅ |
+
+- **meta 帧扩展（Breaking）**：新增 Byte 2 = `data_type`（原始数据类型标记），record_count 位置从 `[2:6]` 后移到 `[3:7]`。`DataType` 常量：`0x00`=UNKNOWN, `0x01`=dict, `0x02`=list[dict], `0x03`=list[str], `0x04`=DataFrame, `0x05`=list[DataFrame], `0x06`=str, `0x07`=bytes
+- **类型还原机制**：pub 端 `_infer_data_type()` 推断原始类型写入 meta；sub 端 `decode()` 据此把反序列化结果（list[dict] / pa.Table）还原为原始 Python 类型。`PulseMessage` 新增 `data_type` 字段
+- **测试强化**：`assert_message_roundtrip` 从"两侧降级为 list[dict] 比较值"升级为"类型保真 + 值相等"双断言（DataFrame 用 `assert_frame_equal`）
+- **诊断脚本**：新增 `scripts/_diag_type_fidelity.py`，覆盖 16 个合法组合的类型+值保真验证
+
+> **升级注意**：
+> - v3 与 v2.x **协议不兼容**，pub/sub 两端必须同时升级到 v3.0.0
+> - `list[DataFrame]` 因多个分片在序列化时展平，sub 端还原为 `[单个合并后的 DataFrame]`（行数据完全一致，仅丢失原分片个数信息）
+> - 用户代码无需改动（`PulseMessage.payload` 现在直接是原始类型，如 DataFrame 而非 list[dict]）
+
+### v2.4.1
+
+🔧 **bugfix**：修复 SUB 端 PLAIN 认证失败时卡死不退出的问题。
+
+- **🔴 修复 SUB 认证失败卡死（致命）**：pyzmq 的 SUB socket 在 PLAIN 认证被服务端 ZAP 拒绝时，`recv()` 不会抛错，而是在后台无限重连，导致用户的 `await sub.recv_multipart()` **永久阻塞**，程序卡死无任何提示。现在 `PulseSubscriber` 通过 ZMQ monitor 检测 `EVENT_HANDSHAKE_FAILED_AUTH` 事件，一旦发生就**自行打 error 日志并静默结束迭代**，`async for` 自然退出，**用户无需 try/except**：
+
+  ```python
+  async with PulseSubscriber(addr, username="alice", password="wrong") as sub:
+      async for msg in sub.subscribe("topic"):
+          print(msg.payload)
+      # 认证失败时：async for 自动结束，无需异常处理
+  # 日志会显示：[SUB 认证失败] PLAIN 握手被服务端拒绝，已停止订阅 (user='alice', ...)。
+  ```
+
+- **零 API 负担**：库自行处理认证失败，不抛异常、不需要用户捕获，看日志即可定位是凭证问题
+- **仅认证场景启用**：无认证（`username=""`）时完全不启用 monitor，零开销零误报
+- **测试强化**：认证失败测试从弱断言（"2秒内无消息"）改为强断言（收到 0 条 + 有 error 日志），加 timeout 防回归
+
+> **升级建议**：所有开启 PLAIN 认证的用户强烈建议立即升级（避免错误凭证导致程序卡死）。
+
+### v2.4.0
+
+🔧 **关键 bugfix + 可观测性增强**：修复 Windows 平台 SUB 端收不到消息的致命问题，并新增 SUB 连接日志。
+
+- **🔴 修复 Windows SUB 收不到消息（致命）**：Windows 上 Python 默认使用 `ProactorEventLoop`，但 pyzmq 的 asyncio 集成只支持 `SelectorEventLoop`，导致 SUB 端 `recv` 永远不返回（或抛 `RuntimeError: Proactor event loop does not implement add_reader family`）。现在 `import pulsemq` 时会在 win32 上自动 `set_event_loop_policy(WindowsSelectorEventLoopPolicy)`，用户**零配置**即可正常收消息（与 pyzmq / aiohttp / tornado 等库的通用做法一致）
+- **SUB 连接可观测性增强**：ZAP handler 此前只在认证失败时打 `warning`，认证成功完全静默。现在三种情况都打印结构化日志：
+  - 认证成功：`[SUB 上线] user=alice addr=192.168.1.5 auth=OK`
+  - 凭证错误：`[SUB 认证失败] user=alice addr=192.168.1.5 auth=FAIL reason=invalid-credentials`
+  - 非 PLAIN 机制：`[SUB 认证失败] user=... addr=... auth=FAIL reason=not-PLAIN mechanism=...`
+  - 含 **用户名 + 客户端 IP + 认证结果 + 失败原因**，便于排查谁连进来、为什么连不上
+- **SUB 端连接日志完善**：`PulseSubscriber.connect()` 现在打印自身用户名，开启认证时为 `Subscriber 连接到 xxx (auth=on, user=alice)`，便于 sub 端自己确认连上的是谁
+- **回归测试**：新增 `test_event_loop_policy_on_windows`，防止 Windows 事件循环策略回归
+- **诊断脚本**：新增 `scripts/_diag_sub_problem.py`（启动真实 pub 服务 + sub 收消息端到端验证）和 `scripts/_diag_auth_fail.py`（认证失败场景验证）
+
+> **升级建议**：Windows 用户强烈建议立即升级；Linux/macOS 用户无影响但可享受新增的连接日志。
 
 ### v2.3.0
 

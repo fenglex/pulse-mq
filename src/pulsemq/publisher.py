@@ -257,15 +257,18 @@ class PulsePublisher:
             record_count = self._infer_record_count(data)
             # 2. 数据类型 ↔ 序列化器强绑定校验（str→str, bytes→bytes 等）
             self._validate_serializer(data, spec.serializer)
+            # 3. 推断原始数据类型标记（v3：供 sub 端还原原始类型）
+            data_type = self._infer_data_type(data)
             payload_obj = self._prepare_payload(data)
 
-            # 3. 序列化 + 压缩 + 编码帧
+            # 4. 序列化 + 压缩 + 编码帧
             encoded_frames = frame_codec.encode(
                 topic=spec.name,
                 data=payload_obj,
                 serializer=spec.serializer,
                 compression=spec.compression,
                 record_count=record_count,
+                data_type=data_type,
             )
 
             # 3. 并行分发
@@ -337,6 +340,37 @@ class PulsePublisher:
             f"不支持的返回类型: {type(data).__name__}。"
             f"仅支持 pd.DataFrame / list[pd.DataFrame] / list[dict] / list[str] / dict / str / bytes。"
         )
+
+    @staticmethod
+    def _infer_data_type(data: Any) -> int:
+        """推断原始数据类型，返回 DataType 常量（v3 新增）。
+
+        用于在 meta 帧记录原始 Python 类型，让 sub 端能还原原始类型
+        （如 DataFrame → DataFrame，而非降级为 list[dict]）。
+        """
+        from pulsemq.protocol.msg_type import DataType
+
+        try:
+            import pandas as pd
+        except ImportError:
+            pd = None  # type: ignore[assignment]
+
+        if pd is not None and isinstance(data, pd.DataFrame):
+            return DataType.DATAFRAME
+        if isinstance(data, list) and data:
+            if pd is not None and isinstance(data[0], pd.DataFrame):
+                return DataType.LIST_DATAFRAME
+            if isinstance(data[0], dict):
+                return DataType.LIST_DICT
+            if isinstance(data[0], str):
+                return DataType.LIST_STR
+        if isinstance(data, dict):
+            return DataType.DICT
+        if isinstance(data, str):
+            return DataType.STR
+        if isinstance(data, bytes):
+            return DataType.BYTES
+        return DataType.UNKNOWN
 
     @staticmethod
     def _validate_serializer(data: Any, serializer: str) -> None:
