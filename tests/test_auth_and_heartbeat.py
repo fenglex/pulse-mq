@@ -372,3 +372,134 @@ class TestHeartbeatEncoding:
         ts1 = struct.unpack(">q", f1[2])[0]
         ts2 = struct.unpack(">q", f2[2])[0]
         assert ts2 >= ts1
+
+
+class TestHeartbeatEndToEnd:
+    """模块 4：心跳机制端到端。"""
+
+    async def test_heartbeat_frames_filtered_from_user(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """用户迭代器不收到 PING 帧。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url)
+        pub._config.heartbeat_interval = 1.0
+
+        topic = "hb_filter_test"
+        received: list = []
+
+        async def _factory() -> dict:
+            return {"v": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.5)
+
+        async with running_publisher(pub, warmup=1.5):
+            sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+            await sub.connect()
+            async for msg in sub.subscribe(topic, heartbeat_timeout=60.0):
+                received.append(msg)
+                if len(received) >= 3:
+                    break
+            await sub.close()
+
+        for msg in received:
+            assert msg.topic == topic, f"不应收到心跳 topic: {msg.topic}"
+        assert len(received) >= 3
+
+    async def test_heartbeat_timeout_raises_connection_lost(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """心跳超时后抛 ConnectionLostError。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url)
+        pub._config.heartbeat_interval = 2.0
+
+        topic = "hb_timeout_test"
+
+        async def _factory() -> dict:
+            return {"v": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.3)
+
+        async with running_publisher(pub) as p:
+            sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+            await sub.connect()
+            # 先收一条确认连通
+            async for msg in sub.subscribe(topic, heartbeat_timeout=5.0):
+                assert msg.topic == topic
+                break
+            await asyncio.sleep(0.5)
+
+        # publisher 已关闭，继续迭代应因心跳超时抛异常
+        with pytest.raises(ConnectionLostError, match="心跳超时"):
+            async for _msg in sub.subscribe(topic, heartbeat_timeout=5.0):
+                pass
+
+        await sub.close()
+
+    async def test_heartbeat_timeout_zero_disabled(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """heartbeat_timeout=0 时心跳检测完全禁用。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url)
+        pub._config.heartbeat_interval = 1.0
+
+        topic = "hb_disabled_test"
+        received: list = []
+
+        async def _factory() -> dict:
+            return {"v": 1}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.3)
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+            await sub.connect()
+            async for msg in sub.subscribe(topic, heartbeat_timeout=0.0):
+                received.append(msg)
+                if len(received) >= 3:
+                    break
+            await sub.close()
+
+        assert len(received) >= 3
+        for msg in received:
+            assert msg.topic == topic
+
+    async def test_zeroconf_pubsub_works(
+        self,
+        random_port_pair: tuple[int, int],
+        tmp_sqlite_url: str,
+    ) -> None:
+        """最简配置端到端：pub 和 sub 零配置即可工作。"""
+        pub_port, admin_port = random_port_pair
+        pub = make_publisher(pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url)
+        pub._config.heartbeat_interval = 2.0
+
+        topic = "zero_config"
+        received: list = []
+
+        async def _factory() -> dict:
+            return {"ok": True}
+
+        pub.register_producer(fn=_factory, name=topic, interval=0.3)
+
+        async with running_publisher(pub):
+            sub = PulseSubscriber(f"tcp://127.0.0.1:{pub_port}")
+            await sub.connect()
+            # 不传 heartbeat_timeout，使用默认 90s
+            async for msg in sub.subscribe(topic):
+                received.append(msg)
+                if len(received) >= 3:
+                    break
+            await sub.close()
+
+        assert len(received) >= 3
+        for msg in received:
+            assert msg.payload == {"ok": True}

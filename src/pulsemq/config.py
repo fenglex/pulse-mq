@@ -31,6 +31,9 @@ class PublisherConfig:
     # 统计内存窗口（分钟）
     stats_retention_minutes: int = 480  # 8 小时
 
+    # 心跳发送间隔（秒），<= 0 禁用心跳发送
+    heartbeat_interval: float = 30.0
+
     # API Keys 字符串（user1:pass1,user2:pass2），空=关闭认证
     api_keys_str: str = ""
 

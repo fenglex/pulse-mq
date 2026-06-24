@@ -78,8 +78,17 @@ class PulseSubscriber:
         self._sub.connect(self._address)
         logger.info("Subscriber 连接到 %s (auth=%s)", self._address, "on" if self._username else "off")
 
-    async def subscribe(self, *topics: str) -> AsyncIterator[PulseMessage]:
-        """订阅 topic，返回异步迭代器。"""
+    async def subscribe(
+        self, *topics: str,
+        heartbeat_timeout: float = 90.0,
+    ) -> AsyncIterator[PulseMessage]:
+        """订阅 topic，返回异步迭代器。
+
+        Args:
+            *topics: 要订阅的 topic 列表。
+            heartbeat_timeout: 心跳超时时间（秒），默认 90s。
+                设为 0 禁用心跳检测。超时后抛 ConnectionLostError。
+        """
         if self._sub is None:
             raise RuntimeError("Subscriber 未连接")
 
@@ -87,12 +96,45 @@ class PulseSubscriber:
             self._sub.setsockopt(zmq.SUBSCRIBE, t.encode("utf-8"))
             logger.info("订阅 topic: %s", t)
 
+        # 心跳检测：自动订阅内部心跳 topic，用 ZMQ RCVTIMEO 做轮询
+        _hb_enabled = heartbeat_timeout > 0
+        if _hb_enabled:
+            self._sub.setsockopt(zmq.SUBSCRIBE, b"__pulse_hb__")
+            last_recv: float | None = None  # 第一条消息到达后才开始计时
+            if self._receive_timeout is None:
+                self._sub.setsockopt(zmq.RCVTIMEO, 1000)
+            logger.info("心跳检测已启用 (timeout=%.0fs)", heartbeat_timeout)
+
         while True:
             try:
                 frames = await self._sub.recv_multipart()
-                if len(frames) == 4:
-                    yield decode(frames)
-            except zmq.ZMQError:
+
+                if len(frames) != 4:
+                    continue
+
+                # 检查是否为 PING 帧（内部心跳，不暴露给用户）
+                if _hb_enabled:
+                    msg_type = frames[1][0]
+                    if msg_type == 0x02:  # MsgType.PING
+                        last_recv = time.monotonic()
+                        continue
+
+                # DATA 帧：刷新心跳计时器
+                if _hb_enabled:
+                    last_recv = time.monotonic()
+
+                yield decode(frames)
+
+            except zmq.ZMQError as e:
+                # RCVTIMEO 超时（EAGAIN）→ 检查心跳
+                if _hb_enabled and e.errno == zmq.EAGAIN:
+                    if last_recv is not None:
+                        elapsed = time.monotonic() - last_recv
+                        if elapsed > heartbeat_timeout:
+                            raise ConnectionLostError(
+                                f"心跳超时: 已 {elapsed:.0f}s 未收到消息"
+                            )
+                    continue
                 if self._closed_by_user:
                     break
                 raise ConnectionLostError("与 Publisher 的连接已断开")

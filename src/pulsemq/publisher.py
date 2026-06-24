@@ -202,6 +202,11 @@ class PulsePublisher:
         # 启动分钟滚动任务
         roll_task = asyncio.create_task(self._minute_roll_loop())
 
+        # 启动心跳循环（默认 30s 间隔）
+        hb_task: asyncio.Task | None = None
+        if self._config.heartbeat_interval > 0:
+            hb_task = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
+
         # 启动所有 producer
         await self._producer_mgr.start_all(self._on_produce)
 
@@ -214,6 +219,12 @@ class PulsePublisher:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            if hb_task is not None:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except asyncio.CancelledError:
+                    pass
             await self._shutdown(roll_task)
 
     async def _shutdown(self, roll_task: asyncio.Task) -> None:
@@ -409,6 +420,25 @@ class PulsePublisher:
             "start_time": self._start_time,
             "producer_count": len(self._producer_mgr.specs),
         }
+
+    # ---- 心跳 ----
+
+    async def _heartbeat_loop(self) -> None:
+        """心跳发送循环：每隔 heartbeat_interval 秒发送一条 PING 帧。"""
+        from pulsemq.protocol.frames import encode_heartbeat
+
+        while self._running:
+            await asyncio.sleep(self._config.heartbeat_interval)
+            if not self._running:
+                break
+            try:
+                frames = encode_heartbeat()
+                if self._transport is not None:
+                    await self._transport.send(frames)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.warning("心跳发送异常", exc_info=True)
 
     # ---- 分钟滚动 ----
 
