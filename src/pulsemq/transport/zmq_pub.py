@@ -73,13 +73,10 @@ class AsyncZAPHandler:
             # ZAP 请求帧格式:
             # [version, request_id, domain, address, identity, mechanism, ...credentials]
             if len(msg) < 7:
-                self._zap.send_multipart([
+                await self._send_zap_reply(
                     msg[1] if len(msg) > 1 else b"",
-                    b"400",
-                    b"Invalid ZAP request",
-                    b"",
-                    b"",
-                ])
+                    b"400", b"Invalid ZAP request",
+                )
                 continue
 
             version = msg[0]
@@ -97,7 +94,7 @@ class AsyncZAPHandler:
                     "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=not-PLAIN mechanism=%s",
                     username or "<empty>", client_addr, mechanism.decode("utf-8", "replace"),
                 )
-                self._zap.send_multipart([version, request_id, b"400", b"Not PLAIN", b"", b""])
+                await self._send_zap_reply(request_id, b"400", b"Not PLAIN")
                 continue
 
             # 白名单校验
@@ -108,14 +105,46 @@ class AsyncZAPHandler:
                     username, client_addr,
                 )
                 await self._notify_auth(username, client_addr, True)
-                self._zap.send_multipart([version, request_id, b"200", b"OK", username.encode(), b""])
+                await self._send_zap_reply(
+                    request_id, b"200", b"OK", user_id=username.encode(),
+                )
             else:
                 logger.warning(
                     "[SUB 认证失败] user=%s addr=%s auth=FAIL reason=invalid-credentials",
                     username or "<empty>", client_addr,
                 )
                 await self._notify_auth(username, client_addr, False)
-                self._zap.send_multipart([version, request_id, b"400", b"Invalid credentials", b"", b""])
+                await self._send_zap_reply(request_id, b"400", b"Invalid credentials")
+
+    async def _send_zap_reply(
+        self,
+        request_id: bytes,
+        status_code: bytes,
+        status_text: bytes,
+        *,
+        version: bytes = b"1.0",
+        user_id: bytes = b"",
+    ) -> None:
+        """发送 ZAP 响应（6 帧），并保护 send 异常。
+
+        ZAP 协议要求响应为 6 帧：
+        [version, request_id, status_code, status_text, user_id, metadata]。
+
+        历史问题：
+        1) 响应未 await：zmq.asyncio socket 的 send_multipart 返回协程，
+           未 await 则响应永不发送，SUB 认证永久挂死；
+        2) send 异常未保护：一次 send 失败会让 _loop 整体退出，
+           ZAP task 静默死亡，后续所有 SUB 认证全部失效。
+        本方法统一 await + try/except，单次 send 失败仅记日志、不影响循环。
+        """
+        if self._zap is None:
+            return
+        try:
+            await self._zap.send_multipart([
+                version, request_id, status_code, status_text, user_id, b"",
+            ])
+        except (zmq.ZMQError, asyncio.CancelledError):
+            logger.warning("ZAP 响应发送失败，忽略并继续处理后续请求", exc_info=True)
 
     async def _notify_auth(self, username: str, client_addr: str, success: bool) -> None:
         """调用认证事件回调，回调异常不影响认证流程。"""
