@@ -19,10 +19,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from functools import wraps
 from typing import Any, Callable, Awaitable, overload, Literal
+
+from loguru import logger
 
 from pulsemq.producers.types import (
     PubData,
@@ -39,8 +40,6 @@ from pulsemq.protocol import frames as frame_codec
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
 from pulsemq.transport.zmq_pub import AuthCallback, ZmqPubTransport
-
-logger = logging.getLogger(__name__)
 
 # 包版本：从 pulsemq._version 统一读取，保持向后兼容的导入路径
 __all__ = ["__version__"]
@@ -294,6 +293,7 @@ class PulsePublisher:
                 bind=self._config.bind,
                 api_keys=api_keys,
                 on_auth=self._on_auth,
+                keepalive_timeout=self._config.keepalive_timeout,
             )
             await self._transport.start()
 
@@ -326,7 +326,7 @@ class PulsePublisher:
             # 启动所有 producer
             await self._producer_mgr.start_all(self._on_produce, self._make_sender)
 
-            logger.info("PulsePublisher 运行中 (bind=%s, admin=%s)", self._config.bind, self._config.admin_bind)
+            logger.info("PulsePublisher 运行中 (bind={}, admin={})", self._config.bind, self._config.admin_bind)
 
             # 等待运行结束
             while self._running:
@@ -585,11 +585,9 @@ class PulsePublisher:
 def main() -> None:
     """CLI 入口点。提供最小示例 publisher。"""
     import sys
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        stream=sys.stderr,
-    )
+    from loguru import logger as _logger
+    _logger.remove()
+    _logger.add(sys.stderr, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} [{level}] {message}")
     pub = PulsePublisher()
     print(format_startup_table(pub._config, pub._explicit_api_keys), file=sys.stderr)
     print("用法: 参考 PulsePublisher 文档注册 producer", file=sys.stderr)

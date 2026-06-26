@@ -1,6 +1,6 @@
 [project]
 name = "pulse-mq"
-version = "3.2.2"
+version = "4.0.2"
 description = "高性能纯 pub→sub 消息系统"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,7 @@ dependencies = [
     "zstandard>=0.22",
     "pyarrow>=14.0",
     "pandas>=2.0",
+    "loguru>=0.7",
 ]
 
 [project.urls]

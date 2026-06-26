@@ -62,7 +62,7 @@ def _make_plain_request(*, username: str = "alice", password: str = "pw") -> lis
 async def test_loop_survives_send_error() -> None:
     """send_multipart 抛异常时 _loop 必须存活，继续处理后续请求。"""
     ctx = zmq.asyncio.Context()
-    handler = AsyncZAPHandler(api_keys={"alice": "pw"}, ctx=ctx)
+    handler = AsyncZAPHandler(api_keys={"alice": "pw"}, ctx=ctx, connected_users=set(), last_seen={})
     stub = _StubZapSocket()
     handler._zap = stub  # type: ignore[assignment]  # 注入桩 socket 替代真实 REP
 

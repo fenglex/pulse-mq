@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Callable
 
 import pandas as pd
 import pytest
+from loguru import logger
 
 # Windows: 强制 Selector 事件循环。pyzmq 的 asyncio 集成不支持 Proactor。
 if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
@@ -28,6 +29,26 @@ from pulsemq.config import PublisherConfig
 from pulsemq.publisher import PulsePublisher
 from pulsemq.protocol.frames import PulseMessage
 from pulsemq.subscriber import PulseSubscriber
+
+
+# ---------------------------------------------------------------------------
+# Loguru 测试集成：确保 loguru 输出可被 pytest capsys/capfd 捕获
+# ---------------------------------------------------------------------------
+
+def _loguru_stderr_sink(message: Any) -> None:
+    """动态写入当前 sys.stderr，确保 pytest capsys 可捕获。"""
+    sys.stderr.write(str(message))
+    sys.stderr.flush()
+
+
+@pytest.fixture(autouse=True)
+def _loguru_capture() -> Any:
+    """配置 loguru 使用动态 sys.stderr sink，pytest capsys 可捕获。"""
+    logger.remove()  # 移除所有 sink
+    logger.add(_loguru_stderr_sink, format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}", level="DEBUG")
+    yield
+    logger.remove()  # 测试结束后清理
+    logger.add(sys.stderr)  # 恢复默认 sink
 
 
 # ---------------------------------------------------------------------------

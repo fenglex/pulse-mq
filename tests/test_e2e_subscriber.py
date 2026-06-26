@@ -238,7 +238,7 @@ class TestSubscriberErrors:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        capsys,
+        capfd,
     ) -> None:
         """错误凭证：subscribe() 打提示后静默结束迭代（不卡死、不抛异常）。
 
@@ -275,7 +275,7 @@ class TestSubscriberErrors:
         # 不应收到任何消息
         assert received == [], f"错误凭证不应收到消息，实际 {len(received)} 条"
         # 应有认证失败的提示（输出到 stderr，不依赖 logging 配置）
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         combined = captured.err + captured.out
         assert "认证失败" in combined, (
             f"错误凭证应输出 [SUB 认证失败] 到 stderr，实际捕获: {combined!r}"
@@ -308,9 +308,9 @@ class TestAuthVisibility:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        capsys,
+        capfd,
     ) -> None:
-        """正确凭证：sub 端应有上线提示（print 到 stderr，不依赖 logging 配置）。"""
+        """正确凭证：sub 端应有上线提示（loguru 输出到 stderr）。"""
         pub_port, admin_port = random_port_pair
         pub = make_publisher(
             pub_port=pub_port, admin_port=admin_port, tmp_db=tmp_sqlite_url,
@@ -338,7 +338,7 @@ class TestAuthVisibility:
                 await sub.close()
 
         # 核心断言：sub 端应有认证成功的上线提示（输出到 stderr）
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         combined = captured.err + captured.out
         assert "上线" in combined or "认证成功" in combined, (
             f"认证成功时应输出上线提示到 stderr，实际捕获: {combined!r}"
@@ -512,7 +512,7 @@ class TestConnectionNotice:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        capsys,
+        capfd,
     ) -> None:
         pub_port, admin_port = random_port_pair
         pub = make_publisher(
@@ -537,9 +537,9 @@ class TestConnectionNotice:
             finally:
                 await sub.close()
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         combined = captured.err + captured.out
-        # 关键：认证成功应有可见提示（不依赖 logging 配置）
+        # 关键：认证成功应有可见提示（loguru 输出）
         assert "上线" in combined or "auth=OK" in combined or "认证成功" in combined, (
             f"认证成功应输出到 stderr 可见，实际捕获: {combined!r}"
         )
@@ -548,12 +548,11 @@ class TestConnectionNotice:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        capsys,
+        capfd,
     ) -> None:
         """sub 上线时，pub 端（ZAP handler）应有可见提示输出到 stderr。
 
-        背景：pub 端 ZAP handler 此前用 logging.info 打 [SUB 上线] auth=OK，
-        用户没配 basicConfig() 时被吞掉，完全看不到。改用 print 到 stderr。
+        pub 端 ZAP handler 用 loguru 打 [SUB 上线] auth=OK。
         本测试断言 pub 端专属格式「auth=OK」（区别于 sub 端的「认证成功」）。
         """
         pub_port, admin_port = random_port_pair
@@ -579,7 +578,7 @@ class TestConnectionNotice:
             finally:
                 await sub.close()
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         combined = captured.err + captured.out
         # pub 端 ZAP 输出格式：[SUB 上线] user=alice addr=... auth=OK
         assert "auth=OK" in combined, (

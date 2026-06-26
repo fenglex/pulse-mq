@@ -16,6 +16,8 @@
 - **纳秒时间戳** — 帧级时间戳独立成帧，端到端延迟可精确测量
 - **跨平台** — Windows / macOS / Linux 开箱即用；`import pulsemq` 自动修正 Windows 事件循环策略，SUB 端无需任何额外配置即可正常收消息
 - **连接可观测** — SUB 连接时 publisher 端打印 `[SUB 上线] user=xxx addr=1.2.3.4 auth=OK`，认证失败打印 `[SUB 认证失败] ... reason=...`，便于排查谁连进来、为什么连不上
+- **心跳保活** — subscriber 每秒发送心跳，publisher 5 秒未收到则自动移除用户（检测 kill/崩溃）
+- **单用户限制** — 同一用户仅允许一个 subscriber 连接，重复连接被拒绝
 
 ## 安装
 
@@ -109,6 +111,19 @@ async def main():
 
 asyncio.run(main())
 ```
+
+**Subscriber 参数**：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `address` | `str` | `tcp://localhost:5555` | Publisher 地址 |
+| `username` | `str` | `""` | 认证用户名 |
+| `password` | `str` | `""` | 认证密码 |
+| `keepalive_interval` | `float` | `1.0` | 心跳发送间隔（秒） |
+
+**单用户限制**：开启认证时，同一用户仅允许一个 subscriber 连接。若需重连，前一个必须先断开或被超时移除。
+
+> **⚠️ 认证使用须知**：由于 ZMQ PLAIN 协议的设计限制，当 publisher 启用认证但 subscriber 未提供凭证时，连接可能绕过 ZAP 验证。**连接到有认证的 publisher 时，subscriber 必须提供 `username`/`password`**。错误凭证会被拒绝并记录日志。
 
 `PulseMessage` 字段：
 
@@ -226,6 +241,7 @@ async def bench():
 | `PULSEMQ_ADMIN_BIND` | Admin 后台绑定地址 | `0.0.0.0:9090` |
 | `PULSEMQ_STATS_DB` | 统计 SQLite 路径 | `sqlite://./stats.sqlite` |
 | `PULSEMQ_API_KEYS` | API Key 列表 `user1:pass1,user2:pass2`，空=关闭认证 | `""` |
+| `PULSEMQ_KEEPALIVE_TIMEOUT` | 心跳超时阈值（秒），subscriber 被 kill 后自动移除用户的等待时间 | `5.0` |
 
 ### Python 配置
 
@@ -238,6 +254,7 @@ config = PublisherConfig(
     stats_db="sqlite://./stats.sqlite",
     stats_retention_minutes=480,   # 内存窗口，默认 8 小时
     api_keys_str="alice:pulse_sk_alice,bob:pulse_sk_bob",
+    keepalive_timeout=5.0,         # 心跳超时（秒）
 )
 
 pub = PulsePublisher(config)
@@ -353,13 +370,35 @@ python scripts/bench_pubsub_matrix.py
 
 ## 更新日志
 
+### v4.0.2
+
+📝 **文档更新**：补充 PLAIN 认证使用限制说明。
+
+- **认证限制说明**：由于 ZMQ PLAIN 协议设计限制，当 publisher 启用认证时，subscriber 必须提供 `username`/`password`，否则可能绕过 ZAP 验证
+- 错误凭证会被拒绝并记录日志（`[SUB 认证失败]`）
+
+### v4.0.1
+
+🔧 **bugfix**：修复认证相关问题。
+
+- **修复断开通知竞态条件**：subscriber 断开后增加短暂等待（50ms），确保 publisher 处理断开通知后再接受同一用户的新连接，避免“already_connected”误判
+- **修复空密码认证**：当 username 提供但 password 为空时，使用占位符确保 PLAIN 握手正常进行
+
+### v4.0.0
+
+⚠️ **Breaking Change**：新增心跳保活 + 单用户限制 + 日志框架切换 loguru。**pub/sub 两端必须同时升级到 v4.0.0。**
+
+- **🔴 心跳保活（核心）**：subscriber 每秒发送心跳帧，publisher 5 秒未收到则自动移除用户。解决 subscriber 被 kill/崩溃时 publisher 无法感知的问题，避免 `connected_users` 永远无法清理导致新用户被拒绝连接
+- **🔴 单用户限制**：同一用户仅允许一个 subscriber 连接，重复连接返回 `400 Already connected`。防止同一账号在多个 SUB 端同时在线
+- **🔴 日志框架切换 loguru**：所有模块从 `logging` 切换到 `loguru`，日志始终可见，无需配置 `logging.basicConfig()`
+- **新增配置**：`PULSEMQ_KEEPALIVE_TIMEOUT` 环境变量（默认 5s）；subscriber 新增 `keepalive_interval` 参数（默认 1s）
+- **协议变更**：PULL socket（PUB端口+1）现在接收断开帧 + 心跳帧两种控制帧，老版本 subscriber 无法发送心跳，会被超时移除
+
+> **升级注意**：v4 与 v3.x **不兼容**，pub/sub 两端必须同时升级。老版本 subscriber 连接 v4 publisher 会在 5 秒内被自动移除。
+
 ### v3.2.2
 
 🔧 **bugfix**：修复 pub 端 sub 上线/认证失败提示看不到（v3.2.1 遗漏）。
-
-- **🔴 修复 pub 端认证提示看不到（致命）**：v3.2.1 只把 sub 端的连接事件改成 `print` 到 stderr，**遗漏了 pub 端**——pub 端 ZAP handler 仍用 `logging.info`/`logger.warning` 打 `[SUB 上线] auth=OK` 和 `[SUB 认证失败] auth=FAIL`，用户没配 `logging.basicConfig()` 时同样被 Python 默认 lastResort 吞掉。修复：pub 端 3 处认证事件（上线成功 / 凭证错误 / 非 PLAIN 机制失败）也改用 `print(..., file=sys.stderr)` 直接输出，与 sub 端对称，保证始终可见。
-
-> **升级建议**：v3.2.1 用户建议升级——v3.2.1 的 pub 端仍看不到 sub 上线提示。
 
 ### v3.2.1
 

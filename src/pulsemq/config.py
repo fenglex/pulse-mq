@@ -12,6 +12,7 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "PULSEMQ_ADMIN_BIND": ("admin_bind", str),
     "PULSEMQ_STATS_DB": ("stats_db", str),
     "PULSEMQ_API_KEYS": ("api_keys_str", str),
+    "PULSEMQ_KEEPALIVE_TIMEOUT": ("keepalive_timeout", float),
 }
 
 
@@ -33,6 +34,10 @@ class PublisherConfig:
 
     # 心跳发送间隔（秒），<= 0 禁用心跳发送
     heartbeat_interval: float = 30.0
+
+    # 心跳超时检测阈值（秒），<= 0 禁用检测
+    # subscriber 被 kill/崩溃时，超过此阈值未收到心跳则自动移除用户
+    keepalive_timeout: float = 5.0
 
     # API Keys 字符串（user1:pass1,user2:pass2），空=关闭认证
     api_keys_str: str = ""

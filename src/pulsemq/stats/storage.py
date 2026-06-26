@@ -6,15 +6,14 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
-from pulsemq.stats.traffic import MinuteSlot
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from pulsemq.stats.traffic import MinuteSlot
 
 
 class StatsStorage:
@@ -42,7 +41,7 @@ class StatsStorage:
             )
         """)
         self._conn.commit()
-        logger.info("StatsStorage 连接: %s", self._db_path)
+        logger.info("StatsStorage 连接: {}", self._db_path)
 
     def close(self) -> None:
         if self._conn is not None:

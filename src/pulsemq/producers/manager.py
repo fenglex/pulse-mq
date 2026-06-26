@@ -8,14 +8,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
-from pulsemq.producers.types import ProducerCallback, PubData
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from pulsemq.producers.types import ProducerCallback, PubData
 
 
 @dataclass
@@ -69,7 +68,7 @@ class ProducerManager:
             inject_sender=inject_sender,
         )
         self._specs[name] = spec
-        logger.info("Producer 注册: name=%s interval=%.1fs", name, interval)
+        logger.info("Producer 注册: name={} interval={:.1f}s", name, interval)
 
     def register_burst(
         self,
@@ -91,7 +90,7 @@ class ProducerManager:
             inject_sender=inject_sender,
         )
         self._specs[name] = spec
-        logger.info("Burst Producer 注册: name=%s", name)
+        logger.info("Burst Producer 注册: name={}", name)
 
     @property
     def specs(self) -> dict[str, ProducerSpec]:
@@ -116,7 +115,7 @@ class ProducerManager:
                 coro = self._run_loop(spec, on_message, sender_factory)
             task = asyncio.create_task(coro, name=f"producer-{name}")
             self._tasks[name] = task
-            logger.info("Producer 启动: %s (burst=%s)", name, spec.interval == 0.0)
+            logger.info("Producer 启动: {} (burst={})", name, spec.interval == 0.0)
 
     async def stop_all(self) -> None:
         """停止所有 producer 任务。"""
@@ -155,7 +154,7 @@ class ProducerManager:
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.warning("Producer %s 回调异常", spec.name, exc_info=True)
+                logger.warning("Producer {} 回调异常", spec.name, exc_info=True)
 
             elapsed = time.monotonic() - start
             sleep_time = max(0.0, spec.interval - elapsed)
@@ -190,5 +189,5 @@ class ProducerManager:
             except asyncio.CancelledError:
                 break
             except Exception:
-                logger.warning("Burst Producer %s 回调异常", spec.name, exc_info=True)
+                logger.warning("Burst Producer {} 回调异常", spec.name, exc_info=True)
                 await asyncio.sleep(0.1)

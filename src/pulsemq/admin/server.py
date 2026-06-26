@@ -7,20 +7,19 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import mimetypes
 import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from loguru import logger
+
 from pulsemq._version import __version__ as _PKG_VERSION
 from pulsemq.admin.web_ui import INDEX_HTML
 from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
-
-logger = logging.getLogger(__name__)
 
 # 版本号：从 pulsemq._version 统一读取，避免与包版本脱节
 SERVER_VERSION: str = _PKG_VERSION
@@ -81,7 +80,7 @@ class AdminServer:
             self._handle_request, self._host, self._port
         )
         self._sse_task = asyncio.create_task(self._sse_broadcast_loop())
-        logger.info("AdminServer 启动: http://%s:%d", self._host, self._port)
+        logger.info("AdminServer 启动: http://{}:{}", self._host, self._port)
 
     async def stop(self) -> None:
         # 关闭 SSE 客户端
@@ -142,7 +141,7 @@ class AdminServer:
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception:
-            logger.debug("请求处理异常 path=%s", locals().get("path", "?"), exc_info=True)
+            logger.debug("请求处理异常 path={} locals={}", locals().get("path", "?"), exc_info=True)
         finally:
             if not getattr(writer, "_sse_takeover", False):
                 try:
@@ -346,7 +345,7 @@ class AdminServer:
                         # 避免死客户端在字典中残留造成内存泄漏。
                         task.cancel()
                         self._sse_clients.pop(cid, None)
-                        logger.debug("SSE 客户端 %d 队列满，已断开", cid)
+                        logger.debug("SSE 客户端 {} 队列满，已断开", cid)
             except asyncio.CancelledError:
                 break
             except Exception:

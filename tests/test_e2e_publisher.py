@@ -367,7 +367,7 @@ class TestStartupTable:
         self,
         random_port_pair: tuple[int, int],
         tmp_sqlite_url: str,
-        capsys: pytest.CaptureFixture,
+        capfd: pytest.CaptureFixture,
     ) -> None:
         """start() 启动时应把配置表格打印到 stderr。
 
@@ -386,7 +386,7 @@ class TestStartupTable:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await pub_task
 
-        captured = capsys.readouterr()
+        captured = capfd.readouterr()
         assert "PulseMQ Publisher v" in captured.err
         assert f"tcp://127.0.0.1:{pub_port}" in captured.err
 
