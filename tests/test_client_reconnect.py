@@ -3,13 +3,20 @@
 
 E2E：consumer 订阅 → server 停 → 同端口重启 → consumer 自动重连
 + 重新认证 + 恢复订阅 → producer 发布后仍能收到。业务层不需要再次 subscribe()。
+
+第二个测试覆盖 review Fix 1：重连时认证失败（凭据被服务端改掉）→
+``_reconnect_loop`` 把 ``AuthenticationError`` 存到 ``consumer._reconnect_fatal``
+而非在后台任务里 raise（那样会被 asyncio GC 吞掉），run_forever 在主上下文重抛。
 """
 from __future__ import annotations
 
 import asyncio
 import socket as _sock
 
+import pytest
+
 from pulsemq import ConsumerClient, ProducerClient, Server
+from pulsemq.errors import AuthenticationError
 
 
 def _free_port() -> int:
@@ -79,3 +86,68 @@ async def test_client_reconnects_and_restores_subscription():
         except Exception:
             pass
         raise
+
+
+async def test_reconnect_auth_failure_sets_reconnect_fatal():
+    """Review Fix 1：重连认证失败 → ``_reconnect_fatal`` 被设为
+    ``AuthenticationError(reason="invalid_password")``，且 ``_stop`` 被置位。
+
+    断网后用错误密码重启服务端凭据表，使 consumer 重连时 PLAIN 认证失败。
+    断言实例属性（不依赖后台任务异常传播，避免 asyncio GC 吞错带来的不确定）。
+    """
+    dp, cp, ap = _free_port(), _free_port(), _free_port()
+    data_ep = f"tcp://127.0.0.1:{dp}"
+    ctrl_ep = f"tcp://127.0.0.1:{cp}"
+    creds = {"c": "c", "p": "p"}
+    srv = Server(
+        data_endpoint=data_ep,
+        control_endpoint=ctrl_ep,
+        admin_endpoint=f"127.0.0.1:{ap}",
+        credentials=creds,
+    )
+    await srv.start()
+    await asyncio.sleep(0.2)
+    consumer = ConsumerClient(data_ep, ctrl_ep, "c", "c")
+    await consumer.start()
+    await asyncio.sleep(0.3)
+
+    try:
+        # 断开 server → client 检测 disconnected → 进入 _reconnect_loop。
+        await srv.stop()
+        await asyncio.sleep(1.0)
+
+        # 同端口重启，但把 client "c" 的密码改掉 → 重连时 PLAIN 认证失败。
+        srv2 = Server(
+            data_endpoint=data_ep,
+            control_endpoint=ctrl_ep,
+            admin_endpoint=f"127.0.0.1:{ap}",
+            credentials={"c": "WRONG", "p": "p"},
+        )
+        await srv2.start()
+        await asyncio.sleep(0.3)
+        try:
+            # 初始退避 1s；给足时间让认证裁定到达 auth_failed 分支。
+            for _ in range(40):
+                await asyncio.sleep(0.5)
+                if consumer._reconnect_fatal is not None:
+                    break
+
+            fatal = consumer._reconnect_fatal
+            assert isinstance(fatal, AuthenticationError), (
+                f"_reconnect_fatal 不是 AuthenticationError: {fatal!r}"
+            )
+            assert fatal.reason == "invalid_password", (
+                f"reason 应为 invalid_password，实际 {fatal.reason!r}"
+            )
+            # _stop 被置位 → run_forever 主循环会退出并重抛。
+            assert consumer._stop.is_set(), "_stop 未被置位"
+        finally:
+            try:
+                await srv2.stop()
+            except Exception:
+                pass
+    finally:
+        try:
+            await consumer.stop()
+        except Exception:
+            pass

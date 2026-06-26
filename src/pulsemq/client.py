@@ -21,6 +21,16 @@ Spec 1 已知限制（见 task-12-report）：
 - 控制面回复匹配是朴素的：REGISTER/SUBSCRIBE 各做一次 ``recv("control")``，
   心跳 ack 是 fire-and-forget，可能在控制面 socket 上堆积并和下一次
   register/subscribe 的 recv 串扰。单客户端 e2e 场景下可接受。
+
+Spec 1 显式偏差：ALREADY_ONLINE 重试
+- Spec 1 §8.3 规定重连时 REGISTER 收到 ALREADY_ONLINE 应退出码 4。但服务端的
+  ``OnlineRegistry`` 以 username 为唯一键，断网后 stale 记录要等心跳超时扫描
+  （``heartbeat_timeout = 6.0s``）才会清理。若一遇到 ALREADY_ONLINE 立即退出 4，
+  自动重连将形同虚设——网络闪断后任何重连都会被 6s 内尚未释放的旧条目击落。
+- 因此当前实现把 ALREADY_ONLINE（及任何 REGISTER/控制面失败）视为暂态失败，
+  退避重试，待心跳扫描释放 username 后自然成功。重试行为本身不改；本偏差仅
+  记录此处与 §8.3 文字的分歧。待服务端支持 reconnect 触发的快速 stale 条目
+  驱逐后再回到 exit 4 的严格行为。
 """
 from __future__ import annotations
 
@@ -96,6 +106,10 @@ class Client:
         # 运行期重连状态机（Spec 1 §8.3）。
         self._reconnecting = False
         self._reconnect_task: asyncio.Task | None = None
+        # 重连时发生的致命错误（如认证失败）。后台 _reconnect_loop 不直接 raise
+        # （会被 asyncio GC 吞掉），而是存到这里，由 run_forever/stop 在主任务
+        # 上下文重新抛出，从而让 CLI 经 exit_code_for 拿到 exit 3。
+        self._reconnect_fatal: AuthenticationError | None = None
         # 生命周期回调（可选）。
         self.on_connected: Callable[[], Awaitable[None]] | None = None
         self.on_disconnected: Callable[[], Awaitable[None]] | None = None
@@ -244,11 +258,16 @@ class Client:
         新建 Transport → PLAIN 认证 → REGISTER（同 client_id）→ 恢复订阅 →
         重启 recv/heartbeat 循环。
 
-        - 重连时认证失败（auth_failed）→ ``AuthenticationError``（exit 3）。
-        - ALREADY_ONLINE：服务端心跳超时扫描（6s）会释放旧 username，对 Spec 1
-          视为暂态失败 → 退避重试，扫描清理后自然成功。
+        - 重连时认证失败（auth_failed）→ **不在此后台任务内 raise**（会被
+          asyncio GC 吞掉）；改为把 ``AuthenticationError`` 存到
+          ``self._reconnect_fatal``，set ``_stop`` 后 return。run_forever /
+          stop 路径在主任务上下文重新抛出，使 CLI 经 ``exit_code_for`` 拿到
+          exit 3。
+        - ALREADY_ONLINE：Spec 1 偏差（见模块 docstring 与下方注释），退避重试。
         - 超时/其他暂态失败 → 退避重试。
         - ``_stop`` 触发后立即退出（优雅停机优先）。
+        - 中途被取消（``CancelledError``，属 BaseException）→ 关闭尚未提交的
+          in-flight transport，避免 socket/monitor 任务泄漏。
         """
         loop = asyncio.get_running_loop()
         creds = (self._username, self._password) if self._username else None
@@ -265,9 +284,13 @@ class Client:
         except Exception:
             logger.debug("重连前旧 transport 关闭失败", exc_info=True)
 
+        # 本次重连尚未提交给 self._transport 的新 transport；若被取消/出错，
+        # 需在 finally 中关闭它，避免泄漏 socket 与 monitor 任务。
+        in_flight: Transport | None = None
         try:
             while not self._stop.is_set():
                 new_transport = Transport()
+                in_flight = new_transport
                 # 准备本次重连的认证裁定 future。
                 self._startup_event = loop.create_future()
                 new_transport.set_monitor_callback(self._on_reconnect_monitor)
@@ -278,6 +301,7 @@ class Client:
                     )
                 except Exception:
                     await self._safe_close(new_transport)
+                    in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
                                 _RECONNECT_MAX_DELAY)
@@ -294,18 +318,24 @@ class Client:
                     kind = None
 
                 if kind == "auth_failed":
-                    # 重连时凭据无效 → 硬失败，exit 3。
+                    # 重连时凭据无效 → 致命错误。**不在后台任务内 raise**
+                    # （会被 asyncio GC 吞掉，进程不会 exit 3）。存到实例，
+                    # 触发 _stop 让 run_forever 主循环退出并在主上下文重抛。
                     await self._safe_close(new_transport)
+                    in_flight = None
                     log_event("ERROR", "CLIENT",
                               username=self._username,
                               action="reconnect_auth_failed")
-                    raise AuthenticationError(
+                    self._reconnect_fatal = AuthenticationError(
                         f"重连认证失败（用户名/密码错误）: {self._username}",
                         reason="invalid_password",
                     )
+                    self._stop.set()
+                    return
                 if kind != "handshake_ok":
                     # 超时/其他暂态失败 → 退避重试。
                     await self._safe_close(new_transport)
+                    in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
                                 _RECONNECT_MAX_DELAY)
@@ -313,6 +343,7 @@ class Client:
 
                 # 认证通过：切换 transport，接控制面，REGISTER，恢复订阅。
                 self._transport = new_transport
+                in_flight = None  # 已提交给 self._transport，finally 不应再关它
                 try:
                     await self._transport.connect(
                         self._control_endpoint, "control",
@@ -323,19 +354,23 @@ class Client:
                     for pattern in list(self._subscriptions):
                         await self._send_subscribe(pattern)
                 except Exception:
-                    # REGISTER 被拒（如 ALREADY_ONLINE）/ 控制面连接失败
-                    # 视为暂态失败（服务端心跳扫描会清理 ALREADY_ONLINE）→
-                    # 退避重试。
+                    # Spec 1 偏差：§8.3 规定重连 REGISTER 收到 ALREADY_ONLINE
+                    # 应 exit 4，但我们退避重试。原因：服务端的 stale 记录要等
+                    # 心跳超时扫描（~6s）才释放，立即 exit 4 会让任何网络闪断后
+                    # 的重连被旧条目击落，自动重连形同虚设。待服务端支持
+                    # reconnect 触发的快速 stale 条目驱逐后再回到严格 exit 4。
                     logger.debug("重连阶段 REGISTER/订阅恢复失败，将退避重试",
                                  exc_info=True)
                     await self._safe_close(self._transport)
                     self._transport = Transport()  # 占位，避免 stop/close 拿到坏的
+                    in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
                                 _RECONNECT_MAX_DELAY)
                     continue
 
-                # 成功：重启后台循环，恢复运行期 monitor。
+                # 成功：重启后台循环，恢复运行期 monitor，清掉之前的致命错误。
+                self._reconnect_fatal = None
                 self._connected = True
                 self._authenticated = True
                 self._recv_task = asyncio.create_task(self._recv_loop())
@@ -345,6 +380,13 @@ class Client:
                 log_event("INFO", "CLIENT",
                           username=self._username, action="reconnected")
                 return
+        except BaseException:
+            # 包括 CancelledError（Py3.8+ 属 BaseException，普通 except Exception
+            # 捕不到）。若此刻有尚未提交给 self._transport 的 in-flight transport
+            # （已 connect、可能挂着 monitor 任务），关闭它以防 socket/任务泄漏。
+            if in_flight is not None and self._transport is not in_flight:
+                await self._safe_close(in_flight)
+            raise
         finally:
             # 兜底：确保 _reconnecting 不会卡住（若 stop 触发提前退出）。
             self._reconnecting = False
@@ -589,13 +631,23 @@ class ProducerClient(Client):
         await self.publish(spec.name, data)
 
     async def run_forever(self) -> None:
-        """连接 + 认证 + 注册，启动所有 producer 调度，运行直到 stop()。"""
+        """连接 + 认证 + 注册，启动所有 producer 调度，运行直到 stop()。
+
+        若后台重连遇到致命错误（如重连认证失败），``_reconnect_loop`` 会把
+        异常存到 ``self._reconnect_fatal`` 并 set ``_stop``；此处 ``_stop.wait``
+        返回后，在主任务上下文重新抛出，使 CLI 经 ``exit_code_for`` 拿到 exit 3。
+        """
         await self.start()
         try:
             await self._producer_mgr.start_all(self._on_produce, sender_factory=None)
-            await self._stop.wait()  # stop() 设置 _stop 后退出
+            await self._stop.wait()  # stop() 或重连致命错误都会 set _stop
         finally:
             await self._producer_mgr.stop_all()
+            fatal = self._reconnect_fatal
+            if fatal is not None:
+                # 在主任务上下文重新抛出 → CLI 走 exit_code_for → exit 3。
+                self._reconnect_fatal = None
+                raise fatal
 
     async def subscribe(self, topic_pattern: str, callback: Callable) -> None:  # type: ignore[override]
         raise NotImplementedError("ProducerClient 不支持订阅")
