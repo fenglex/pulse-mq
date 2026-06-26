@@ -6,13 +6,15 @@
   Transport.send 调 send_multipart([identity_bytes, frame])，必须传 bytes。
 - Server 持有 client_id→ident 映射，用于心跳超时清理 routing（client_id 与
   ROUTER identity 不是同一个东西）。
-- 不导入 admin（admin 接入由 Task 11b 完成）。
+- 不维护 topic 缓存（Spec 1 §9.2 admin 服务沿用现有 AdminServer；topic_buffers
+  传 None，AdminServer 已对 None 做了容忍）。
 """
 from __future__ import annotations
 
 import asyncio
 import time
 
+from pulsemq.admin.server import AdminServer
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
                              RegisterResult)
@@ -52,11 +54,29 @@ class Server:
         # client_id (REGISTER payload) -> ROUTER bytes identity
         # 心跳超时清理 routing 时必须用它把 client_id 映射回 bytes ident。
         self._ident_by_client_id: dict[str, bytes] = {}
+        # admin HTTP 服务（Spec 1 §9.2：常驻，沿用现有 AdminServer）
+        self._admin: AdminServer | None = None
+        self._start_time: float | None = None
 
     async def start(self) -> None:
         self._storage.connect()
         await self._transport.bind(self._data_endpoint, "server_ingress", auth=self._auth)
         await self._transport.bind(self._control_endpoint, "control", auth=self._auth)
+        # 接入 AdminServer（:9090 监控端口）。Spec 1 在同一 event loop 上运行，
+        # Spec 3 后续再迁移到独立线程。
+        self._start_time = time.time()
+        self._admin = AdminServer(
+            bind=self._admin_endpoint,
+            traffic_stats=self._stats,
+            topic_buffers=None,  # Spec 1 不维护 topic 缓存
+            stats_storage=self._storage,
+            snapshot_fn=lambda: {
+                "online_clients": self._registry.snapshot(),
+                "subscriptions": self._routing.snapshot(),
+            },
+            start_time=self._start_time,
+        )
+        await self._admin.start()
         self._running = True
         self._tasks = [
             asyncio.create_task(self._data_loop()),
@@ -65,9 +85,10 @@ class Server:
             asyncio.create_task(self._minute_roll_loop()),
         ]
         logger.info(
-            "Server 启动完成 data={} control={}",
+            "Server 启动完成 data={} control={} admin={}",
             self._data_endpoint,
             self._control_endpoint,
+            self._admin_endpoint,
         )
 
     async def _data_loop(self) -> None:
@@ -231,5 +252,9 @@ class Server:
             self._storage.save_minutes_batch(archived)
         except Exception:
             logger.debug("stop 归档失败", exc_info=True)
+        # 关闭顺序（Spec 1 §10/§11.8）：停 admin → 停 transport → 关 storage。
+        if self._admin is not None:
+            await self._admin.stop()
+            self._admin = None
         await self._transport.close()
         self._storage.close()
