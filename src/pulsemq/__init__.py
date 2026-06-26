@@ -1,12 +1,17 @@
-"""PulseMQ v2 — Client/Server 模型消息系统（重构中）。"""
+"""PulseMQ v2 — Client/Server 模型消息系统。"""
+import sys
 
-import sys as _sys
-
-if _sys.platform == "win32":  # pragma: no cover - 平台相关
-    import asyncio as _asyncio
-    if hasattr(_asyncio, "WindowsSelectorEventLoopPolicy"):
-        _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+if sys.platform == "win32":  # pragma: no cover - 平台相关
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from pulsemq._version import __version__
+from pulsemq.client import Client, ConsumerClient, ProducerClient
+from pulsemq.producers.types import PubData
+from pulsemq.protocol.frames import PulseMessage
+from pulsemq.server import Server
 
-__all__ = ["__version__"]
+__all__ = [
+    "Client", "ProducerClient", "ConsumerClient", "Server",
+    "PulseMessage", "PubData", "__version__",
+]

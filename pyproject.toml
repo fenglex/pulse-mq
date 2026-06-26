@@ -1,6 +1,6 @@
 [project]
 name = "pulse-mq"
-version = "4.0.2"
+version = "5.0.0"
 description = "高性能纯 pub→sub 消息系统"
 readme = "README.md"
 license = "MIT"
@@ -36,7 +36,8 @@ Repository = "https://github.com/haifeng/pulse-mq"
 Issues = "https://github.com/haifeng/pulse-mq/issues"
 
 [project.scripts]
-pulse-mq = "pulsemq.publisher:main"
+pulsemq = "pulsemq.cli.server:main"
+pulsemq-server = "pulsemq.cli.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsemq"]

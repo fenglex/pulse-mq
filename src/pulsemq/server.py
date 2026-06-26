@@ -210,6 +210,10 @@ class Server:
     async def wait_for_shutdown(self) -> None:
         await self._stop.wait()
 
+    def is_shutting_down(self) -> bool:
+        """是否已进入关闭流程（_stop 已 set）。"""
+        return self._stop.is_set()
+
     async def stop(self) -> None:
         self._running = False
         self._stop.set()
