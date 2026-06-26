@@ -340,7 +340,74 @@ def _matches(pattern: str, topic: str) -> bool:
 
 
 class ProducerClient(Client):
-    """只发布，屏蔽 subscribe。"""
+    """只发布。支持 producer 调度装饰器（复用 ProducerManager）。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from pulsemq.producers.manager import ProducerManager
+
+        self._producer_mgr = ProducerManager()
+
+    def producer(
+        self,
+        topic: str,
+        *,
+        interval: float = 5.0,
+        cache_size: int = 100_000,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ) -> Callable:
+        """注册一个定时 producer：回调返回的数据发布到 topic。"""
+
+        def deco(fn):
+            self._producer_mgr.register(
+                fn,
+                name=topic,
+                interval=interval,
+                cache_size=cache_size,
+                serializer=serializer,
+                compression=compression,
+                inject_sender=False,
+            )
+            return fn
+
+        return deco
+
+    def burst_producer(
+        self,
+        topic: str,
+        *,
+        cache_size: int = 100_000,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ) -> Callable:
+        """注册一个 burst producer：无间隔连续发送，用于极限性能测试。"""
+
+        def deco(fn):
+            self._producer_mgr.register_burst(
+                fn,
+                name=topic,
+                cache_size=cache_size,
+                serializer=serializer,
+                compression=compression,
+                inject_sender=False,
+            )
+            return fn
+
+        return deco
+
+    async def _on_produce(self, spec, data) -> None:
+        # spec.name == topic（注册时以 topic 为 name）
+        await self.publish(spec.name, data)
+
+    async def run_forever(self) -> None:
+        """连接 + 认证 + 注册，启动所有 producer 调度，运行直到 stop()。"""
+        await self.start()
+        try:
+            await self._producer_mgr.start_all(self._on_produce, sender_factory=None)
+            await self._stop.wait()  # stop() 设置 _stop 后退出
+        finally:
+            await self._producer_mgr.stop_all()
 
     async def subscribe(self, topic_pattern: str, callback: Callable) -> None:  # type: ignore[override]
         raise NotImplementedError("ProducerClient 不支持订阅")
