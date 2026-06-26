@@ -133,9 +133,15 @@ class Transport:
 
     async def connect(self, endpoint: str, role: str,
                       credentials: tuple[str, str] | None = None,
-                      *, monitor: bool = True) -> None:
+                      *, monitor: bool = True,
+                      identity: bytes | None = None) -> None:
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 1000)
+        # 显式设置 identity：让同一 client 的数据面/控制面两个 DEALER
+        # 在各自 ROUTER 上呈现相同的 bytes identity，这样 server 的
+        # routing 表（以 control 面的 ident 为 key）能直接用于数据面转发。
+        if identity is not None:
+            sock.setsockopt(zmq.IDENTITY, identity)
         if credentials:
             username, password = credentials
             sock.plain_username = username.encode("utf-8")
@@ -167,6 +173,7 @@ class Transport:
                 "connected" if event == zmq.EVENT_CONNECTED
                 else "disconnected" if event == zmq.EVENT_DISCONNECTED
                 else "auth_failed" if event == zmq.EVENT_HANDSHAKE_FAILED_AUTH
+                else "handshake_ok" if event == zmq.EVENT_HANDSHAKE_SUCCEEDED
                 else "other"
             )
             if self._on_monitor:
