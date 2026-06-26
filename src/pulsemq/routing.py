@@ -40,4 +40,10 @@ class SubscriptionTable:
         return set(self._by_identity.get(identity, set()))
 
     def snapshot(self) -> dict:
-        return {k: sorted(v) for k, v in self._by_identity.items()}
+        # routing key 是 ROUTER bytes identity（server.py 用 ident 作为 key），
+        # JSON 序列化需要 str 键。client_id 是 uuid-hex ASCII，decode 无损。
+        return {
+            (k.decode("utf-8", "replace") if isinstance(k, (bytes, bytearray)) else k):
+                sorted(v)
+            for k, v in self._by_identity.items()
+        }

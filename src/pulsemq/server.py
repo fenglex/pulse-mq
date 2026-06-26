@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from pathlib import Path
+
 from pulsemq.admin.server import AdminServer
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
@@ -24,6 +26,33 @@ from pulsemq.routing import SubscriptionTable
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
 from pulsemq.transport.router import PlainAuthDict, Transport
+
+try:
+    import tomllib  # py311+
+except ModuleNotFoundError:  # pragma: no cover
+    import tomli as tomllib  # type: ignore
+
+
+def _load_credentials_file(path: str) -> dict[str, str] | None:
+    """Spec §1.3/§11.2 明文 TOML 白名单：``[users]`` 表 username=plaintext_password。
+
+    文件缺失或无 ``[users]`` 表返回 None（由调用方回退默认并告警）。
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        logger.exception("[SECURITY] 凭据文件解析失败 path={}", path)
+        return None
+    users = data.get("users")
+    if not isinstance(users, dict) or not users:
+        return None
+    return {str(k): str(v) for k, v in users.items()}
 
 
 class Server:
@@ -42,7 +71,25 @@ class Server:
         self._data_endpoint = data_endpoint or self._cfg.data_endpoint
         self._control_endpoint = control_endpoint or self._cfg.control_endpoint
         self._admin_endpoint = admin_endpoint or self._cfg.admin_endpoint
-        self._auth = PlainAuthDict(credentials or {"admin": "admin"})
+        if credentials is not None:
+            # 显式传入优先；不读文件。
+            self._auth = PlainAuthDict(credentials)
+        else:
+            loaded = _load_credentials_file(self._cfg.credentials_file)
+            if loaded is not None:
+                self._auth = PlainAuthDict(loaded)
+                log_event("INFO", "SECURITY",
+                          action="credentials_file_loaded",
+                          path=self._cfg.credentials_file,
+                          users=len(loaded))
+            else:
+                self._auth = PlainAuthDict({"admin": "admin"})
+                log_event(
+                    "WARNING", "SECURITY",
+                    action="default_credentials",
+                    msg="未检测到凭据文件，使用默认 admin:admin",
+                    path=self._cfg.credentials_file,
+                )
         self._transport = Transport()
         self._routing = SubscriptionTable()
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
