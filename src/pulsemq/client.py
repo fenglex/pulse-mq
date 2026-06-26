@@ -284,8 +284,10 @@ class Client:
         except Exception:
             logger.debug("重连前旧 transport 关闭失败", exc_info=True)
 
-        # 本次重连尚未提交给 self._transport 的新 transport；若被取消/出错，
-        # 需在 finally 中关闭它，避免泄漏 socket 与 monitor 任务。
+        # 本次重连尚未完全成功提交的新 transport。它指向 ``new_transport`` 直到
+        # 完整成功路径走完才置 None；这样 pre-handshake 与 post-handshake 取消
+        # 都能在下面 ``except BaseException`` 里关掉同一个 in_flight，避免
+        # 半连接的 socket/monitor 任务泄漏（详见 round-2 Fix B）。
         in_flight: Transport | None = None
         try:
             while not self._stop.is_set():
@@ -300,7 +302,7 @@ class Client:
                         credentials=creds, monitor=True, identity=ident,
                     )
                 except Exception:
-                    await self._safe_close(new_transport)
+                    await self._safe_close(in_flight)
                     in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
@@ -321,7 +323,7 @@ class Client:
                     # 重连时凭据无效 → 致命错误。**不在后台任务内 raise**
                     # （会被 asyncio GC 吞掉，进程不会 exit 3）。存到实例，
                     # 触发 _stop 让 run_forever 主循环退出并在主上下文重抛。
-                    await self._safe_close(new_transport)
+                    await self._safe_close(in_flight)
                     in_flight = None
                     log_event("ERROR", "CLIENT",
                               username=self._username,
@@ -334,16 +336,20 @@ class Client:
                     return
                 if kind != "handshake_ok":
                     # 超时/其他暂态失败 → 退避重试。
-                    await self._safe_close(new_transport)
+                    await self._safe_close(in_flight)
                     in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
                                 _RECONNECT_MAX_DELAY)
                     continue
 
-                # 认证通过：切换 transport，接控制面，REGISTER，恢复订阅。
+                # 认证通过：把 new_transport 提交给 self._transport，使 _register
+                # /_send_subscribe 能用。**注意**：in_flight 此时仍指向
+                # new_transport（== self._transport），不在此处置 None——只有完整
+                # 成功路径走完才置 None。这样 post-handshake 取消（CancelledError
+                # 属 BaseException，绕过 except Exception）也能在 except
+                # BaseException 中关掉它（round-2 Fix B）。
                 self._transport = new_transport
-                in_flight = None  # 已提交给 self._transport，finally 不应再关它
                 try:
                     await self._transport.connect(
                         self._control_endpoint, "control",
@@ -361,7 +367,8 @@ class Client:
                     # reconnect 触发的快速 stale 条目驱逐后再回到严格 exit 4。
                     logger.debug("重连阶段 REGISTER/订阅恢复失败，将退避重试",
                                  exc_info=True)
-                    await self._safe_close(self._transport)
+                    # in_flight == self._transport == new_transport，关掉它。
+                    await self._safe_close(in_flight)
                     self._transport = Transport()  # 占位，避免 stop/close 拿到坏的
                     in_flight = None
                     await self._backoff_sleep(delay)
@@ -379,12 +386,19 @@ class Client:
                 self._reconnecting = False
                 log_event("INFO", "CLIENT",
                           username=self._username, action="reconnected")
+                # 完整成功：现在才把 in_flight 置 None。此后 self._transport 由
+                # 运行期 monitor / stop() 负责生命周期，except BaseException 不
+                # 应再关它（否则会和 stop() 的 close() 双关）。
+                in_flight = None
                 return
         except BaseException:
             # 包括 CancelledError（Py3.8+ 属 BaseException，普通 except Exception
-            # 捕不到）。若此刻有尚未提交给 self._transport 的 in-flight transport
-            # （已 connect、可能挂着 monitor 任务），关闭它以防 socket/任务泄漏。
-            if in_flight is not None and self._transport is not in_flight:
+            # 捕不到）。若 in_flight 仍非 None，说明本次重连尚未走完整成功路径
+            # ——可能是 pre-handshake 取消（in_flight == new_transport，尚未提交给
+            # self._transport）或 post-handshake 取消（in_flight == self._transport
+            # == new_transport）。两种情况都关闭 in_flight 以防 socket/任务泄漏，
+            # 然后 re-raise（不吞 CancelledError，stop() 才能真正取消本任务）。
+            if in_flight is not None:
                 await self._safe_close(in_flight)
             raise
         finally:

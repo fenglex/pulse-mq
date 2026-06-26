@@ -88,6 +88,91 @@ async def test_client_reconnects_and_restores_subscription():
         raise
 
 
+async def test_run_forever_reraises_reconnect_auth_failure():
+    """Round-2 Fix A：重连认证失败时，``ProducerClient.run_forever`` 必须在
+    主任务上下文重新抛出 ``AuthenticationError``（exit 3 路径的真正契约），
+    而不只是设置 ``_reconnect_fatal`` 实例字段。
+
+    流程：启动带 creds 的 server → 启动注册了 producer 的 ProducerClient →
+    在 task 里跑 ``run_forever`` → 停 server → 同端口用错密码重启 →
+    重连 PLAIN 认证失败 → 轮询 ``_reconnect_fatal`` 直到非空 → 断言
+    run_forever task 已结束且 ``task.exception()`` 是 ``AuthenticationError``。
+    """
+    dp, cp, ap = _free_port(), _free_port(), _free_port()
+    data_ep = f"tcp://127.0.0.1:{dp}"
+    ctrl_ep = f"tcp://127.0.0.1:{cp}"
+    creds = {"c": "c", "p": "p"}
+    srv = Server(
+        data_endpoint=data_ep,
+        control_endpoint=ctrl_ep,
+        admin_endpoint=f"127.0.0.1:{ap}",
+        credentials=creds,
+    )
+    await srv.start()
+    await asyncio.sleep(0.2)
+    producer = ProducerClient(data_ep, ctrl_ep, "p", "p")
+
+    @producer.producer("p.topic", interval=10.0)
+    def _produce():
+        return {"k": 1}
+
+    # run_forever 内部会 start()，所以这里不再预启动。
+    rf_task = asyncio.create_task(producer.run_forever())
+    await asyncio.sleep(0.5)  # 让 start() + producer 调度起来进入主循环
+    try:
+        # 断开 server → producer 检测 disconnected → _reconnect_loop。
+        await srv.stop()
+        await asyncio.sleep(1.0)
+
+        # 同端口重启，但把 "p" 的密码改掉 → 重连 PLAIN 认证失败。
+        srv2 = Server(
+            data_endpoint=data_ep,
+            control_endpoint=ctrl_ep,
+            admin_endpoint=f"127.0.0.1:{ap}",
+            credentials={"c": "c", "p": "WRONG"},
+        )
+        await srv2.start()
+        await asyncio.sleep(0.3)
+        try:
+            # 初始退避 1s；轮询直到 run_forever task 结束。它应当以
+            # AuthenticationError 异常结束（_reconnect_loop 把异常存到
+            # _reconnect_fatal + set _stop → run_forever 主循环退出 → finally
+            # 在主任务上下文重抛）。注意：不能轮询 _reconnect_fatal 本身，因为
+            # run_forever 的 finally 会在重抛前把它清空，可能错过窗口。
+            for _ in range(80):  # 80 × 0.5s = 40s 上限，覆盖退避+认证裁定
+                if rf_task.done():
+                    break
+                await asyncio.sleep(0.5)
+            assert rf_task.done(), (
+                "run_forever task 未在超时内结束（重连认证失败未触发重抛）"
+            )
+
+            # 核心契约：run_forever 必须在主任务上下文重抛 AuthenticationError。
+            exc = rf_task.exception()
+            assert isinstance(exc, AuthenticationError), (
+                f"run_forever 应重抛 AuthenticationError，实际 exception={exc!r}"
+            )
+            assert exc.reason == "invalid_password", (
+                f"reason 应为 invalid_password，实际 {exc.reason!r}"
+            )
+        finally:
+            try:
+                await srv2.stop()
+            except Exception:
+                pass
+    finally:
+        if not rf_task.done():
+            rf_task.cancel()
+            try:
+                await rf_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await producer.stop()
+        except Exception:
+            pass
+
+
 async def test_reconnect_auth_failure_sets_reconnect_fatal():
     """Review Fix 1：重连认证失败 → ``_reconnect_fatal`` 被设为
     ``AuthenticationError(reason="invalid_password")``，且 ``_stop`` 被置位。
