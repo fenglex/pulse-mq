@@ -11,8 +11,11 @@ from pulsemq.protocol.msg_type import DataType, MsgType
 
 class TestMsgType:
     def test_constants(self):
+        from pulsemq.protocol.msg_type import MsgType
         assert MsgType.DATA == 0x01
-        assert MsgType.PING == 0x02
+        assert MsgType.CONTROL == 0x02
+        assert MsgType.HEARTBEAT == 0x03
+        assert MsgType.ADMIN == 0x04
 
 
 class TestDataType:
@@ -64,6 +67,15 @@ class TestFlags:
         result_ser, result_comp = decode_flags(byte_val)
         assert result_ser == ser
         assert result_comp == comp
+
+    def test_crc_bit(self):
+        from pulsemq.protocol.flags import encode_flags, decode_flags, has_crc
+        base = encode_flags("msgpack", "none")
+        assert has_crc(base) is False
+        with_crc = encode_flags("msgpack", "none", crc=True)
+        assert has_crc(with_crc) is True
+        # crc 位不影响 ser/comp 解码
+        assert decode_flags(with_crc) == ("msgpack", "none")
 
 
 class TestFrameCodec:
