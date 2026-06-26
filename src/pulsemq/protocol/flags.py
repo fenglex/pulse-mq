@@ -27,11 +27,14 @@ _COMP_MAP: dict[str, int] = {
 _COMP_MAP_REV: dict[int, str] = {v: k for k, v in _COMP_MAP.items()}
 
 
-def encode_flags(ser_fmt: str, comp: str) -> int:
+def encode_flags(ser_fmt: str, comp: str, *, crc: bool = False) -> int:
     """编码序列化+压缩标志为单字节。"""
     ser_bits = _SER_MAP.get(ser_fmt, 0b000)
     comp_bits = _COMP_MAP.get(comp, 0b00)
-    return ser_bits | (comp_bits << 3)
+    val = ser_bits | (comp_bits << 3)
+    if crc:
+        val |= _CRC_BIT
+    return val
 
 
 def decode_flags(byte_val: int) -> tuple[str, str]:
@@ -42,3 +45,11 @@ def decode_flags(byte_val: int) -> tuple[str, str]:
         _SER_MAP_REV.get(ser_bits, "msgpack"),
         _COMP_MAP_REV.get(comp_bits, "none"),
     )
+
+
+_CRC_BIT = 0b1000_0000
+
+
+def has_crc(byte_val: int) -> bool:
+    """是否设置了 CRC 位（bit 7）。"""
+    return bool(byte_val & _CRC_BIT)

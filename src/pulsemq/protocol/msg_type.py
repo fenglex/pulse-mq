@@ -1,21 +1,11 @@
-"""消息类型常量。
-
-v2 简化：无 broker 不需要 AUTH/SUB/UNSUB/QUERY 等控制消息，
-仅保留 DATA 和 PING。
-
-v3：meta 帧扩展为 7 字节，新增 Byte 2 = data_type（原始数据类型标记），
-让 sub 端能把反序列化结果还原为 pub 端的原始 Python 类型
-（如 DataFrame → DataFrame）。
-"""
-
-from __future__ import annotations
+"""帧类型。Spec 1：DATA/CONTROL/HEARTBEAT/ADMIN。"""
 
 
 class MsgType:
-    """消息类型常量，对应 meta 帧 Byte 0。"""
-
     DATA = 0x01
-    PING = 0x02
+    CONTROL = 0x02
+    HEARTBEAT = 0x03
+    ADMIN = 0x04
 
 
 class DataType:

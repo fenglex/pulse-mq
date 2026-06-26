@@ -25,7 +25,7 @@ class CachedMessage:
     """缓存中的消息。"""
 
     timestamp_ns: int
-    frames: list[bytes]       # 原始 4 帧数据（可用于重发）
+    frame: bytes              # 单 bytes 帧（最近值快照）
     record_count: int = 1     # 本帧包含的记录数
 
 
@@ -38,7 +38,7 @@ class TopicBuffer:
         self._buf: deque[CachedMessage] = deque()
         self._total_records = 0               # 当前累计记录数
 
-    def append(self, timestamp_ns: int, frames: list[bytes], record_count: int = 1) -> None:
+    def append(self, timestamp_ns: int, frame: bytes, record_count: int = 1) -> None:
         """追加一条消息。
 
         Args:
@@ -54,7 +54,7 @@ class TopicBuffer:
             evicted = self._buf.popleft()
             self._total_records -= evicted.record_count
         # 加入新帧（即便超限也至少保留这一帧，避免单帧就超限时缓存为空）
-        self._buf.append(CachedMessage(timestamp_ns=timestamp_ns, frames=frames, record_count=rc))
+        self._buf.append(CachedMessage(timestamp_ns=timestamp_ns, frame=frame, record_count=rc))
         self._total_records += rc
 
     def snapshot(self, since_ns: int = 0, limit: int = 100) -> list[CachedMessage]:

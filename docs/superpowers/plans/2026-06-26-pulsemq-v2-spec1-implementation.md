@@ -1232,8 +1232,6 @@ def test_plain_auth_dict_verify():
 
 async def test_router_dealer_roundtrip(ctx, monkeypatch):
     # 选随机端口
-    port = zmq.sugar.socket.Socket.__new__(zmq.Socket)  # 占位，避免 lint；实际用系统分配
-    del port
     import socket as _sock
     def _free_port():
         s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
@@ -1414,6 +1412,7 @@ class Transport:
         self._sockets[role] = sock
 
     async def _monitor_loop(self, mon: zmq.asyncio.Socket) -> None:
+        import struct
         while True:
             try:
                 evt = await mon.recv_multipart()
@@ -1421,8 +1420,16 @@ class Transport:
                 break
             except Exception:
                 continue
-            kind = "ok" if evt and b"EVENT_CONNECTED" in b"" else "unknown"
-            # 简化：把事件转字符串回调
+            # pyzmq monitor 帧：[event:uint16, address:bytes]
+            event = 0
+            if evt and len(evt[0]) >= 2:
+                event = struct.unpack("=H", evt[0][:2])[0]
+            kind = (
+                "connected" if event == zmq.EVENT_CONNECTED
+                else "disconnected" if event == zmq.EVENT_DISCONNECTED
+                else "auth_failed" if event == zmq.EVENT_HANDSHAKE_FAILED_AUTH
+                else "other"
+            )
             if self._on_monitor:
                 try:
                     await self._on_monitor(kind)
@@ -2151,9 +2158,13 @@ def test_version_bumped():
 
 async def test_run_server_handles_sigint(monkeypatch):
     # 不真发信号；直接测 run_server 在 stop 后退出
-    srv = Server(data_endpoint="tcp://127.0.0.1:0",  # bind 0 由 OS 分配
-                 control_endpoint="tcp://127.0.0.1:0",
-                 admin_endpoint="127.0.0.1:0",
+    import socket as _sock
+    def _fp():
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+    srv = Server(data_endpoint=f"tcp://127.0.0.1:{_fp()}",
+                 control_endpoint=f"tcp://127.0.0.1:{_fp()}",
+                 admin_endpoint=f"127.0.0.1:{_fp()}",
                  credentials={"a": "b"})
 
     async def _stop_after(coro_srv):
@@ -2165,7 +2176,7 @@ async def test_run_server_handles_sigint(monkeypatch):
     await asyncio.wait_for(srv_task, timeout=3.0)  # 应正常返回
 ```
 
-> 注：`bind` 到端口 0 时，zmq 会分配端口但 `Server` 当前用固定字符串 endpoint。测试用 0 端口需要 `Server` 支持——为避免改 `Server`，本测试改用真实空闲端口（用 `_free_port`）。实施时把 endpoint 换成 `_free_port()` 形式。
+> 注：用 `_fp()` 取真实空闲端口，避免 `Server` 固定 endpoint 字符串与端口 0 不兼容。
 
 - [ ] **Step 2: Run test to verify it fails**
 
