@@ -1,13 +1,21 @@
 # src/pulsemq/client.py
 """Client / ProducerClient / ConsumerClient。
 
-启动硬失败 + 运行期（Spec 1：单次连接，重连由 Task 12b 接管）。
+启动硬失败 + 运行期自动重连（Spec 1 §8.3）。
 
 启动认证检测采用 monitor-based 设计（非 brief 的"握手成功即认证成功"）：
 - 在数据面 connect 时开启 ZMQ monitor，监听握手期事件。
 - ``handshake_ok`` → PLAIN 认证通过，继续控制面 connect + REGISTER。
 - ``auth_failed`` → 抛 ``AuthenticationError``（exit 3）。
 - 超时 / 其他事件 → 视为服务器不可达，抛 ``ClientStartupError``（exit 4）。
+
+运行期（启动成功后）：
+- monitor 回调切换为 ``_on_runtime_monitor``，监听 ``disconnected``。
+- 断线 → ``_reconnect_loop`` 指数退避（初始 1s，×2，封顶 30s）：
+  新 Transport → PLAIN 重认证 → REGISTER（同 client_id）→ 恢复订阅 →
+  重启 recv/heartbeat 循环。业务层无需重新 subscribe()。
+- 重连时 auth_failed → ``AuthenticationError``（exit 3）。
+- ALREADY_ONLINE / 其他暂态 → 退避重试（服务端心跳扫描会清理 stale 记录）。
 
 Spec 1 已知限制（见 task-12-report）：
 - 控制面回复匹配是朴素的：REGISTER/SUBSCRIBE 各做一次 ``recv("control")``，
@@ -35,6 +43,12 @@ _STARTUP_MONITOR_TIMEOUT = 5.0
 _REGISTER_REPLY_TIMEOUT = 3.0
 # 心跳间隔（秒）。
 _HEARTBEAT_INTERVAL = 1.0
+# 运行期重连参数（Spec 1 §8.3）：指数退避，初始 1s，×2，封顶 30s。
+_RECONNECT_INITIAL_DELAY = 1.0
+_RECONNECT_BACKOFF_MULTIPLIER = 2.0
+_RECONNECT_MAX_DELAY = 30.0
+# 重连时单次等待 monitor 认证裁定的超时秒数。
+_RECONNECT_MONITOR_TIMEOUT = 5.0
 
 
 def require_connected(func):
@@ -79,6 +93,9 @@ class Client:
         self._stop = asyncio.Event()
         # 启动期 monitor 裁定 future：由 _on_startup_monitor resolve。
         self._startup_event: asyncio.Future | None = None
+        # 运行期重连状态机（Spec 1 §8.3）。
+        self._reconnecting = False
+        self._reconnect_task: asyncio.Task | None = None
         # 生命周期回调（可选）。
         self.on_connected: Callable[[], Awaitable[None]] | None = None
         self.on_disconnected: Callable[[], Awaitable[None]] | None = None
@@ -161,6 +178,9 @@ class Client:
         self._recv_task = asyncio.create_task(self._recv_loop())
         self._hb_task = asyncio.create_task(self._heartbeat_loop())
 
+        # 启动成功后，切换到运行期 monitor 回调（接管断线重连）。
+        self._transport.set_monitor_callback(self._on_runtime_monitor)
+
         if self.on_connected:
             try:
                 await self.on_connected()
@@ -176,6 +196,171 @@ class Client:
         if kind in ("handshake_ok", "auth_failed") and self._startup_event is not None \
                 and not self._startup_event.done():
             self._startup_event.set_result(kind)
+
+    # ------------------------------------------------- 运行期重连状态机 §8.3
+
+    async def _on_runtime_monitor(self, kind: str) -> None:
+        """运行期 monitor 回调：仅在 ``disconnected`` 且未在重连时触发一次重连。
+
+        幂等保护：``_reconnecting`` 标志避免多次 disconnected 事件派生多个重连任务。
+        """
+        if kind != "disconnected":
+            return
+        if self._reconnecting or self._stop.is_set():
+            return
+        self._reconnecting = True
+        log_event("INFO", "CLIENT", username=self._username, action="reconnecting")
+        if self.on_reconnecting:
+            try:
+                await self.on_reconnecting()
+            except Exception:
+                logger.exception("on_reconnecting 回调异常")
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _on_reconnect_monitor(self, kind: str) -> None:
+        """重连期 monitor 回调：与启动期同形，仅在 auth-outcome 事件 resolve future。"""
+        if kind in ("handshake_ok", "auth_failed") and self._startup_event is not None \
+                and not self._startup_event.done():
+            self._startup_event.set_result(kind)
+
+    async def _cancel_bg_tasks(self) -> None:
+        """取消并等待 recv/heartbeat 后台任务（吞掉 CancelledError/异常）。"""
+        for t in (self._recv_task, self._hb_task):
+            if t is not None:
+                t.cancel()
+        for t in (self._recv_task, self._hb_task):
+            if t is not None:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._recv_task = None
+        self._hb_task = None
+
+    async def _reconnect_loop(self) -> None:
+        """运行期重连状态机（Spec 1 §8.3）。
+
+        断线后指数退避（初始 1s，×2，封顶 30s）尝试重连：
+        新建 Transport → PLAIN 认证 → REGISTER（同 client_id）→ 恢复订阅 →
+        重启 recv/heartbeat 循环。
+
+        - 重连时认证失败（auth_failed）→ ``AuthenticationError``（exit 3）。
+        - ALREADY_ONLINE：服务端心跳超时扫描（6s）会释放旧 username，对 Spec 1
+          视为暂态失败 → 退避重试，扫描清理后自然成功。
+        - 超时/其他暂态失败 → 退避重试。
+        - ``_stop`` 触发后立即退出（优雅停机优先）。
+        """
+        loop = asyncio.get_running_loop()
+        creds = (self._username, self._password) if self._username else None
+        ident = self._client_id.encode("utf-8")
+        delay = _RECONNECT_INITIAL_DELAY
+
+        # 清理旧 transport 与后台任务（保留 _subscriptions 作为恢复源）。
+        await self._cancel_bg_tasks()
+        self._connected = False
+        self._authenticated = False
+        self._registered = False
+        try:
+            await self._transport.close()
+        except Exception:
+            logger.debug("重连前旧 transport 关闭失败", exc_info=True)
+
+        try:
+            while not self._stop.is_set():
+                new_transport = Transport()
+                # 准备本次重连的认证裁定 future。
+                self._startup_event = loop.create_future()
+                new_transport.set_monitor_callback(self._on_reconnect_monitor)
+                try:
+                    await new_transport.connect(
+                        self._data_endpoint, "consumer",
+                        credentials=creds, monitor=True, identity=ident,
+                    )
+                except Exception:
+                    await self._safe_close(new_transport)
+                    await self._backoff_sleep(delay)
+                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
+                                _RECONNECT_MAX_DELAY)
+                    continue
+
+                # 等待认证裁定。
+                kind: str | None
+                try:
+                    kind = await asyncio.wait_for(
+                        self._startup_event,
+                        timeout=_RECONNECT_MONITOR_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    kind = None
+
+                if kind == "auth_failed":
+                    # 重连时凭据无效 → 硬失败，exit 3。
+                    await self._safe_close(new_transport)
+                    log_event("ERROR", "CLIENT",
+                              username=self._username,
+                              action="reconnect_auth_failed")
+                    raise AuthenticationError(
+                        f"重连认证失败（用户名/密码错误）: {self._username}",
+                        reason="invalid_password",
+                    )
+                if kind != "handshake_ok":
+                    # 超时/其他暂态失败 → 退避重试。
+                    await self._safe_close(new_transport)
+                    await self._backoff_sleep(delay)
+                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
+                                _RECONNECT_MAX_DELAY)
+                    continue
+
+                # 认证通过：切换 transport，接控制面，REGISTER，恢复订阅。
+                self._transport = new_transport
+                try:
+                    await self._transport.connect(
+                        self._control_endpoint, "control",
+                        credentials=creds, monitor=False, identity=ident,
+                    )
+                    await self._register()
+                    # 恢复订阅（不重新调用业务 subscribe()）。
+                    for pattern in list(self._subscriptions):
+                        await self._send_subscribe(pattern)
+                except Exception:
+                    # REGISTER 被拒（如 ALREADY_ONLINE）/ 控制面连接失败
+                    # 视为暂态失败（服务端心跳扫描会清理 ALREADY_ONLINE）→
+                    # 退避重试。
+                    logger.debug("重连阶段 REGISTER/订阅恢复失败，将退避重试",
+                                 exc_info=True)
+                    await self._safe_close(self._transport)
+                    self._transport = Transport()  # 占位，避免 stop/close 拿到坏的
+                    await self._backoff_sleep(delay)
+                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
+                                _RECONNECT_MAX_DELAY)
+                    continue
+
+                # 成功：重启后台循环，恢复运行期 monitor。
+                self._connected = True
+                self._authenticated = True
+                self._recv_task = asyncio.create_task(self._recv_loop())
+                self._hb_task = asyncio.create_task(self._heartbeat_loop())
+                self._transport.set_monitor_callback(self._on_runtime_monitor)
+                self._reconnecting = False
+                log_event("INFO", "CLIENT",
+                          username=self._username, action="reconnected")
+                return
+        finally:
+            # 兜底：确保 _reconnecting 不会卡住（若 stop 触发提前退出）。
+            self._reconnecting = False
+
+    async def _backoff_sleep(self, delay: float) -> None:
+        """退避 sleep，``_stop`` 触发时立即返回（不阻塞优雅停机）。"""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _safe_close(self, transport: Transport) -> None:
+        try:
+            await transport.close()
+        except Exception:
+            logger.debug("重连 cleanup 关闭 transport 失败", exc_info=True)
 
     # -------------------------------------------------------------- register
 
@@ -296,19 +481,22 @@ class Client:
     # ------------------------------------------------------------------- stop
 
     async def stop(self) -> None:
-        """优雅停机：取消后台任务 + DISCONNECT + 关闭 transport。"""
+        """优雅停机：取消后台任务（含重连任务）+ DISCONNECT + 关闭 transport。"""
         self._stop.set()
-        for t in (self._recv_task, self._hb_task):
+        # 先取消重连任务（若正在重连），避免它继续派生新 transport。
+        for t in (self._reconnect_task, self._recv_task, self._hb_task):
             if t:
                 t.cancel()
-        for t in (self._recv_task, self._hb_task):
+        for t in (self._reconnect_task, self._recv_task, self._hb_task):
             if t:
                 try:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
+        self._reconnect_task = None
         self._recv_task = None
         self._hb_task = None
+        self._reconnecting = False
         if self._registered:
             try:
                 disc = frames.encode_control(
