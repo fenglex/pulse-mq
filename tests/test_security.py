@@ -111,3 +111,21 @@ def test_from_dict_in_memory():
     store = CredentialStore.from_dict({"alice": "pw"})
     assert store.verify("alice", "pw").success is True
     store.save()  # no-op，不抛
+
+
+def test_invalid_username_rejected(tmp_path):
+    import pytest
+    from pulsemq.errors import SecurityError
+    f = str(tmp_path / "u.toml")
+    store = CredentialStore(f, allow_auto_generated=False)
+    for bad in ["a.b", "a b", 'a"b', "a\nb", "", "x" * 65, "a/b"]:
+        with pytest.raises(SecurityError):
+            store.add_user(bad, "pw", roles=[])
+    # valid names still work
+    store.add_user("alice_01", "pw", roles=["subscriber"])
+    # from_dict validates too
+    with pytest.raises(SecurityError):
+        CredentialStore.from_dict({"a.b": "pw"})
+    # roles validated
+    with pytest.raises(SecurityError):
+        store.add_user("bob", "pw", roles=["bad role"])

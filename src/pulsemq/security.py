@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import string
 import time
@@ -18,6 +19,15 @@ except ModuleNotFoundError:  # pragma: no cover
 from pulsemq.errors import ConfigurationError, SecurityError
 
 _DEFAULT_ROLES = ["publisher", "subscriber"]
+
+# 准入校验：用户名/角色只允许 1-64 位字母数字_-。
+# 阻断 `.`, `]`, `"`, 换行等危险字符流入 save() 的 f-string，防 TOML 损坏/注入。
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _validate_name(name: str) -> None:
+    if not isinstance(name, str) or not _NAME_RE.match(name):
+        raise SecurityError(f"非法名称（仅允许 1-64 位字母数字_-）: {name!r}")
 
 
 @dataclass
@@ -84,6 +94,7 @@ class CredentialStore:
         store._users = {}
         now = _now_iso()
         for u, pw in creds.items():
+            _validate_name(u)
             store._users[u] = UserInfo(u, _hash_password(pw, 12), list(_DEFAULT_ROLES),
                                        True, now)
         return store
@@ -163,6 +174,9 @@ class CredentialStore:
     # ---- 管理 ----
     def add_user(self, username: str, password: str, roles: list[str] | None = None,
                  enabled: bool = True) -> None:
+        _validate_name(username)
+        for r in roles or []:
+            _validate_name(r)
         if username in self._users:
             raise SecurityError(f"用户已存在: {username}")
         self._users[username] = UserInfo(
