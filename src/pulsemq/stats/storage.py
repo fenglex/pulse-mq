@@ -119,3 +119,75 @@ class StatsStorage:
         except Exception:
             logger.debug("cleanup 失败", exc_info=True)
             return 0
+
+
+class AsyncArchiveWriter:
+    """分钟归档异步批量写：enqueue 进 queue，consumer 任务批量 save_minutes_batch。
+
+    SQLite 写仅在 consumer 任务，数据接收循环不阻塞。
+    """
+
+    def __init__(self, storage: "StatsStorage", batch_size: int = 50) -> None:
+        self._storage = storage
+        self._batch_size = batch_size
+        self._queue: asyncio.Queue | None = None
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        self._queue = asyncio.Queue()
+        self._task = asyncio.create_task(self._consume())
+
+    async def enqueue(self, archived: dict) -> None:
+        if self._queue is None:
+            return
+        await self._queue.put(archived)
+
+    async def _consume(self) -> None:
+        assert self._queue is not None
+        while True:
+            merged: dict = {}
+            try:
+                # 阻塞取第一个，再批量取最多 batch_size-1 个
+                first = await self._queue.get()
+                merged.update(first)
+                for _ in range(self._batch_size - 1):
+                    try:
+                        more = self._queue.get_nowait()
+                        merged.update(more)
+                    except asyncio.QueueEmpty:
+                        break
+                if merged:
+                    self._storage.save_minutes_batch(merged)
+            except asyncio.CancelledError:
+                # 收到停止信号；剩余项由 stop() 统一 drain
+                raise
+            except Exception:
+                pass  # 单批失败不杀 consumer
+
+    def _drain(self) -> None:
+        if self._queue is None:
+            return
+        merged: dict = {}
+        while True:
+            try:
+                merged.update(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if merged:
+            try:
+                self._storage.save_minutes_batch(merged)
+            except Exception:
+                pass
+
+    async def stop(self) -> None:
+        # 1. 取消 consumer 任务（当前正在处理的批会被放弃，但项仍在队列中）
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # 2. 在主上下文 drain 剩余项（可靠：不依赖被取消任务内执行）
+        self._drain()
+        self._task = None
+        self._queue = None
