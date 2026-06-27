@@ -1,7 +1,7 @@
 [project]
 name = "pulse-mq"
-version = "5.0.0"
-description = "高性能纯 pub→sub 消息系统"
+version = "6.0.0"
+description = "高性能 Client/Server 消息中间件 — ZeroMQ ROUTER/DEALER + bcrypt 认证 + 实时监控"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
@@ -61,6 +61,8 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "hypothesis>=6.0",
+    "build>=1.5.0",
+    "twine>=6.2.0",
 ]
 
 [tool.pytest.ini_options]
