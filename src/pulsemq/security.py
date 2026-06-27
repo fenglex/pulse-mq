@@ -17,6 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 from pulsemq.errors import ConfigurationError, SecurityError
+from pulsemq.logging_setup import logger
 
 _DEFAULT_ROLES = ["publisher", "subscriber"]
 
@@ -78,6 +79,11 @@ class CredentialStore:
         self._allow_auto = allow_auto_generated
         self._hash_algo = hash_algo
         self._cost = bcrypt_cost
+        # Spec §3.4：argon2 等为"预留"。接受配置但回退 bcrypt，并告警防误导。
+        if hash_algo and hash_algo != "bcrypt":
+            logger.warning(
+                "[SECURITY] password_hash_algo={} 未实现，回退 bcrypt", hash_algo,
+            )
         self._users: dict[str, UserInfo] = {}
         self._in_memory = False
 

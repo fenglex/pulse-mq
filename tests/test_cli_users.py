@@ -3,6 +3,24 @@ from pulsemq.cli.users import main
 from pulsemq.security import CredentialStore
 
 
+def test_cli_reload_no_pid_returns_nonzero(monkeypatch):
+    monkeypatch.delenv("PULSEMQ_PID", raising=False)
+    assert main(["reload"]) != 0  # 无 PID → 非零
+
+
+def test_cli_reload_sends_sighup_posix(monkeypatch):
+    import os
+    import signal
+
+    if os.name != "posix":
+        pytest.skip("SIGHUP is POSIX-only")
+    monkeypatch.setenv("PULSEMQ_PID", "4242")
+    calls = []
+    monkeypatch.setattr("pulsemq.cli.users.os.kill", lambda pid, sig: calls.append((pid, sig)))
+    assert main(["reload"]) == 0
+    assert calls == [(4242, signal.SIGHUP)]
+
+
 def test_cli_add_list_disable_enable(tmp_path, capsys):
     f = str(tmp_path / "u.toml")
     assert main(["add", "alice", "--password", "pw", "--roles", "pub,sub",

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -74,10 +76,45 @@ def _dispatch(args) -> int:
     if args.cmd == "enable":
         s = _store(args.file); s.set_enabled(args.username, True); s.save(); return 0
     if args.cmd == "reload":
-        print("[users] reload 需通知运行中的 Server（Linux: killall -HUP pulsemq；"
-              "Windows: Spec 3 admin 接口）", file=sys.stderr)
-        return 0
+        return _reload_server()
     return 2
+
+
+def _reload_server() -> int:
+    """向 Server 进程发 SIGHUP 热更新凭据（Spec §6）。
+
+    定位 PID：仅支持 ``PULSEMQ_PID`` 环境变量（pidfile 由 Spec 3+ 引入）。
+    POSIX：os.kill(SIGHUP)；Windows：无 SIGHUP，提示走 admin 接口。
+    """
+    if os.name != "posix" or not hasattr(signal, "SIGHUP"):
+        print(
+            "[users] Windows 不支持 SIGHUP reload，请用 admin 接口（Spec 3）",
+            file=sys.stderr,
+        )
+        return 6
+    pid_env = os.environ.get("PULSEMQ_PID")
+    if not pid_env:
+        print(
+            "[users] 未定位 Server PID：请设置 PULSEMQ_PID 环境变量"
+            "（或 Linux 下手动 kill -HUP <pid>）",
+            file=sys.stderr,
+        )
+        return 6
+    try:
+        pid = int(pid_env)
+    except ValueError:
+        print(f"[users] PULSEMQ_PID 非法整数: {pid_env!r}", file=sys.stderr)
+        return 6
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        print(f"[users] Server 进程不存在 (pid={pid})", file=sys.stderr)
+        return 6
+    except PermissionError:
+        print(f"[users] 无权限向 Server 发信号 (pid={pid})", file=sys.stderr)
+        return 6
+    print(f"[users] 已通知 Server (pid={pid}) 热更新凭据")
+    return 0
 
 
 if __name__ == "__main__":

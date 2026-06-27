@@ -15,6 +15,7 @@ import asyncio
 import base64
 import os
 import secrets
+import stat
 import sys
 import time
 
@@ -173,6 +174,32 @@ class Server:
             except OSError:
                 # Windows/非 POSIX：chmod 失败可接受，文件已写入。
                 pass
+            # Spec §11.4：token 文件必须 0600。检查实际权限位并告警。
+            if os.name == "posix":
+                try:
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                except OSError:
+                    mode = None
+                if mode is not None and (mode & 0o077):
+                    print(
+                        f"[ADMIN] 警告：token 文件权限过宽 (mode={oct(mode)}), "
+                        "建议 chmod 600",
+                        file=sys.stderr,
+                    )
+                    log_event(
+                        "WARNING", "ADMIN",
+                        action="insecure_token_file", path=path, mode=oct(mode),
+                    )
+            else:
+                # Windows：chmod 无效，提示目录 ACL 受控。
+                print(
+                    "[ADMIN] 警告：Windows 未限制 token 文件 ACL，请确保目录访问受控",
+                    file=sys.stderr,
+                )
+                log_event(
+                    "WARNING", "ADMIN",
+                    action="insecure_token_file_windows", path=path,
+                )
             print(f"[ADMIN] 管理接口 token: {tok}", file=sys.stderr)
             log_event("WARNING", "ADMIN", action="admin_token_generated", path=path)
         except OSError:

@@ -1,6 +1,8 @@
 import asyncio
 import socket as _sock
 
+import pytest
+
 from pulsemq.admin.auth import TokenAuth
 
 
@@ -100,3 +102,40 @@ async def test_server_random_admin_token_written_to_file(tmp_path, monkeypatch):
         assert "401" in await _get(ap, "/api/v1/stats/realtime", token="wrong")
     finally:
         await srv.stop()
+
+
+def test_token_file_mode_0600_posix(tmp_path, monkeypatch):
+    """Spec §11.4：随机生成的 token 文件权限必须为 0600（POSIX）。"""
+    import os
+    import stat
+
+    if os.name != "posix":
+        pytest.skip("0600 is POSIX-only")
+
+    from pulsemq.server import Server
+
+    monkeypatch.delenv("PULSEMQ_ADMIN_TOKEN", raising=False)
+    tok_file = str(tmp_path / "admin.token")
+    dp, cp, ap = _port(), _port(), _port()
+    # 仅构造 Server：__init__ 内 _resolve_admin_token 已写盘，无需 start()。
+    srv = Server(
+        data_endpoint=f"tcp://127.0.0.1:{dp}",
+        control_endpoint=f"tcp://127.0.0.1:{cp}",
+        admin_endpoint=f"127.0.0.1:{ap}",
+        credentials={"a": "b"},
+        admin_token_file=tok_file,
+    )
+    assert os.path.exists(tok_file)
+    mode = stat.S_IMODE(os.stat(tok_file).st_mode)
+    assert mode == 0o600
+
+
+def test_non_bcrypt_hash_algo_warns(tmp_path, capsys):
+    """Fix 3：非 bcrypt 的 hash_algo 应告警（不抛异常）。"""
+    from pulsemq.security import CredentialStore
+
+    f = str(tmp_path / "u.toml")
+    CredentialStore(f, allow_auto_generated=False, hash_algo="argon2")
+    err = capsys.readouterr().err
+    # loguru 默认写 stderr；非严格匹配，含关键词即可。
+    assert "argon2" in err and "bcrypt" in err
