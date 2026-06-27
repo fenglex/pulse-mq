@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +39,11 @@ _STATUS_TEXT: dict[int, str] = {
 STATIC_ROOT: Path = Path(__file__).resolve().parent / "static"
 
 
+def _iso(ts: float) -> str:
+    """Unix 时间戳 → ISO8601 UTC 字符串（空/0 → 空串）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else ""
+
+
 class AdminServer:
     """后台管理 HTTP 服务: REST + SSE + Web UI。
 
@@ -61,6 +67,10 @@ class AdminServer:
         snapshot_fn: Callable[[], dict] | None = None,
         start_time: float | None = None,
         token_auth: TokenAuth | None = None,
+        *,
+        connection_stats=None,
+        latency_stats=None,
+        admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
         self._host = host
@@ -71,23 +81,94 @@ class AdminServer:
         self._snapshot_fn = snapshot_fn
         self._start_time = start_time or time.time()
         self._token_auth = token_auth
+        # Spec 3 监控扩展：连接/延迟统计 + 独立线程模式
+        self._connections = connection_stats
+        self._latency = latency_stats
+        self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
         self._sse_clients: dict[int, tuple[asyncio.Queue, asyncio.Task]] = {}
         self._sse_id = 0
         self._sse_task: asyncio.Task | None = None
+        # 独立线程生命周期（admin_thread=True 模式）
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread_started = threading.Event()
 
     # ---- 生命周期 ----
 
     async def start(self) -> None:
+        """启动 AdminServer。
+
+        - admin_thread=True（默认）：在独立 daemon 线程 + 独立 asyncio loop 上
+          运行 HTTP/SSE 服务，使 HTTP 请求不会阻塞 ZMQ 数据线程。`start()` 阻塞
+          至线程内 server 就绪（`_thread_started` 被置位）后返回。
+        - admin_thread=False：直接在调用方 loop 上 `await self._serve()`。
+        """
+        if self._admin_thread:
+            self._thread = threading.Thread(
+                target=self._run_thread, daemon=True, name="pulsemq-admin"
+            )
+            self._thread.start()
+            # 等待线程内 server 就绪，使调用方可立即访问端口
+            self._thread_started.wait(timeout=5.0)
+        else:
+            await self._serve()
+
+    def _run_thread(self) -> None:
+        """独立线程入口：自建 asyncio loop 并运行 _serve()。"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            loop.run_until_complete(self._serve())
+        except (asyncio.CancelledError, Exception):
+            # stop() 取消 serve_forever 会抛 CancelledError，属正常关闭路径，吞掉。
+            logger.debug("AdminServer 线程退出")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    async def _serve(self) -> None:
+        """实际建立 HTTP server + SSE 广播任务。
+
+        - admin_thread=True（独立线程）：建立后 `serve_forever()` 阻塞，使线程 loop
+          持续运行直至 `_stop_serve()` 关闭 server。
+        - admin_thread=False（内联）：仅建立 server + SSE 任务后返回（沿用 Spec 1 行为，
+          由调用方 loop 在后台驱动连接处理）。
+        """
         self._server = await asyncio.start_server(
             self._handle_request, self._host, self._port
         )
         self._sse_task = asyncio.create_task(self._sse_broadcast_loop())
+        # 通知等待方 server 已就绪（独立线程模式下尤为关键）
+        self._thread_started.set()
         logger.info("AdminServer 启动: http://{}:{}", self._host, self._port)
+        if self._admin_thread:
+            async with self._server:
+                await self._server.serve_forever()
 
     async def stop(self) -> None:
-        # 关闭 SSE 客户端
+        """停止 AdminServer。
+
+        独立线程模式下：通过 `run_coroutine_threadsafe` 在 admin loop 上调度
+        `_stop_serve()`，再 join 线程。线程内异常或超时被吞掉，保证调用方不死锁。
+        """
+        if self._admin_thread and self._loop is not None:
+            fut = asyncio.run_coroutine_threadsafe(self._stop_serve(), self._loop)
+            try:
+                fut.result(timeout=5.0)
+            except Exception:
+                pass
+            if self._thread:
+                self._thread.join(timeout=5.0)
+        else:
+            await self._stop_serve()
+
+    async def _stop_serve(self) -> None:
+        """关闭 SSE 客户端 + 广播任务 + HTTP server（原 stop 逻辑）。"""
         for _qid, (_q, task) in list(self._sse_clients.items()):
             task.cancel()
         self._sse_clients.clear()
@@ -180,6 +261,19 @@ class AdminServer:
             await self._handle_sse(writer)
             return
 
+        if method == "GET" and path == "/api/v1/clients":
+            await self._respond_json(writer, 200, self._clients_snapshot())
+            return
+
+        if method == "GET" and path == "/api/v1/events":
+            limit = 50
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except (ValueError, IndexError):
+                pass
+            await self._respond_json(writer, 200, self._events_snapshot(limit))
+            return
+
         if method == "GET" and path == "/api/v1/topics":
             await self._respond_json(writer, 200, self._list_topics())
             return
@@ -225,8 +319,46 @@ class AdminServer:
             snap["cache_sizes"] = self._buffers.snapshot()
         if self._snapshot_fn is not None:
             snap.update(self._snapshot_fn())
+        # Spec 3 监控扩展：延迟分位（统一加 latency_ 前缀，与 API 契约一致）
+        if self._latency is not None:
+            for _k, _v in self._latency.percentiles().items():
+                snap[f"latency_{_k}"] = round(float(_v), 3)
+        # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
+        if self._connections is not None:
+            snap.update(self._connections.counters())
         snap["server_time"] = time.time()
         return snap
+
+    def _clients_snapshot(self) -> dict:
+        """在线 client 明细（跨线程只读快照；connection_stats 为 None 时返回空）。"""
+        if self._connections is None:
+            return {"clients": []}
+        clients = []
+        for c in self._connections.online_clients():
+            clients.append({
+                "client_id": c.client_id,
+                "username": c.username,
+                "role": c.role,
+                "endpoint": c.endpoint,
+                "topics": list(c.topics),
+                "connected_at_iso": _iso(c.connected_at),
+                "duration_seconds": round(c.duration_seconds, 1),
+            })
+        return {"clients": clients}
+
+    def _events_snapshot(self, limit: int) -> dict:
+        """生命周期事件（最近 N 条；connection_stats 为 None 时返回空）。"""
+        if self._connections is None:
+            return {"events": []}
+        events = []
+        for e in self._connections.recent_events(limit):
+            events.append({
+                "ts_iso": _iso(e.ts),
+                "level": e.level,
+                "type": e.type,
+                "message": e.message,
+            })
+        return {"events": events}
 
     def _list_topics(self) -> dict:
         """所有 topic 列表 + 指标。"""
