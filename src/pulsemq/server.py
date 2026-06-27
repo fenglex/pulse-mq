@@ -12,9 +12,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
+import secrets
 import sys
 import time
 
+from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.server import AdminServer
 from pulsemq.auth import PlainAuth
 from pulsemq.config import ServerConfig, load_server_config
@@ -41,6 +45,8 @@ class Server:
         credentials_file: str | None = None,
         allow_auto_generated: bool | None = None,
         config: ServerConfig | None = None,
+        admin_token: str | None = None,
+        admin_token_file: str | None = None,
     ) -> None:
         self._cfg = config or load_server_config(None)
         # 显式传值优先于 config；空串视为未传（回退到 config）
@@ -83,6 +89,10 @@ class Server:
                 )
         self._credential_store = store
         self._auth = PlainAuth(store)
+        # admin token（Spec 2 §5）：优先级 explicit > config > env > 随机生成（写文件 0600）。
+        # 显式传 admin_token="" 视为「禁用 token 校验」（向后兼容 Spec 1 测试）。
+        self.admin_token = self._resolve_admin_token(admin_token, admin_token_file)
+        self._token_auth = TokenAuth(self.admin_token)
         self._transport = Transport()
         self._routing = SubscriptionTable()
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
@@ -115,6 +125,7 @@ class Server:
                 "subscriptions": self._routing.snapshot(),
             },
             start_time=self._start_time,
+            token_auth=self._token_auth,
         )
         await self._admin.start()
         self._running = True
@@ -131,6 +142,42 @@ class Server:
             self._admin_endpoint,
         )
         self._install_sighup_reload()
+
+    def _resolve_admin_token(self, explicit: str | None,
+                             token_file: str | None) -> str:
+        """确定 admin HTTP token（Spec 2 §5）。
+
+        优先级：
+        1. 显式 ``admin_token=`` 参数（含空串 → 禁用 token，向后兼容 Spec 1）
+        2. config ``monitoring.admin_token``（含被环境变量 ``PULSEMQ_ADMIN_TOKEN``
+           覆盖后的值，见 ``load_server_config``）
+        3. 环境变量 ``PULSEMQ_ADMIN_TOKEN``（双保险；正常路径已被 step 2 吸收）
+        4. 随机生成 32 字节 base64url，写 ``admin_token_file``（0600）+ stderr 输出一次
+
+        返回最终 token 字符串（空串表示禁用）。
+        """
+        if explicit is not None:
+            return explicit
+        if self._cfg.admin_token:
+            return self._cfg.admin_token
+        env_tok = os.environ.get("PULSEMQ_ADMIN_TOKEN")
+        if env_tok:
+            return env_tok
+        tok = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+        path = token_file or self._cfg.admin_token_file
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(tok)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                # Windows/非 POSIX：chmod 失败可接受，文件已写入。
+                pass
+            print(f"[ADMIN] 管理接口 token: {tok}", file=sys.stderr)
+            log_event("WARNING", "ADMIN", action="admin_token_generated", path=path)
+        except OSError:
+            log_event("WARNING", "ADMIN", action="admin_token_write_failed", path=path)
+        return tok
 
     def reload_credentials(self) -> None:
         """热更新凭据（CLI 改文件后调用，或 SIGHUP 触发）。"""
