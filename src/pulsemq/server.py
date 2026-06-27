@@ -259,18 +259,18 @@ class Server:
             except Exception:
                 logger.exception("数据面 recv 异常")
                 continue
+            # 轻量头部解码（不解压/不反序列化），消除完整 frames.decode 在服务端的开销。
             try:
-                msg = frames.decode(frame_bytes)
+                hdr = frames.decode_header(frame_bytes)
             except Exception:
-                logger.debug("数据面帧解码失败，丢弃")
+                logger.debug("数据面帧头部解码失败，丢弃")
                 continue
-            self._stats.record(msg.topic, msg.record_count, len(msg.raw_payload))
+            self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
             # 延迟采样：帧已携带 timestamp_ns（生产者发送时刻），差值为端到端延迟。
             if self._latency.should_sample():
-                self._latency.record(time.time_ns() - msg.timestamp_ns)
-            # match() 返回的是 routing key 集合，本实现里 routing key=bytes ident，
-            # 直接交给 Transport.send（send_multipart([target, frame])）。
-            for target in self._routing.match(msg.topic):
+                self._latency.record(time.time_ns() - hdr.timestamp_ns)
+            # match() 返回 bytes identity，直接给 send_multipart。
+            for target in self._routing.match(hdr.topic):
                 await self._transport.send(target, frame_bytes, role="server_ingress")
 
     async def _control_loop(self) -> None:

@@ -36,12 +36,22 @@ class TrafficStats:
         self._current_minute: int = self._minute_now()
 
     def record(self, topic: str, record_count: int, payload_size: int) -> None:
-        """记录一条消息（同步，无锁）。"""
-        self._ensure_current(topic)
-        cur = self._current[topic]
+        """记录一条消息。单写者无锁，使用单次 dict.get 避免二次查找。"""
+        cur = self._current.get(topic)
+        if cur is None:
+            now_minute = self._minute_now()
+            if now_minute != self._current_minute:
+                self.roll_minute()
+                now_minute = self._current_minute
+            self._current[topic] = cur = MinuteSlot(timestamp=now_minute)
         cur.msg_count += 1
         cur.record_count += record_count
         cur.bytes_total += payload_size
+        # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
+        if (cur.msg_count & 0x3FF) == 0:
+            now = self._minute_now()
+            if now != self._current_minute:
+                self.roll_minute()
 
     def roll_minute(self) -> dict[str, MinuteSlot]:
         """整分钟时调用：归档当前累积器 → 滚动窗口淘汰过期数据。
