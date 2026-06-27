@@ -17,6 +17,9 @@ htmlcov/
 # test runner logs
 err.log
 out.log
+# 运行时日志文件
+logs/
+*.log
 # Spec 2：运行时生成的敏感文件（凭据 / admin token）
 pulsemq_users.toml
 pulsemq_admin.token
