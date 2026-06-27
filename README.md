@@ -53,6 +53,40 @@ pulsemq users add user1 pass1 --role publisher
 pulsemq users list
 ```
 
+### 服务端内置定时推送
+
+无需外部生产者客户端，直接在 Server 上注册定时回调：
+
+```python
+from pulsemq import Server
+
+srv = Server(data_endpoint=..., control_endpoint=..., credentials={"u": "p"})
+
+@srv.producer("market.tick", interval=2.0, serializer="msgpack")
+async def gen_tick():
+    return {"symbol": "AAPL", "price": 180.5, "volume": 1000}
+
+@srv.producer("market.quote", interval=0.5, serializer="pyarrow", compression="lz4")
+async def gen_quote():
+    import pandas as pd
+    return pd.DataFrame({"price": [10, 20], "vol": [100, 200]})
+
+@srv.burst_producer("bench", serializer="msgpack")
+async def bench():
+    if not has_more():
+        return None
+    return {"seq": next_seq()}
+
+await srv.start()   # 自动开始调度
+```
+
+| 方法 | 参数 | 说明 |
+|------|------|------|
+| `srv.producer(topic, interval, serializer, compression)` | `interval` 秒 | 固定间隔定时推送 |
+| `srv.burst_producer(topic, serializer, compression)` | 无间隔 | 连续推送，返回 `None` 停止 |
+
+回调返回值支持 DataFrame / dict / str / bytes，自动编码为协议帧并路由到所有匹配的消费者。
+
 ### 生产者
 
 ```python
