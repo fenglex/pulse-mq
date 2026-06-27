@@ -287,7 +287,10 @@ class Server:
             except Exception:
                 logger.debug("控制面帧解码失败，丢弃")
                 continue
-            await self._dispatch_control(ident, cmd_msg)
+            try:
+                await self._dispatch_control(ident, cmd_msg)
+            except Exception:
+                logger.exception("控制命令处理异常（可能 DEALER 已断开导致 ROUTER_MANDATORY 发送失败）")
 
     async def _dispatch_control(self, ident: bytes, cmd_msg: ControlMessage) -> None:
         """分发控制命令。
