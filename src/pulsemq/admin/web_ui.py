@@ -281,9 +281,14 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   </div>
 </main>
 
-<script src="/static/echarts.min.js"></script>
 <script>
-const _tok = new URLSearchParams(location.search).get('token') || '';
+  window._tok = new URLSearchParams(location.search).get('token') || '';
+  document.write('<script src="/static/echarts.min.js' +
+    (window._tok ? '?token=' + encodeURIComponent(window._tok) : '') +
+    '"><\/script>');
+</script>
+<script>
+const _tok = window._tok || '';
 function _authHeaders(extra) {
   const h = extra || {};
   if (_tok) { h['Authorization'] = 'Bearer ' + _tok; }
