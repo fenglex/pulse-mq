@@ -115,7 +115,8 @@ class Transport:
         self._on_monitor = cb
 
     async def bind(self, endpoint: str, role: str,
-                   *, auth: PlainAuthDict | None = None) -> None:
+                   *, auth: PlainAuthDict | None = None,
+                   on_auth: AuthCallback | None = None) -> None:
         sock = self._ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 1000)
         sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
@@ -123,8 +124,10 @@ class Transport:
             sock.plain_server = True
             # ZAP REP socket 绑定的是 inproc 单例端点，同一 ctx 只能 bind 一次。
             # 多个 ROUTER socket（数据面/控制面）共享同一 ZAP handler。
+            # ZAP 是 ctx 单例：仅首次 auth bind 创建 handler，故 on_auth 必须在
+            # 首次（数据面）bind 时提供；后续（控制面）bind 的 on_auth 被忽略。
             if not self._zap_started:
-                zap = AsyncZAPHandler(self._ctx, auth)
+                zap = AsyncZAPHandler(self._ctx, auth, on_auth=on_auth)
                 await zap.start()
                 self._zaps.append(zap)
                 self._zap_started = True
