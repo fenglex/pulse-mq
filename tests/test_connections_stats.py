@@ -50,6 +50,17 @@ def test_on_auth_records_failure_reason():
     assert e.type == "AUTH"
 
 
+def test_on_auth_records_user_not_found_reason():
+    # 验证未知用户场景的 reason 透传（区别于 invalid_password）。
+    cs = ConnectionStats(_reg_snap_factory([]))
+    cs.on_auth("ghost", "ep", success=False, reason="user_not_found")
+    e = cs.recent_events(10)[0]
+    assert e.level == "WARNING"
+    assert "user_not_found" in e.message
+    assert "invalid_password" not in e.message
+    assert e.type == "AUTH"
+
+
 def test_online_clients_snapshot():
     cs = ConnectionStats(_reg_snap_factory([
         {"client_id": "c1", "username": "alice", "roles": ["subscriber"], "topics": ["a.*"]},

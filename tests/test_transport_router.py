@@ -59,7 +59,7 @@ async def test_bind_forwards_on_auth(ctx):
         s = _sock.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
     dp = _fp()
     seen = []
-    async def on_auth(username, address, ok):
+    async def on_auth(username, address, ok, reason=None):
         seen.append((username, ok))
     server = Transport(ctx=ctx)
     await server.bind(f"tcp://127.0.0.1:{dp}", "server_ingress",

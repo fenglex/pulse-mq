@@ -400,13 +400,14 @@ class Server:
             except Exception:
                 logger.exception("分钟归档异常")
 
-    async def _on_auth_event(self, username: str, address: str, ok: bool) -> None:
+    async def _on_auth_event(self, username: str, address: str, ok: bool,
+                             reason: str | None = None) -> None:
         """ZAP 认证回调（async）：发认证事件到连接统计环。
 
-        ZAP handler 在 reply 后调用，签名为 ``(username, address, ok)``。
+        ZAP handler 在 reply 后调用，签名为 ``(username, address, ok, reason)``。
+        reason 由 PlainAuthDict.verify 返回（如 user_not_found / invalid_password）。
         address 当前由 AsyncZAPHandler 传空串（ZAP 帧内的 address 字段），保留接口。
         """
-        reason = None if ok else "invalid_password"
         self._connections.on_auth(username, address, success=ok, reason=reason)
 
     async def wait_for_shutdown(self) -> None:

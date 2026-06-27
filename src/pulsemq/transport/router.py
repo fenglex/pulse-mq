@@ -10,7 +10,7 @@ import zmq.asyncio
 
 from pulsemq.logging_setup import logger
 
-AuthCallback = Callable[[str, str, bool], Awaitable[None]]
+AuthCallback = Callable[[str, str, bool, "str | None"], Awaitable[None]]
 
 
 class PlainAuthDict:
@@ -81,7 +81,7 @@ class AsyncZAPHandler:
         await self._reply(request_id, status, text, user_id=username.encode() if ok else b"")
         if self._on_auth:
             try:
-                await self._on_auth(username, "", ok)
+                await self._on_auth(username, "", ok, reason)
             except Exception:
                 logger.exception("on_auth 回调异常")
 

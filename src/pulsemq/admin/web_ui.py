@@ -839,22 +839,6 @@ async function openClientModal() {
 }
 function closeClientModal() { $('client-modal').classList.remove('show'); }
 
-/* ---- 事件流 SSE ---- */
-function connectEventStream() {
-  try {
-    const es = new EventSource(_withToken('/api/v1/events'));
-    es.onmessage = ev => {
-      try {
-        const d = JSON.parse(ev.data);
-        if (Array.isArray(d)) { for (const e of d) pushEvent(e); }
-        else { pushEvent(d); }
-        renderEvents();
-      } catch(e) { /* ignore */ }
-    };
-    es.onerror = () => { es.close(); setTimeout(connectEventStream, 5000); };
-  } catch(e) { /* endpoint may be absent; SSE realtime payload already feeds events */ }
-}
-
 /* ---- 图表 30s 自动刷新 ---- */
 setInterval(() => {
   if (state.selected.length > 0) {
@@ -865,7 +849,6 @@ setInterval(() => {
 
 /* ---- 初始化 ---- */
 connectSSE();
-connectEventStream();
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeClientModal(); });
 fetch(_withToken('/api/v1/system/status'), {headers: _authHeaders()}).then(r=>r.json()).then(d => {
   state.uptime = d.uptime_seconds || 0;
