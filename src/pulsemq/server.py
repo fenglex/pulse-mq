@@ -29,7 +29,9 @@ from pulsemq.logging_setup import log_event, logger
 from pulsemq.protocol import frames
 from pulsemq.routing import SubscriptionTable
 from pulsemq.security import CredentialStore
-from pulsemq.stats.storage import StatsStorage
+from pulsemq.stats.connections import ConnectionStats, _role_of
+from pulsemq.stats.latency import LatencyStats
+from pulsemq.stats.storage import AsyncArchiveWriter, StatsStorage
 from pulsemq.stats.traffic import TrafficStats
 from pulsemq.transport.router import Transport
 
@@ -48,6 +50,7 @@ class Server:
         config: ServerConfig | None = None,
         admin_token: str | None = None,
         admin_token_file: str | None = None,
+        latency_sample_rate: float | None = None,
     ) -> None:
         self._cfg = config or load_server_config(None)
         # 显式传值优先于 config；空串视为未传（回退到 config）
@@ -99,6 +102,23 @@ class Server:
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
         self._stats = TrafficStats(retention_minutes=self._cfg.stats_retention_minutes)
         self._storage = StatsStorage(self._cfg.stats_db)
+        # Spec 3 监控依赖：延迟统计 + 连接/事件统计 + 异步归档 writer。
+        # 须在 registry/storage 之后构造（ConnectionStats 持有 registry.snapshot 引用，
+        # AsyncArchiveWriter 持有 storage 引用）。
+        # 显式 latency_sample_rate 覆盖 config；None 时回退到 config。
+        rate = (latency_sample_rate if latency_sample_rate is not None
+                else self._cfg.latency_sample_rate)
+        self._latency = LatencyStats(sample_rate=rate)
+        self._connections = ConnectionStats(
+            registry_snapshot_fn=self._registry.snapshot,
+            ring_size=self._cfg.event_ring_size,
+        )
+        self._archive_writer = AsyncArchiveWriter(
+            self._storage, batch_size=self._cfg.stats_archive_batch_size
+        )
+        # ZAP on_auth 回调（认证事件）。ZAP 是 ctx 单例：on_auth 必须在
+        # 首次（数据面）auth bind 时提供，控制面 bind 复用同一 ZAP，不传 on_auth。
+        self._auth_on_auth = self._on_auth_event
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._stop = asyncio.Event()
@@ -111,10 +131,16 @@ class Server:
 
     async def start(self) -> None:
         self._storage.connect()
-        await self._transport.bind(self._data_endpoint, "server_ingress", auth=self._auth)
+        # 数据面 bind 传 on_auth：ZAP 是 ctx 单例，仅首次 auth bind 创建 handler，
+        # 故 on_auth 必须在数据面 bind 提供；控制面 bind 复用同一 ZAP，不传。
+        await self._transport.bind(
+            self._data_endpoint, "server_ingress",
+            auth=self._auth, on_auth=self._auth_on_auth,
+        )
         await self._transport.bind(self._control_endpoint, "control", auth=self._auth)
-        # 接入 AdminServer（:9090 监控端口）。Spec 1 在同一 event loop 上运行，
-        # Spec 3 后续再迁移到独立线程。
+        # 异步归档 writer：在 minute_roll_loop 启动前 start。
+        await self._archive_writer.start()
+        # 接入 AdminServer（:9090 监控端口）。
         self._start_time = time.time()
         self._admin = AdminServer(
             bind=self._admin_endpoint,
@@ -127,6 +153,9 @@ class Server:
             },
             start_time=self._start_time,
             token_auth=self._token_auth,
+            connection_stats=self._connections,
+            latency_stats=self._latency,
+            admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
         self._running = True
@@ -236,6 +265,9 @@ class Server:
                 logger.debug("数据面帧解码失败，丢弃")
                 continue
             self._stats.record(msg.topic, msg.record_count, len(msg.raw_payload))
+            # 延迟采样：帧已携带 timestamp_ns（生产者发送时刻），差值为端到端延迟。
+            if self._latency.should_sample():
+                self._latency.record(time.time_ns() - msg.timestamp_ns)
             # match() 返回的是 routing key 集合，本实现里 routing key=bytes ident，
             # 直接交给 Transport.send（send_multipart([target, frame])）。
             for target in self._routing.match(msg.topic):
@@ -281,6 +313,10 @@ class Server:
                 self._ident_by_client_id[cid] = ident
                 for pattern in topics:
                     self._routing.subscribe(ident, pattern)
+                # 连接事件（Spec 3）：REGISTER 成功 → on_connect
+                self._connections.on_connect(
+                    cid, info.username, info.endpoint, _role_of(info.roles)
+                )
             reply = frames.encode_control(cmd_msg.cmd, {"result": result})
             await self._transport.send(ident, reply, role="control")
             log_event(
@@ -318,6 +354,8 @@ class Server:
             self._routing.remove(ident)
             self._ident_by_client_id.pop(cid, None)
             self._registry.unregister(cid)
+            # 断开事件（Spec 3）：DISCONNECT → on_disconnect
+            self._connections.on_disconnect(cid, "disconnect")
             await self._transport.send(
                 ident,
                 frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
@@ -338,6 +376,8 @@ class Server:
                     ident = self._ident_by_client_id.pop(c.client_id, None)
                     if ident is not None:
                         self._routing.remove(ident)
+                    # 断开事件（Spec 3）：心跳超时下线 → on_disconnect
+                    self._connections.on_disconnect(c.client_id, "heartbeat_timeout")
                     log_event(
                         "WARNING", "CLIENT",
                         username=c.username, reason="heartbeat_timeout",
@@ -352,11 +392,22 @@ class Server:
             await asyncio.sleep(60.0)
             try:
                 archived = self._stats.roll_minute()
-                self._storage.save_minutes_batch(archived)
+                if archived:
+                    # Spec 3：异步归档，不阻塞数据接收循环。
+                    await self._archive_writer.enqueue(archived)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("分钟归档异常")
+
+    async def _on_auth_event(self, username: str, address: str, ok: bool) -> None:
+        """ZAP 认证回调（async）：发认证事件到连接统计环。
+
+        ZAP handler 在 reply 后调用，签名为 ``(username, address, ok)``。
+        address 当前由 AsyncZAPHandler 传空串（ZAP 帧内的 address 字段），保留接口。
+        """
+        reason = None if ok else "invalid_password"
+        self._connections.on_auth(username, address, success=ok, reason=reason)
 
     async def wait_for_shutdown(self) -> None:
         await self._stop.wait()
@@ -376,15 +427,20 @@ class Server:
             except (asyncio.CancelledError, Exception):
                 pass
         self._tasks.clear()
-        # 停机前最后归档一次当前分钟，避免丢统计。
+        # 停机前最后归档一次当前分钟，避免丢统计：入队 archive_writer，
+        # 由其 stop() drain 落库。
         try:
             archived = self._stats.roll_minute()
-            self._storage.save_minutes_batch(archived)
+            if archived:
+                await self._archive_writer.enqueue(archived)
         except Exception:
-            logger.debug("stop 归档失败", exc_info=True)
-        # 关闭顺序（Spec 1 §10/§11.8）：停 admin → 停 transport → 关 storage。
+            logger.debug("stop 归档入队失败", exc_info=True)
+        # 关闭顺序（Spec 3）：停 admin → 停 archive_writer（drain 剩余）→
+        # 停 transport → 关 storage。storage.close 必须在 archive_writer.stop 之后，
+        # 否则 drain 写入已关闭的 SQLite 连接。
         if self._admin is not None:
             await self._admin.stop()
             self._admin = None
+        await self._archive_writer.stop()
         await self._transport.close()
         self._storage.close()

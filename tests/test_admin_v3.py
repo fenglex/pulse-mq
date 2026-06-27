@@ -10,8 +10,6 @@ from __future__ import annotations
 import asyncio
 import socket as _sock
 
-import pytest
-
 from pulsemq.stats.connections import ConnectionStats
 from pulsemq.stats.latency import LatencyStats
 
@@ -113,14 +111,9 @@ async def test_admin_thread_mode_serves_on_independent_loop():
     assert adm._thread is None or not adm._thread.is_alive()
 
 
-# ---- Server 集成测试：Task 8 接线后转 GREEN；当前 skip ----
-
-_SKIP_TASK8 = pytest.mark.skip(
-    reason="Task 8 未把 connection_stats/latency_stats 接线进 Server"
-)
+# ---- Server 集成测试：Task 8 接线后转 GREEN ----
 
 
-@_SKIP_TASK8
 async def test_admin_clients_and_events_routes_require_token():
     from pulsemq.server import Server
 
@@ -143,7 +136,6 @@ async def test_admin_clients_and_events_routes_require_token():
         await srv.stop()
 
 
-@_SKIP_TASK8
 async def test_realtime_has_latency_and_counters():
     from pulsemq.server import Server
 
@@ -164,7 +156,6 @@ async def test_realtime_has_latency_and_counters():
         await srv.stop()
 
 
-@_SKIP_TASK8
 async def test_admin_runs_on_independent_thread():
     from pulsemq.client import ConsumerClient, ProducerClient
     from pulsemq.server import Server
