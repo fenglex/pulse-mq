@@ -39,6 +39,7 @@ Issues = "https://github.com/haifeng/pulse-mq/issues"
 [project.scripts]
 pulsemq = "pulsemq.cli.server:main"
 pulsemq-server = "pulsemq.cli.server:main"
+pulsemq-users = "pulsemq.cli.users:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsemq"]
