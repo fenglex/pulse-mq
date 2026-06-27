@@ -12,47 +12,21 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 
-from pathlib import Path
-
 from pulsemq.admin.server import AdminServer
+from pulsemq.auth import PlainAuth
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
                              RegisterResult)
 from pulsemq.logging_setup import log_event, logger
 from pulsemq.protocol import frames
 from pulsemq.routing import SubscriptionTable
+from pulsemq.security import CredentialStore
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
-from pulsemq.transport.router import PlainAuthDict, Transport
-
-try:
-    import tomllib  # py311+
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
-
-
-def _load_credentials_file(path: str) -> dict[str, str] | None:
-    """Spec §1.3/§11.2 明文 TOML 白名单：``[users]`` 表 username=plaintext_password。
-
-    文件缺失或无 ``[users]`` 表返回 None（由调用方回退默认并告警）。
-    """
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        return None
-    try:
-        with p.open("rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        logger.exception("[SECURITY] 凭据文件解析失败 path={}", path)
-        return None
-    users = data.get("users")
-    if not isinstance(users, dict) or not users:
-        return None
-    return {str(k): str(v) for k, v in users.items()}
+from pulsemq.transport.router import Transport
 
 
 class Server:
@@ -64,6 +38,8 @@ class Server:
         control_endpoint: str = "tcp://0.0.0.0:5556",
         admin_endpoint: str = "0.0.0.0:9090",
         credentials: dict[str, str] | None = None,
+        credentials_file: str | None = None,
+        allow_auto_generated: bool | None = None,
         config: ServerConfig | None = None,
     ) -> None:
         self._cfg = config or load_server_config(None)
@@ -71,25 +47,42 @@ class Server:
         self._data_endpoint = data_endpoint or self._cfg.data_endpoint
         self._control_endpoint = control_endpoint or self._cfg.control_endpoint
         self._admin_endpoint = admin_endpoint or self._cfg.admin_endpoint
+        # 凭据源（Spec 2）：CredentialStore + PlainAuth
+        self.generated_admin_password: str | None = None
         if credentials is not None:
-            # 显式传入优先；不读文件。
-            self._auth = PlainAuthDict(credentials)
+            # 显式明文 dict（测试/兼容）：内存态 store，哈希落值
+            store = CredentialStore.from_dict(credentials)
         else:
-            loaded = _load_credentials_file(self._cfg.credentials_file)
-            if loaded is not None:
-                self._auth = PlainAuthDict(loaded)
-                log_event("INFO", "SECURITY",
-                          action="credentials_file_loaded",
-                          path=self._cfg.credentials_file,
-                          users=len(loaded))
-            else:
-                self._auth = PlainAuthDict({"admin": "admin"})
-                log_event(
-                    "WARNING", "SECURITY",
-                    action="default_credentials",
-                    msg="未检测到凭据文件，使用默认 admin:admin",
-                    path=self._cfg.credentials_file,
+            cred_file = credentials_file or self._cfg.credentials_file
+            allow = (self._cfg.allow_auto_generated_credentials
+                     if allow_auto_generated is None else allow_auto_generated)
+            store = CredentialStore(
+                cred_file,
+                allow_auto_generated=allow,
+                hash_algo=self._cfg.password_hash_algo,
+                bcrypt_cost=self._cfg.bcrypt_cost,
+            )
+            plaintext = store.load()
+            if plaintext is not None:
+                # 自动生成的默认 admin：明文仅此一次输出
+                self.generated_admin_password = plaintext
+                print(f"[SECURITY] 未检测到 {cred_file}，已生成默认用户", file=sys.stderr)
+                print(f"[SECURITY] username=admin, password={plaintext}", file=sys.stderr)
+                print(
+                    "[SECURITY] 提示：默认凭据仅用于首次启动，"
+                    "请使用 pulsemq.users CLI 创建正式用户",
+                    file=sys.stderr,
                 )
+                log_event("WARNING", "SECURITY", action="default_credentials_generated")
+            else:
+                log_event(
+                    "INFO", "SECURITY",
+                    action="credentials_file_loaded",
+                    path=cred_file,
+                    users=len(store.list_users()),
+                )
+        self._credential_store = store
+        self._auth = PlainAuth(store)
         self._transport = Transport()
         self._routing = SubscriptionTable()
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
@@ -137,6 +130,22 @@ class Server:
             self._control_endpoint,
             self._admin_endpoint,
         )
+        self._install_sighup_reload()
+
+    def reload_credentials(self) -> None:
+        """热更新凭据（CLI 改文件后调用，或 SIGHUP 触发）。"""
+        self._credential_store.reload()
+        log_event("INFO", "SECURITY", action="credentials_reloaded")
+
+    def _install_sighup_reload(self) -> None:
+        """Linux：注册 SIGHUP→reload_credentials。Windows/非主线程静默跳过。"""
+        import signal
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGHUP, self.reload_credentials)
+        except (AttributeError, NotImplementedError, ValueError, RuntimeError):
+            # Windows 无 SIGHUP；非主线程无信号。留接口，Spec 3 admin 接口接入。
+            pass
 
     async def _data_loop(self) -> None:
         while self._running:
