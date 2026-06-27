@@ -29,7 +29,7 @@ _HEAD_AFTER_TOPIC = struct.Struct(">qI")         # ts rc
 
 @dataclass
 class PulseMessage:
-    """解码后的消息。"""
+    """解码后的完整消息（含 payload）。"""
 
     topic: str
     payload: Any
@@ -40,6 +40,16 @@ class PulseMessage:
     compression: str
     data_type: int = DataType.UNKNOWN
     msg_type: int = MsgType.DATA
+
+
+@dataclass
+class FrameHeader:
+    """仅帧头部字段，不解压/不反序列化 payload。供服务端路由使用。"""
+    topic: str
+    record_count: int
+    timestamp_ns: int
+    msg_type: int
+    raw_payload: bytes
 
 
 def _encode_payload(obj: Any, serializer: str, compression_fmt: str) -> bytes:
@@ -56,6 +66,35 @@ def _decode_payload(raw: bytes, serializer: str, compression_fmt: str) -> Any:
     ser = serialization.get(serializer)
     comp = compression.get(compression_fmt)
     return ser.deserialize(comp.decompress(raw))
+
+
+def _restore_type(data: Any, data_type: int, serializer: str) -> Any:
+    """根据 data_type 还原原始 Python 类型（DataFrame / dict / str / bytes）。
+
+    pyarrow 序列化器总是返回 ``pa.Table``；msgpack/json 下 DataFrame 被转为
+    list[dict]。此函数负责将这两种情况还原为调用方期待的原始类型。
+    """
+    from pulsemq.protocol.msg_type import DataType
+
+    if data_type == DataType.DATAFRAME:
+        if serializer == "pyarrow":
+            import pyarrow as pa
+            return data.to_pandas() if isinstance(data, pa.Table) else data
+        # msgpack / json: list[dict] → DataFrame
+        import pandas as _pd
+        if isinstance(data, list):
+            return _pd.DataFrame(data)
+        return data
+
+    if data_type == DataType.DICT:
+        if serializer == "pyarrow":
+            import pyarrow as pa
+            if hasattr(data, "to_pylist"):
+                lst = data.to_pylist()
+                return lst[0] if lst else data
+        return data
+
+    return data
 
 
 def encode(
@@ -137,6 +176,7 @@ def decode(frame: bytes) -> PulseMessage:
         payload = frame[off:]
     serializer, compression_fmt = decode_flags(flags)
     data = _decode_payload(payload, serializer, compression_fmt)
+    data = _restore_type(data, data_type, serializer)
     return PulseMessage(
         topic=topic,
         payload=data,
@@ -148,6 +188,29 @@ def decode(frame: bytes) -> PulseMessage:
         data_type=data_type,
         msg_type=msg_type,
     )
+
+
+def decode_header(frame: bytes) -> FrameHeader:
+    """仅提取帧头部字段，不解压/不反序列化 payload。
+
+    服务端 ``_data_loop`` 使用此函数获取 topic/record_count/timestamp_ns
+    用于路由匹配与统计，避免 msgspec 反序列化开销（占完整 decode ~80% 时间）。
+    """
+    if len(frame) < _HEAD_BEFORE_TOPIC.size + _HEAD_AFTER_TOPIC.size:
+        raise FrameError("帧过短")
+    magic, ver, msg_type, flags, data_type, topic_len = _HEAD_BEFORE_TOPIC.unpack_from(frame, 0)
+    if magic != MAGIC:
+        raise FrameError("魔数不匹配")
+    if ver != VERSION:
+        raise FrameError(f"版本不支持: {ver}")
+    off = _HEAD_BEFORE_TOPIC.size
+    topic = frame[off:off + topic_len].decode("utf-8")
+    off += topic_len
+    ts, record_count = _HEAD_AFTER_TOPIC.unpack_from(frame, off)
+    off += _HEAD_AFTER_TOPIC.size
+    crc_on = has_crc(flags)
+    raw_payload = frame[off:] if not crc_on else frame[off:-4]
+    return FrameHeader(topic, record_count, ts, msg_type, raw_payload)
 
 
 def encode_control(
@@ -186,10 +249,12 @@ def decode_control(frame: bytes) -> "ControlMessage":  # noqa: F821
 
 __all__ = [
     "PulseMessage",
+    "FrameHeader",
     "MAGIC",
     "VERSION",
     "encode",
     "decode",
+    "decode_header",
     "encode_control",
     "decode_control",
 ]
