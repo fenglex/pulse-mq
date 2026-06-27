@@ -110,6 +110,8 @@ class Client:
         # （会被 asyncio GC 吞掉），而是存到这里，由 run_forever/stop 在主任务
         # 上下文重新抛出，从而让 CLI 经 exit_code_for 拿到 exit 3。
         self._reconnect_fatal: AuthenticationError | None = None
+        # 角色标记（监控用）：子类 ProducerClient/ConsumerClient 覆写。
+        self._roles: list[str] = ["publisher", "subscriber"]
         # 生命周期回调（可选）。
         self.on_connected: Callable[[], Awaitable[None]] | None = None
         self.on_disconnected: Callable[[], Awaitable[None]] | None = None
@@ -432,7 +434,7 @@ class Client:
                 "client_id": self._client_id,
                 "username": self._username,
                 "endpoint": self._data_endpoint,
-                "roles": [],
+                "roles": list(self._roles),
                 "topics": list(self._subscriptions),
             },
         )
@@ -588,6 +590,7 @@ class ProducerClient(Client):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self._roles = ["publisher"]
         from pulsemq.producers.manager import ProducerManager
 
         self._producer_mgr = ProducerManager()
@@ -669,6 +672,10 @@ class ProducerClient(Client):
 
 class ConsumerClient(Client):
     """只订阅，屏蔽 publish。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._roles = ["subscriber"]
 
     async def publish(self, topic: str, data: Any) -> None:  # type: ignore[override]
         raise NotImplementedError("ConsumerClient 不支持发布")

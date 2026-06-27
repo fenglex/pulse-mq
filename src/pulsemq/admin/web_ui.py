@@ -468,11 +468,13 @@ function connectSSE() {
           p99: d.latency_p99_ms != null ? d.latency_p99_ms : state.latency.p99,
         };
       }
-      // 若 SSE 内嵌事件流，按事件数组增量入队
-      if (Array.isArray(d.events)) {
-        for (const e of d.events) pushEvent(e);
-      } else if (d.event) {
-        pushEvent(d.event);
+      // SSE 事件流（全量替换，无重复）
+      if (Array.isArray(d.sse_events)) {
+        state.events = d.sse_events.map(e => ({
+          type: e.type || 'other',
+          ts: e.ts != null ? e.ts * 1000 : Date.now(),
+          detail: e.message || '',
+        }));
       }
       render();
       renderOverview();

@@ -326,6 +326,11 @@ class AdminServer:
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())
+            # 最近 10 条生命周期事件（SSE 推送，JS 每帧替换 state 而非增量追加）。
+            snap["sse_events"] = [
+                {"ts": e.ts, "type": e.type, "level": e.level, "message": e.message}
+                for e in self._connections.recent_events(10)
+            ]
         snap["server_time"] = time.time()
         return snap
 

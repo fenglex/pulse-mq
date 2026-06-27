@@ -75,7 +75,9 @@ class AsyncZAPHandler:
         request_id = msg[1]
         username = msg[6].decode("utf-8", "replace") if len(msg) > 6 else ""
         password = msg[7].decode("utf-8", "replace") if len(msg) > 7 else ""
-        ok, reason = self._auth.verify(username, password)
+        # verify 包含 bcrypt.checkpw（~200ms 同步阻塞），抛到线程池避免阻塞事件循环。
+        loop = asyncio.get_running_loop()
+        ok, reason = await loop.run_in_executor(None, self._auth.verify, username, password)
         status = b"200" if ok else b"400"
         text = b"OK" if ok else b"INVALID"
         await self._reply(request_id, status, text, user_id=username.encode() if ok else b"")
