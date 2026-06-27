@@ -28,6 +28,13 @@ class ServerConfig:
     bcrypt_cost: int = 12
     admin_token: str = ""
     admin_token_file: str = "./pulsemq_admin.token"
+    sse_interval: float = 1.0
+    latency_sample_rate: float = 0.01
+    event_ring_size: int = 200
+    stats_archive_batch_size: int = 50
+    admin_thread: bool = True
+    ui_enabled: bool = True
+    retention_days: int = 7
 
 
 @dataclass
@@ -82,6 +89,16 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         admin_token=m.get("admin_token", ServerConfig.admin_token),
         admin_token_file=m.get("admin_token_file",
                                ServerConfig.admin_token_file),
+        sse_interval=float(m.get("sse_interval", ServerConfig.sse_interval)),
+        latency_sample_rate=float(m.get("latency_sample_rate",
+                                        ServerConfig.latency_sample_rate)),
+        event_ring_size=int(m.get("event_ring_size",
+                                  ServerConfig.event_ring_size)),
+        stats_archive_batch_size=int(m.get("stats_archive_batch_size",
+                                           ServerConfig.stats_archive_batch_size)),
+        admin_thread=bool(m.get("admin_thread", ServerConfig.admin_thread)),
+        ui_enabled=bool(m.get("ui_enabled", ServerConfig.ui_enabled)),
+        retention_days=int(m.get("retention_days", ServerConfig.retention_days)),
     )
     # 环境变量覆盖
     if (v := _env("PULSEMQ_DATA_ENDPOINT")):

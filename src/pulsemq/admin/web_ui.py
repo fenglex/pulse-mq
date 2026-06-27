@@ -204,6 +204,58 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 .topic-card .cache{color:var(--text-muted)}
 .empty{text-align:center;padding:48px;color:var(--text-muted);font-size:13px}
 
+/* ===== 事件流 ===== */
+#event-stream .ev-row{
+  padding:9px 14px;border-bottom:1px solid rgba(30,48,84,0.4);
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
+  font-size:12px;color:var(--text-secondary);
+}
+#event-stream .ev-row:hover{background:rgba(59,130,246,0.06)}
+#event-stream .ev-type{
+  font-weight:600;padding:2px 8px;border-radius:6px;font-size:11px;
+}
+#event-stream .ev-type.connect{background:rgba(52,211,153,0.15);color:var(--accent-green)}
+#event-stream .ev-type.disconnect{background:rgba(251,113,133,0.15);color:var(--accent-rose)}
+#event-stream .ev-type.subscribe{background:rgba(59,130,246,0.15);color:var(--accent-blue)}
+#event-stream .ev-type.unsubscribe{background:rgba(167,139,250,0.15);color:var(--accent-purple)}
+#event-stream .ev-type.auth{background:rgba(251,191,36,0.15);color:var(--accent-amber)}
+#event-stream .ev-type.other{background:rgba(138,154,179,0.15);color:var(--text-secondary)}
+#event-stream .ev-ts{color:var(--text-muted);font-variant-numeric:tabular-nums;font-size:11px}
+#event-stream .ev-detail{color:var(--text-primary);font-size:12px;flex:1;text-align:right;word-break:break-all}
+
+/* ===== Modal ===== */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(2,6,15,0.72);
+  backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  display:none;align-items:center;justify-content:center;z-index:200;
+}
+.modal-overlay.show{display:flex}
+.modal{
+  background:linear-gradient(135deg,rgba(13,26,48,0.96),rgba(10,19,38,0.96));
+  border:1px solid var(--border);border-radius:16px;
+  padding:24px;max-width:880px;width:92%;max-height:80vh;overflow:auto;
+  box-shadow:0 24px 64px rgba(0,0,0,0.6);
+}
+.modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+.modal-title{font-size:16px;font-weight:700;color:var(--text-primary)}
+.modal-close{
+  background:transparent;border:1px solid var(--border);border-radius:8px;
+  color:var(--text-secondary);width:30px;height:30px;cursor:pointer;font-size:16px;
+  display:flex;align-items:center;justify-content:center;transition:all .2s;
+}
+.modal-close:hover{color:var(--accent-rose);border-color:var(--accent-rose)}
+.client-table{width:100%;border-collapse:collapse;font-size:12px}
+.client-table th{
+  text-align:left;padding:8px 10px;color:var(--text-secondary);
+  font-weight:600;border-bottom:1px solid var(--border);
+}
+.client-table td{padding:8px 10px;border-bottom:1px solid rgba(30,48,84,0.4);color:var(--text-primary)}
+.client-table tr:hover td{background:rgba(59,130,246,0.06)}
+.client-role{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600}
+.client-role.pub{background:rgba(251,191,36,0.15);color:var(--accent-amber)}
+.client-role.sub{background:rgba(52,211,153,0.15);color:var(--accent-green)}
+.client-role.mixed{background:rgba(59,130,246,0.15);color:var(--accent-blue)}
+
 /* ===== 滚动条 ===== */
 ::-webkit-scrollbar{width:7px;height:7px}
 ::-webkit-scrollbar-track{background:var(--bg-deep)}
@@ -258,6 +310,41 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
     </div>
   </div>
 
+  <div class="card-grid" id="overview-cards-clients">
+    <div class="card blue" style="cursor:pointer" onclick="openClientModal()" title="点击查看在线 Client 详情">
+      <div class="head">
+        <div class="label">在线用户</div>
+        <div class="icon">👤</div>
+      </div>
+      <div class="value" id="v-online-users">0</div>
+      <div class="sub">已认证连接</div>
+    </div>
+    <div class="card amber">
+      <div class="head">
+        <div class="label">在线生产者</div>
+        <div class="icon">📤</div>
+      </div>
+      <div class="value" id="v-online-producers">0</div>
+      <div class="sub">PUB 角色连接</div>
+    </div>
+    <div class="card green">
+      <div class="head">
+        <div class="label">在线消费者</div>
+        <div class="icon">📥</div>
+      </div>
+      <div class="value" id="v-online-consumers">0</div>
+      <div class="sub">SUB 角色连接</div>
+    </div>
+    <div class="card purple">
+      <div class="head">
+        <div class="label">总订阅</div>
+        <div class="icon">🔗</div>
+      </div>
+      <div class="value" id="v-total-subs">0</div>
+      <div class="sub">活跃订阅条目</div>
+    </div>
+  </div>
+
   <div class="chart-section">
     <div class="chart-header">
       <div class="chart-title">
@@ -275,11 +362,45 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 
   <div class="chart-section">
     <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>端到端延迟分位（毫秒）<span class="chart-hint" style="margin-left:6px">P50 / P95 / P99 实时</span></span>
+      </div>
+    </div>
+    <div id="latency-chart" style="width:100%;height:320px"></div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>最近事件流<span class="chart-hint" style="margin-left:6px">最新在上 · 自动滚动</span></span>
+      </div>
+    </div>
+    <div id="event-stream" style="max-height:360px;overflow-y:auto;border-radius:10px;border:1px solid var(--border);background:rgba(10,19,38,0.4)">
+      <div class="empty">等待事件…</div>
+    </div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
       <div class="chart-title"><span>📋 主题列表</span></div>
     </div>
     <div class="topic-grid" id="topic-list"></div>
   </div>
 </main>
+
+<div class="modal-overlay" id="client-modal" onclick="if(event.target===this)closeClientModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title">👤 在线 Client 列表</div>
+      <button class="modal-close" onclick="closeClientModal()">✕</button>
+    </div>
+    <div id="client-modal-body">
+      <div class="empty">加载中…</div>
+    </div>
+  </div>
+</div>
 
 <script>
   window._tok = new URLSearchParams(location.search).get('token') || '';
@@ -308,10 +429,18 @@ let state = {
   selected: [],
   uptime: 0,
   timeRange: 60,
+  onlineUsers: 0,
+  onlineProducers: 0,
+  onlineConsumers: 0,
+  totalSubs: 0,
+  latency: { p50: 0, p95: 0, p99: 0 },
+  events: [],
 };
 
 let chart = null;
+let latencyChart = null;
 let firstSelectDone = false;
+const MAX_EVENTS = 50;
 
 /* ---- SSE ---- */
 function connectSSE() {
@@ -327,7 +456,28 @@ function connectSSE() {
       } else if (d.uptime_seconds != null) {
         state.uptime = d.uptime_seconds;
       }
+      // Spec3 实时字段
+      state.onlineUsers = d.online_users != null ? d.online_users : state.onlineUsers;
+      state.onlineProducers = d.online_producers != null ? d.online_producers : state.onlineProducers;
+      state.onlineConsumers = d.online_consumers != null ? d.online_consumers : state.onlineConsumers;
+      state.totalSubs = d.total_subscriptions != null ? d.total_subscriptions : state.totalSubs;
+      if (d.latency_p50_ms != null || d.latency_p95_ms != null || d.latency_p99_ms != null) {
+        state.latency = {
+          p50: d.latency_p50_ms != null ? d.latency_p50_ms : state.latency.p50,
+          p95: d.latency_p95_ms != null ? d.latency_p95_ms : state.latency.p95,
+          p99: d.latency_p99_ms != null ? d.latency_p99_ms : state.latency.p99,
+        };
+      }
+      // 若 SSE 内嵌事件流，按事件数组增量入队
+      if (Array.isArray(d.events)) {
+        for (const e of d.events) pushEvent(e);
+      } else if (d.event) {
+        pushEvent(d.event);
+      }
       render();
+      renderOverview();
+      renderLatency();
+      renderEvents();
       if (!firstSelectDone && Object.keys(d.topics || {}).length > 0) {
         firstSelectDone = true;
         const firstName = Object.keys(d.topics)[0];
@@ -556,6 +706,139 @@ function formatCache(c) {
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
 
+/* ---- Spec3 概览卡片 / 延迟 / 事件 / 详情弹窗 ---- */
+function renderOverview() {
+  $('v-online-users').textContent = state.onlineUsers.toLocaleString();
+  $('v-online-producers').textContent = state.onlineProducers.toLocaleString();
+  $('v-online-consumers').textContent = state.onlineConsumers.toLocaleString();
+  $('v-total-subs').textContent = state.totalSubs.toLocaleString();
+}
+
+function renderLatency() {
+  if (!latencyChart) {
+    latencyChart = echarts.init($('latency-chart'), null, { renderer: 'canvas' });
+    window.addEventListener('resize', () => latencyChart && latencyChart.resize());
+  }
+  const data = [
+    { name: 'P50', value: +(state.latency.p50 || 0).toFixed(2) },
+    { name: 'P95', value: +(state.latency.p95 || 0).toFixed(2) },
+    { name: 'P99', value: +(state.latency.p99 || 0).toFixed(2) },
+  ];
+  const colors = ['#34d399', '#fbbf24', '#fb7185'];
+  latencyChart.setOption({
+    backgroundColor: 'transparent',
+    animation: true, animationDuration: 300,
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(10,19,38,0.95)',
+      borderColor: '#1e3054',
+      textStyle: { color: '#eef2fa', fontSize: 12 },
+      valueFormatter: v => v != null ? v.toFixed(2) + ' ms' : '-',
+    },
+    grid: { left: 56, right: 24, top: 28, bottom: 36 },
+    xAxis: {
+      type: 'category', data: data.map(d => d.name),
+      axisLine: { lineStyle: { color: '#1e3054' } },
+      axisTick: { show: false },
+      axisLabel: { color: '#8a9ab3', fontSize: 12 },
+    },
+    yAxis: {
+      type: 'value', name: 'ms',
+      nameTextStyle: { color: '#8a9ab3', fontSize: 11 },
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: '#8a9ab3', fontSize: 11 },
+      splitLine: { lineStyle: { color: 'rgba(30,48,84,0.6)', type: 'dashed' } },
+    },
+    series: [{
+      type: 'bar', data: data.map((d, i) => ({ value: d.value, itemStyle: { color: colors[i] } })),
+      barWidth: '38%',
+      itemStyle: { borderRadius: [6, 6, 0, 0] },
+      label: {
+        show: true, position: 'top', color: '#eef2fa', fontSize: 12,
+        formatter: p => p.value.toFixed(2) + ' ms',
+      },
+    }],
+  }, true);
+}
+
+function pushEvent(e) {
+  // e: {type, ts/timestamp, detail/user/client_id}
+  if (!e) return;
+  const ev = {
+    type: (e.type || 'other'),
+    ts: e.ts != null ? e.ts : (e.timestamp != null ? e.timestamp : Date.now()),
+    detail: e.detail != null ? e.detail
+      : (e.client_id != null ? e.client_id : (e.user != null ? e.user : '')),
+    raw: e,
+  };
+  state.events.unshift(ev);
+  if (state.events.length > MAX_EVENTS) state.events.length = MAX_EVENTS;
+}
+
+function renderEvents() {
+  const el = $('event-stream');
+  if (!state.events || state.events.length === 0) {
+    el.innerHTML = '<div class="empty">等待事件…</div>';
+    return;
+  }
+  el.innerHTML = state.events.map(ev => {
+    const tCls = ['connect','disconnect','subscribe','unsubscribe','auth'].includes(ev.type) ? ev.type : 'other';
+    const ts = new Date(ev.ts).toLocaleTimeString('zh-CN', { hour12: false });
+    return `<div class="ev-row">
+      <span class="ev-type ${tCls}">${esc(ev.type)}</span>
+      <span class="ev-detail">${esc(ev.detail)}</span>
+      <span class="ev-ts">${esc(ts)}</span>
+    </div>`;
+  }).join('');
+}
+
+async function openClientModal() {
+  const modal = $('client-modal');
+  const body = $('client-modal-body');
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  modal.classList.add('show');
+  try {
+    const r = await fetch(_withToken('/api/v1/clients'), { headers: _authHeaders() });
+    if (!r.ok) {
+      body.innerHTML = '<div class="empty">获取失败（HTTP ' + r.status + '）</div>';
+      return;
+    }
+    const d = await r.json();
+    const clients = Array.isArray(d) ? d : (d.clients || d.data || []);
+    if (!clients.length) {
+      body.innerHTML = '<div class="empty">当前无在线 Client</div>';
+      return;
+    }
+    body.innerHTML = `<table class="client-table">
+      <thead><tr>
+        <th>Client ID</th><th>用户</th><th>角色</th>
+        <th>订阅数</th><th>连接时长</th><th>远端</th>
+      </tr></thead>
+      <tbody>${clients.map(c => {
+        const role = c.role || c.roles || '';
+        let roleCls = 'mixed';
+        let roleText = esc(role || 'unknown');
+        if (role === 'pub' || role === 'producer') { roleCls = 'pub'; roleText = 'PUB'; }
+        else if (role === 'sub' || role === 'consumer') { roleCls = 'sub'; roleText = 'SUB'; }
+        else if (!role) { roleCls = 'mixed'; roleText = '-'; }
+        const up = c.connected_at ? Math.max(0, Math.floor(Date.now()/1000 - c.connected_at)) : (c.uptime_seconds || 0);
+        return `<tr>
+          <td>${esc(c.client_id || c.id || '-')}</td>
+          <td>${esc(c.user || c.username || '-')}</td>
+          <td><span class="client-role ${roleCls}">${roleText}</span></td>
+          <td>${esc((c.subscriptions != null ? c.subscriptions : (c.sub_count != null ? c.sub_count : '-')))}</td>
+          <td>${formatUptime(up)}</td>
+          <td>${esc(c.remote || c.peer || '-')}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>`;
+  } catch(e) {
+    body.innerHTML = '<div class="empty">加载失败：' + esc(String(e)) + '</div>';
+  }
+}
+function closeClientModal() { $('client-modal').classList.remove('show'); }
+
 /* ---- 图表 30s 自动刷新 ---- */
 setInterval(() => {
   if (state.selected.length > 0) {
@@ -566,6 +849,7 @@ setInterval(() => {
 
 /* ---- 初始化 ---- */
 connectSSE();
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeClientModal(); });
 fetch(_withToken('/api/v1/system/status'), {headers: _authHeaders()}).then(r=>r.json()).then(d => {
   state.uptime = d.uptime_seconds || 0;
   $('version-tag').textContent = 'v' + (d.version || '-');

@@ -72,3 +72,24 @@ def test_env_admin_token_and_password(monkeypatch):
     cfg = load_server_config(None)
     assert cfg.admin_token == "envtok"
     # PULSEMQ_ADMIN_PASSWORD 不进 config（仅 security 模块读），这里只验证不报错
+
+
+def test_monitoring_defaults():
+    cfg = ServerConfig()
+    assert cfg.sse_interval == 1.0
+    assert cfg.latency_sample_rate == 0.01
+    assert cfg.event_ring_size == 200
+    assert cfg.stats_archive_batch_size == 50
+    assert cfg.admin_thread is True
+    assert cfg.ui_enabled is True
+    assert cfg.retention_days == 7
+
+
+def test_load_monitoring_block(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text('[monitoring]\nlatency_sample_rate = 0.5\nevent_ring_size = 50\n'
+                 'admin_thread = false\n', encoding="utf-8")
+    cfg = load_server_config(str(p))
+    assert cfg.latency_sample_rate == 0.5
+    assert cfg.event_ring_size == 50
+    assert cfg.admin_thread is False

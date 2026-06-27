@@ -50,3 +50,24 @@ async def test_router_dealer_roundtrip(ctx, monkeypatch):
     assert recv == frame
     await client.close()
     await server.close()
+
+
+async def test_bind_forwards_on_auth(ctx):
+    from pulsemq.transport.router import Transport, PlainAuthDict
+    import socket as _sock
+    def _fp():
+        s = _sock.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+    dp = _fp()
+    seen = []
+    async def on_auth(username, address, ok, reason=None):
+        seen.append((username, ok))
+    server = Transport(ctx=ctx)
+    await server.bind(f"tcp://127.0.0.1:{dp}", "server_ingress",
+                      auth=PlainAuthDict({"alice": "pw"}), on_auth=on_auth)
+    # 触发一次 ZAP：client 连 + 错密码
+    client = Transport(ctx=ctx)
+    await client.connect(f"tcp://127.0.0.1:{dp}", "consumer",
+                         credentials=("alice", "WRONG"))
+    await asyncio.sleep(0.3)
+    assert any(u == "alice" for u, _ in seen)  # on_auth 被调用
+    await client.close(); await server.close()
