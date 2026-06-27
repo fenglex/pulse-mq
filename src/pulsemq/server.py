@@ -26,7 +26,9 @@ from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
                              RegisterResult)
 from pulsemq.logging_setup import log_event, logger
+from pulsemq.producers.manager import ProducerManager
 from pulsemq.protocol import frames
+from pulsemq.protocol.msg_type import DataType
 from pulsemq.routing import SubscriptionTable
 from pulsemq.security import CredentialStore
 from pulsemq.stats.connections import ConnectionStats, _role_of
@@ -128,6 +130,8 @@ class Server:
         # admin HTTP 服务（Spec 1 §9.2：常驻，沿用现有 AdminServer）
         self._admin: AdminServer | None = None
         self._start_time: float | None = None
+        # 内置 producer 调度（服务端定时推送）
+        self._producer_mgr = ProducerManager()
 
     async def start(self) -> None:
         self._storage.connect()
@@ -172,6 +176,10 @@ class Server:
             self._admin_endpoint,
         )
         self._install_sighup_reload()
+        # 启动内置 producer 调度
+        if self._producer_mgr.specs:
+            await self._producer_mgr.start_all(self._on_server_produce)
+            logger.info("内置 Producer 调度启动: {} 个", len(self._producer_mgr.specs))
 
     def _resolve_admin_token(self, explicit: str | None,
                              token_file: str | None) -> str:
@@ -249,6 +257,65 @@ class Server:
         except (AttributeError, NotImplementedError, ValueError, RuntimeError):
             # Windows 无 SIGHUP；非主线程无信号。留接口，Spec 3 admin 接口接入。
             pass
+
+    # ---- 服务端内置 producer 调度（定时推送到指定 topic） ----
+
+    def producer(
+        self,
+        topic: str,
+        *,
+        interval: float = 5.0,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ):
+        """注册一个定时 producer：回调返回的数据通过服务端内置广播推送到 topic。
+
+        用法::
+
+            srv = Server(...)
+
+            @srv.producer("market.tick", interval=2.0, serializer="msgpack")
+            async def gen_tick():
+                return {"symbol": "AAPL", "price": 180.5, "volume": 1000}
+        """
+
+        def deco(fn):
+            self._producer_mgr.register(
+                fn, name=topic, interval=interval,
+                serializer=serializer, compression=compression,
+            )
+            return fn
+
+        return deco
+
+    def burst_producer(
+        self,
+        topic: str,
+        *,
+        serializer: str = "msgpack",
+        compression: str = "none",
+    ):
+        """注册一个 burst producer：无间隔连续发送，回调返回 None 时停止。"""
+
+        def deco(fn):
+            self._producer_mgr.register_burst(
+                fn, name=topic,
+                serializer=serializer, compression=compression,
+            )
+            return fn
+
+        return deco
+
+    async def _on_server_produce(self, spec, data) -> None:
+        """内置 producer 回调：编码 → 路由 → 广播给所有匹配的订阅者。"""
+        from pulsemq.protocol.frames import encode
+        frame = encode(spec.name, data, serializer=spec.serializer,
+                       compression=spec.compression, data_type=DataType.UNKNOWN)
+        for target in self._routing.match(spec.name):
+            try:
+                await self._transport.send(target, frame, role="server_ingress")
+            except Exception:
+                pass
 
     async def _data_loop(self) -> None:
         while self._running:
@@ -439,6 +506,8 @@ class Server:
                 await self._archive_writer.enqueue(archived)
         except Exception:
             logger.debug("stop 归档入队失败", exc_info=True)
+        # 停内置 producer 调度
+        await self._producer_mgr.stop_all()
         # 关闭顺序（Spec 3）：停 admin → 停 archive_writer（drain 剩余）→
         # 停 transport → 关 storage。storage.close 必须在 archive_writer.stop 之后，
         # 否则 drain 写入已关闭的 SQLite 连接。
