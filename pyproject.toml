@@ -28,6 +28,7 @@ dependencies = [
     "pyarrow>=14.0",
     "pandas>=2.0",
     "loguru>=0.7",
+    "bcrypt>=4.0",
 ]
 
 [project.urls]
@@ -38,6 +39,7 @@ Issues = "https://github.com/haifeng/pulse-mq/issues"
 [project.scripts]
 pulsemq = "pulsemq.cli.server:main"
 pulsemq-server = "pulsemq.cli.server:main"
+pulsemq-users = "pulsemq.cli.users:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pulsemq"]

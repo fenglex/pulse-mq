@@ -38,6 +38,7 @@ async def test_realtime_json_serializable_with_live_subscription():
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         admin_endpoint=f"127.0.0.1:{ap}",
         credentials={"c": "c"},
+        admin_token="",  # Spec 2：禁用 token 校验，沿用 Spec 1 行为
     )
     await srv.start()
     try:

@@ -23,6 +23,11 @@ class ServerConfig:
     heartbeat_timeout: float = 6.0
     stats_db: str = "sqlite://./pulsemq_stats.sqlite"
     stats_retention_minutes: int = 480
+    allow_auto_generated_credentials: bool = True
+    password_hash_algo: str = "bcrypt"
+    bcrypt_cost: int = 12
+    admin_token: str = ""
+    admin_token_file: str = "./pulsemq_admin.token"
 
 
 @dataclass
@@ -56,6 +61,7 @@ def load_server_config(path: str | None = None) -> ServerConfig:
     data = _read_toml(path)
     s = data.get("server", {})
     a = data.get("auth", {})
+    m = data.get("monitoring", {})
     if a.get("type", "plain") not in ("plain", "PLAIN"):
         raise ConfigurationError(f"auth.type 仅支持 plain，拒绝 {a.get('type')!r}")
     cfg = ServerConfig(
@@ -67,6 +73,15 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         stats_db=s.get("stats_db", ServerConfig.stats_db),
         stats_retention_minutes=int(s.get("stats_retention_minutes",
                                           ServerConfig.stats_retention_minutes)),
+        allow_auto_generated_credentials=bool(
+            a.get("allow_auto_generated_credentials",
+                  ServerConfig.allow_auto_generated_credentials)),
+        password_hash_algo=a.get("password_hash_algo",
+                                 ServerConfig.password_hash_algo),
+        bcrypt_cost=int(a.get("bcrypt_cost", ServerConfig.bcrypt_cost)),
+        admin_token=m.get("admin_token", ServerConfig.admin_token),
+        admin_token_file=m.get("admin_token_file",
+                               ServerConfig.admin_token_file),
     )
     # 环境变量覆盖
     if (v := _env("PULSEMQ_DATA_ENDPOINT")):
@@ -77,6 +92,8 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         cfg.admin_endpoint = v
     if (v := _env("PULSEMQ_CREDENTIALS_FILE")):
         cfg.credentials_file = v
+    if (v := _env("PULSEMQ_ADMIN_TOKEN")):
+        cfg.admin_token = v
     return cfg
 
 

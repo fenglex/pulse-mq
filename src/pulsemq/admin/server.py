@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from loguru import logger
 
 from pulsemq._version import __version__ as _PKG_VERSION
+from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.web_ui import INDEX_HTML
 from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.stats.storage import StatsStorage
@@ -28,6 +29,7 @@ SERVER_VERSION: str = _PKG_VERSION
 _STATUS_TEXT: dict[int, str] = {
     200: "OK",
     400: "Bad Request",
+    401: "Unauthorized",
     404: "Not Found",
     500: "Internal Server Error",
 }
@@ -58,6 +60,7 @@ class AdminServer:
         stats_storage: StatsStorage | None = None,
         snapshot_fn: Callable[[], dict] | None = None,
         start_time: float | None = None,
+        token_auth: TokenAuth | None = None,
     ) -> None:
         host, port = bind.split(":")
         self._host = host
@@ -67,6 +70,7 @@ class AdminServer:
         self._storage = stats_storage
         self._snapshot_fn = snapshot_fn
         self._start_time = start_time or time.time()
+        self._token_auth = token_auth
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
         self._sse_clients: dict[int, tuple[asyncio.Queue, asyncio.Task]] = {}
@@ -135,6 +139,11 @@ class AdminServer:
             parsed = urlparse(full_path)
             path = parsed.path
             query = parse_qs(parsed.query)
+            # token 认证（除 /healthz）
+            if self._token_auth is not None and self._token_auth.enabled and path != "/healthz":
+                if not self._token_auth.validate(headers, query):
+                    await self._respond_json(writer, 401, {"error": "unauthorized"})
+                    return
             await self._route(writer, method, path, query)
         except asyncio.TimeoutError:
             pass

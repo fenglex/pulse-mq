@@ -43,3 +43,9 @@ def test_client_startup_error_fields():
 
 def test_exit_code_for_unknown_exception():
     assert exit_code_for(ValueError("x")) == 1
+
+
+def test_security_error_exit_code():
+    from pulsemq.errors import SecurityError
+    assert SecurityError.exit_code == 6
+    assert exit_code_for(SecurityError("bad hash")) == 6

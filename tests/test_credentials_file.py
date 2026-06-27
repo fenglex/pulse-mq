@@ -1,4 +1,4 @@
-"""Finding 2：Server 加载 credentials_file TOML 白名单（Spec §1.3/§11.2）。"""
+"""Server 凭据文件加载（Spec 2：CredentialStore TOML 格式 + 默认生成）。"""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,7 @@ import pytest
 from pulsemq.client import ConsumerClient
 from pulsemq.config import ServerConfig
 from pulsemq.errors import AuthenticationError, ClientStartupError
+from pulsemq.security import CredentialStore
 from pulsemq.server import Server
 
 
@@ -21,11 +22,12 @@ def _free_port() -> int:
 
 
 async def test_credentials_file_loaded(tmp_path):
-    """写入 [users] TOML，Server(credentials=None) 加载白名单。"""
+    """CredentialStore 写回的 TOML（哈希），Server(credentials=None) 加载白名单。"""
     cred_path = tmp_path / "users.toml"
-    cred_path.write_text(
-        '[users]\nalice = "pw-alice"\nbob = "pw-bob"\n', encoding="utf-8"
-    )
+    store = CredentialStore(str(cred_path), allow_auto_generated=False)
+    store.add_user("alice", "pw-alice", roles=["subscriber"])
+    store.add_user("bob", "pw-bob", roles=["publisher"])
+    store.save()
     dp, cp, ap = _free_port(), _free_port(), _free_port()
     cfg = ServerConfig(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
@@ -53,7 +55,7 @@ async def test_credentials_file_loaded(tmp_path):
         await ok.start()
         await ok.stop()
 
-        # 默认 admin:admin 不应通过（文件存在时不再回退默认）
+        # admin:admin 不应通过（文件存在，无默认回退）
         bad = ConsumerClient(
             data_endpoint=f"tcp://127.0.0.1:{dp}",
             control_endpoint=f"tcp://127.0.0.1:{cp}",
@@ -66,14 +68,15 @@ async def test_credentials_file_loaded(tmp_path):
         await srv.stop()
 
 
-async def test_credentials_file_missing_falls_back_to_default(tmp_path):
-    """文件缺失：回退 admin:admin 并告警。"""
+async def test_credentials_file_missing_generates_default(tmp_path):
+    """文件缺失：自动生成默认 admin（随机密码写回文件），不再用 admin:admin。"""
     dp, cp, ap = _free_port(), _free_port(), _free_port()
+    cred_path = str(tmp_path / "nope.toml")
     cfg = ServerConfig(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         admin_endpoint=f"127.0.0.1:{ap}",
-        credentials_file=str(tmp_path / "nope.toml"),
+        credentials_file=cred_path,
     )
     srv = Server(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
@@ -85,11 +88,12 @@ async def test_credentials_file_missing_falls_back_to_default(tmp_path):
     await srv.start()
     try:
         await asyncio.sleep(0.2)
+        assert srv.generated_admin_password is not None
         c = ConsumerClient(
             data_endpoint=f"tcp://127.0.0.1:{dp}",
             control_endpoint=f"tcp://127.0.0.1:{cp}",
             username="admin",
-            password="admin",
+            password=srv.generated_admin_password,
         )
         await c.start()
         await c.stop()

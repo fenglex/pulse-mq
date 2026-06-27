@@ -12,47 +12,26 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
+import secrets
+import stat
+import sys
 import time
 
-from pathlib import Path
-
+from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.server import AdminServer
+from pulsemq.auth import PlainAuth
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
                              RegisterResult)
 from pulsemq.logging_setup import log_event, logger
 from pulsemq.protocol import frames
 from pulsemq.routing import SubscriptionTable
+from pulsemq.security import CredentialStore
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
-from pulsemq.transport.router import PlainAuthDict, Transport
-
-try:
-    import tomllib  # py311+
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib  # type: ignore
-
-
-def _load_credentials_file(path: str) -> dict[str, str] | None:
-    """Spec §1.3/§11.2 明文 TOML 白名单：``[users]`` 表 username=plaintext_password。
-
-    文件缺失或无 ``[users]`` 表返回 None（由调用方回退默认并告警）。
-    """
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        return None
-    try:
-        with p.open("rb") as f:
-            data = tomllib.load(f)
-    except Exception:
-        logger.exception("[SECURITY] 凭据文件解析失败 path={}", path)
-        return None
-    users = data.get("users")
-    if not isinstance(users, dict) or not users:
-        return None
-    return {str(k): str(v) for k, v in users.items()}
+from pulsemq.transport.router import Transport
 
 
 class Server:
@@ -64,32 +43,57 @@ class Server:
         control_endpoint: str = "tcp://0.0.0.0:5556",
         admin_endpoint: str = "0.0.0.0:9090",
         credentials: dict[str, str] | None = None,
+        credentials_file: str | None = None,
+        allow_auto_generated: bool | None = None,
         config: ServerConfig | None = None,
+        admin_token: str | None = None,
+        admin_token_file: str | None = None,
     ) -> None:
         self._cfg = config or load_server_config(None)
         # 显式传值优先于 config；空串视为未传（回退到 config）
         self._data_endpoint = data_endpoint or self._cfg.data_endpoint
         self._control_endpoint = control_endpoint or self._cfg.control_endpoint
         self._admin_endpoint = admin_endpoint or self._cfg.admin_endpoint
+        # 凭据源（Spec 2）：CredentialStore + PlainAuth
+        self.generated_admin_password: str | None = None
         if credentials is not None:
-            # 显式传入优先；不读文件。
-            self._auth = PlainAuthDict(credentials)
+            # 显式明文 dict（测试/兼容）：内存态 store，哈希落值
+            store = CredentialStore.from_dict(credentials)
         else:
-            loaded = _load_credentials_file(self._cfg.credentials_file)
-            if loaded is not None:
-                self._auth = PlainAuthDict(loaded)
-                log_event("INFO", "SECURITY",
-                          action="credentials_file_loaded",
-                          path=self._cfg.credentials_file,
-                          users=len(loaded))
-            else:
-                self._auth = PlainAuthDict({"admin": "admin"})
-                log_event(
-                    "WARNING", "SECURITY",
-                    action="default_credentials",
-                    msg="未检测到凭据文件，使用默认 admin:admin",
-                    path=self._cfg.credentials_file,
+            cred_file = credentials_file or self._cfg.credentials_file
+            allow = (self._cfg.allow_auto_generated_credentials
+                     if allow_auto_generated is None else allow_auto_generated)
+            store = CredentialStore(
+                cred_file,
+                allow_auto_generated=allow,
+                hash_algo=self._cfg.password_hash_algo,
+                bcrypt_cost=self._cfg.bcrypt_cost,
+            )
+            plaintext = store.load()
+            if plaintext is not None:
+                # 自动生成的默认 admin：明文仅此一次输出
+                self.generated_admin_password = plaintext
+                print(f"[SECURITY] 未检测到 {cred_file}，已生成默认用户", file=sys.stderr)
+                print(f"[SECURITY] username=admin, password={plaintext}", file=sys.stderr)
+                print(
+                    "[SECURITY] 提示：默认凭据仅用于首次启动，"
+                    "请使用 pulsemq.users CLI 创建正式用户",
+                    file=sys.stderr,
                 )
+                log_event("WARNING", "SECURITY", action="default_credentials_generated")
+            else:
+                log_event(
+                    "INFO", "SECURITY",
+                    action="credentials_file_loaded",
+                    path=cred_file,
+                    users=len(store.list_users()),
+                )
+        self._credential_store = store
+        self._auth = PlainAuth(store)
+        # admin token（Spec 2 §5）：优先级 explicit > config > env > 随机生成（写文件 0600）。
+        # 显式传 admin_token="" 视为「禁用 token 校验」（向后兼容 Spec 1 测试）。
+        self.admin_token = self._resolve_admin_token(admin_token, admin_token_file)
+        self._token_auth = TokenAuth(self.admin_token)
         self._transport = Transport()
         self._routing = SubscriptionTable()
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
@@ -122,6 +126,7 @@ class Server:
                 "subscriptions": self._routing.snapshot(),
             },
             start_time=self._start_time,
+            token_auth=self._token_auth,
         )
         await self._admin.start()
         self._running = True
@@ -137,6 +142,84 @@ class Server:
             self._control_endpoint,
             self._admin_endpoint,
         )
+        self._install_sighup_reload()
+
+    def _resolve_admin_token(self, explicit: str | None,
+                             token_file: str | None) -> str:
+        """确定 admin HTTP token（Spec 2 §5）。
+
+        优先级：
+        1. 显式 ``admin_token=`` 参数（含空串 → 禁用 token，向后兼容 Spec 1）
+        2. config ``monitoring.admin_token``（含被环境变量 ``PULSEMQ_ADMIN_TOKEN``
+           覆盖后的值，见 ``load_server_config``）
+        3. 环境变量 ``PULSEMQ_ADMIN_TOKEN``（双保险；正常路径已被 step 2 吸收）
+        4. 随机生成 32 字节 base64url，写 ``admin_token_file``（0600）+ stderr 输出一次
+
+        返回最终 token 字符串（空串表示禁用）。
+        """
+        if explicit is not None:
+            return explicit
+        if self._cfg.admin_token:
+            return self._cfg.admin_token
+        env_tok = os.environ.get("PULSEMQ_ADMIN_TOKEN")
+        if env_tok:
+            return env_tok
+        tok = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+        path = token_file or self._cfg.admin_token_file
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(tok)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                # Windows/非 POSIX：chmod 失败可接受，文件已写入。
+                pass
+            # Spec §11.4：token 文件必须 0600。检查实际权限位并告警。
+            if os.name == "posix":
+                try:
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                except OSError:
+                    mode = None
+                if mode is not None and (mode & 0o077):
+                    print(
+                        f"[ADMIN] 警告：token 文件权限过宽 (mode={oct(mode)}), "
+                        "建议 chmod 600",
+                        file=sys.stderr,
+                    )
+                    log_event(
+                        "WARNING", "ADMIN",
+                        action="insecure_token_file", path=path, mode=oct(mode),
+                    )
+            else:
+                # Windows：chmod 无效，提示目录 ACL 受控。
+                print(
+                    "[ADMIN] 警告：Windows 未限制 token 文件 ACL，请确保目录访问受控",
+                    file=sys.stderr,
+                )
+                log_event(
+                    "WARNING", "ADMIN",
+                    action="insecure_token_file_windows", path=path,
+                )
+            print(f"[ADMIN] 管理接口 token: {tok}", file=sys.stderr)
+            log_event("WARNING", "ADMIN", action="admin_token_generated", path=path)
+        except OSError:
+            log_event("WARNING", "ADMIN", action="admin_token_write_failed", path=path)
+        return tok
+
+    def reload_credentials(self) -> None:
+        """热更新凭据（CLI 改文件后调用，或 SIGHUP 触发）。"""
+        self._credential_store.reload()
+        log_event("INFO", "SECURITY", action="credentials_reloaded")
+
+    def _install_sighup_reload(self) -> None:
+        """Linux：注册 SIGHUP→reload_credentials。Windows/非主线程静默跳过。"""
+        import signal
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGHUP, self.reload_credentials)
+        except (AttributeError, NotImplementedError, ValueError, RuntimeError):
+            # Windows 无 SIGHUP；非主线程无信号。留接口，Spec 3 admin 接口接入。
+            pass
 
     async def _data_loop(self) -> None:
         while self._running:

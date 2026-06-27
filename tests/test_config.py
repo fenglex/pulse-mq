@@ -43,3 +43,32 @@ def test_invalid_auth_type_rejected(tmp_path):
     p.write_text('[auth]\ntype = "curve"\n', encoding="utf-8")
     with __import__("pytest").raises(ConfigurationError):
         load_server_config(str(p))
+
+
+def test_server_config_security_defaults():
+    cfg = ServerConfig()
+    assert cfg.allow_auto_generated_credentials is True
+    assert cfg.password_hash_algo == "bcrypt"
+    assert cfg.bcrypt_cost == 12
+    assert cfg.admin_token == ""
+    assert cfg.admin_token_file == "./pulsemq_admin.token"
+
+
+def test_load_auth_block_from_toml(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text(
+        '[auth]\ntype = "plain"\nallow_auto_generated_credentials = false\n'
+        'bcrypt_cost = 10\n[monitoring]\nadmin_token = "tok123"\n',
+        encoding="utf-8")
+    cfg = load_server_config(str(p))
+    assert cfg.allow_auto_generated_credentials is False
+    assert cfg.bcrypt_cost == 10
+    assert cfg.admin_token == "tok123"
+
+
+def test_env_admin_token_and_password(monkeypatch):
+    monkeypatch.setenv("PULSEMQ_ADMIN_TOKEN", "envtok")
+    monkeypatch.setenv("PULSEMQ_ADMIN_PASSWORD", "envpw")
+    cfg = load_server_config(None)
+    assert cfg.admin_token == "envtok"
+    # PULSEMQ_ADMIN_PASSWORD 不进 config（仅 security 模块读），这里只验证不报错

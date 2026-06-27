@@ -32,6 +32,7 @@ async def test_admin_healthz_served():
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         admin_endpoint=f"127.0.0.1:{ap}",
         credentials={"a": "b"},
+        admin_token="",  # Spec 2：禁用 token 校验，沿用 Spec 1 行为
     )
     await srv.start()
     try:
@@ -51,6 +52,7 @@ async def test_admin_realtime_snapshot_includes_online_clients():
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         admin_endpoint=f"127.0.0.1:{ap}",
         credentials={"a": "b"},
+        admin_token="",  # Spec 2：禁用 token 校验，沿用 Spec 1 行为
     )
     await srv.start()
     try:

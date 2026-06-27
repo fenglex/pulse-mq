@@ -281,8 +281,22 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   </div>
 </main>
 
-<script src="/static/echarts.min.js"></script>
 <script>
+  window._tok = new URLSearchParams(location.search).get('token') || '';
+  document.write('<script src="/static/echarts.min.js' +
+    (window._tok ? '?token=' + encodeURIComponent(window._tok) : '') +
+    '"><\/script>');
+</script>
+<script>
+const _tok = window._tok || '';
+function _authHeaders(extra) {
+  const h = extra || {};
+  if (_tok) { h['Authorization'] = 'Bearer ' + _tok; }
+  return h;
+}
+function _withToken(url) {
+  return _tok ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(_tok) : url;
+}
 const $ = id => document.getElementById(id);
 const COLORS = ['#3b82f6','#fbbf24','#34d399','#a78bfa','#fb7185'];
 const MAX_SELECTED = 5;
@@ -301,7 +315,7 @@ let firstSelectDone = false;
 
 /* ---- SSE ---- */
 function connectSSE() {
-  const es = new EventSource('/api/v1/stats/stream');
+  const es = new EventSource(_withToken('/api/v1/stats/stream'));
   es.onopen = () => { $('conn-status').textContent='实时'; $('conn-status').className='ok'; };
   es.onmessage = ev => {
     try {
@@ -359,7 +373,7 @@ async function loadHistory(topic) {
   const range = state.timeRange;
   if (state.history_cache[topic][range]) return;
   try {
-    const r = await fetch('/api/v1/topics/' + encodeURIComponent(topic) + '/history?minutes=' + range);
+    const r = await fetch(_withToken('/api/v1/topics/' + encodeURIComponent(topic) + '/history?minutes=' + range), {headers: _authHeaders()});
     const d = await r.json();
     state.history_cache[topic][range] = d.history || [];
   } catch(e) {
@@ -552,7 +566,7 @@ setInterval(() => {
 
 /* ---- 初始化 ---- */
 connectSSE();
-fetch('/api/v1/system/status').then(r=>r.json()).then(d => {
+fetch(_withToken('/api/v1/system/status'), {headers: _authHeaders()}).then(r=>r.json()).then(d => {
   state.uptime = d.uptime_seconds || 0;
   $('version-tag').textContent = 'v' + (d.version || '-');
   render();

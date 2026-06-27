@@ -45,6 +45,11 @@ class ConfigurationError(PulseMQError):
     exit_code = 6
 
 
+class SecurityError(PulseMQError):
+    """凭据文件解析失败、哈希格式非法等安全侧错误。"""
+    exit_code = 6
+
+
 class ResourceExhaustedError(PulseMQError):
     exit_code = 7
 
