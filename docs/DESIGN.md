@@ -93,8 +93,10 @@ PulseMQ v2 是一个 **Client/Server 消息中间件**，基于 ZeroMQ ROUTER/DE
 ```python
 srv = Server(data_endpoint, control_endpoint, admin_endpoint,
              credentials={"user": "pass"}, admin_token="...")
-await srv.start()   # bind 数据面 + 控制面 + admin HTTP，启动 4 个后台任务
-await srv.stop()    # 取消任务 → 归档统计 → 关闭 admin → drain archive → 关 transport → 关存储
+# 以下均为协程，需在 asyncio 事件循环中调用：
+await srv.start()          # bind 数据面 + 控制面 + admin HTTP，启动 4 个后台任务
+await srv.wait_for_shutdown()  # 阻塞直到 Ctrl+C / srv.stop()
+await srv.stop()           # 取消任务 → 归档统计 → 关闭 admin → drain archive → 关 transport → 关存储
 ```
 
 ### 后台任务
@@ -460,14 +462,15 @@ Windows 自动设置 `WindowsSelectorEventLoopPolicy`。
 
 ### CLI 入口
 
+两个独立入口（见 `pyproject.toml` `[project.scripts]`）：
+
 ```bash
-pulsemq server          # 启动服务
-pulsemq users add       # 添加用户
-pulsemq users list      # 列出用户
-pulsemq users disable   # 禁用
-pulsemq users enable    # 启用
-pulsemq users passwd    # 改密码
-pulsemq users reload    # 热更新
+pulsemq              # 启动 Server（等价 pulsemq-server），Ctrl+C 优雅关闭
+pulsemq-users add    # 添加用户（--password / --roles，自动 bcrypt 哈希）
+pulsemq-users list   # 列出用户
+pulsemq-users disable / enable <user>
+pulsemq-users passwd <user>     # 修改密码
+pulsemq-users reload  # 热更新（SIGHUP，仅 POSIX）
 ```
 
 ---

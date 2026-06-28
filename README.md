@@ -33,24 +33,36 @@ from pulsemq import Server
 
 ### 启动服务端
 
-```python
-from pulsemq import Server
-
-srv = Server(
-    data_endpoint="tcp://0.0.0.0:5555",
-    control_endpoint="tcp://0.0.0.0:5556",
-    admin_endpoint="0.0.0.0:9090",
-    credentials={"user1": "pass1"},  # 或 credentials_file
-)
-await srv.start()
-```
-
-首次启动若不存在凭据文件，自动生成默认 `admin` 用户，密码输出到 stderr。
-可通过 CLI 管理用户：
+最简单的方式是直接用 CLI（零配置，首次启动自动生成默认 `admin` 用户，密码输出到 stderr）：
 
 ```bash
-pulsemq users add user1 pass1 --role publisher
-pulsemq users list
+pulsemq          # 或： pulsemq-server
+```
+
+也可以在代码中启动（注意 `start()` 是协程，需要 `asyncio.run` 包裹）：
+
+```python
+import asyncio
+from pulsemq import Server
+
+async def main():
+    srv = Server(
+        data_endpoint="tcp://0.0.0.0:5555",
+        control_endpoint="tcp://0.0.0.0:5556",
+        admin_endpoint="0.0.0.0:9090",
+        credentials={"user1": "pass1"},  # 或省略，用 credentials_file（默认 ./pulsemq_users.toml）
+    )
+    await srv.start()
+    await srv.wait_for_shutdown()  # Ctrl+C / srv.stop() 后返回
+
+asyncio.run(main())
+```
+
+用户管理是独立的 CLI（`pulsemq-users`，不连 Server，直接读写凭据文件）：
+
+```bash
+pulsemq-users add user1 --password pass1 --roles publisher,subscriber
+pulsemq-users list
 ```
 
 ### 服务端内置定时推送
@@ -58,36 +70,52 @@ pulsemq users list
 无需外部生产者客户端，直接在 Server 上注册定时回调：
 
 ```python
+import asyncio
 from pulsemq import Server
 
-srv = Server(data_endpoint=..., control_endpoint=..., credentials={"u": "p"})
+async def main():
+    srv = Server(credentials={"u": "p"})
 
-@srv.producer("market.tick", interval=2.0, serializer="msgpack")
-async def gen_tick():
-    return {"symbol": "AAPL", "price": 180.5, "volume": 1000}
+    @srv.producer("market.tick", interval=2.0, serializer="msgpack")
+    async def gen_tick():
+        return {"symbol": "AAPL", "price": 180.5, "volume": 1000}
 
-@srv.producer("market.quote", interval=0.5, serializer="pyarrow", compression="lz4")
-async def gen_quote():
-    import pandas as pd
-    return pd.DataFrame({"price": [10, 20], "vol": [100, 200]})
+    @srv.producer("market.quote", interval=0.5, serializer="pyarrow", compression="lz4")
+    async def gen_quote():
+        import pandas as pd
+        return pd.DataFrame({"price": [10, 20], "vol": [100, 200]})
 
-@srv.burst_producer("bench", serializer="msgpack")
-async def bench():
-    if not has_more():
-        return None
-    return {"seq": next_seq()}
+    # burst_producer：无间隔连续推送，回调返回 None 即停止本 producer
+    seq = 0
+    @srv.burst_producer("bench", serializer="msgpack")
+    async def bench():
+        nonlocal seq
+        if seq >= 1000:   # 发满 1000 条后停止
+            return None
+        seq += 1
+        return {"seq": seq}
 
-await srv.start()   # 自动开始调度
+    await srv.start()       # 注册的 producer 自动开始调度
+    await srv.wait_for_shutdown()
+
+asyncio.run(main())
 ```
 
 | 方法 | 参数 | 说明 |
 |------|------|------|
 | `srv.producer(topic, interval, serializer, compression)` | `interval` 秒 | 固定间隔定时推送 |
-| `srv.burst_producer(topic, serializer, compression)` | 无间隔 | 连续推送，返回 `None` 停止 |
+| `srv.burst_producer(topic, serializer, compression)` | 无间隔 | 连续推送，回调返回 `None` 停止 |
 
 回调返回值支持 DataFrame / dict / str / bytes，自动编码为协议帧并路由到所有匹配的消费者。
 
 ### 生产者
+
+先创建用户（一次性），再运行下面任一示例（Server 必须已在运行）：
+
+```bash
+pulsemq-users add publisher --password pass1 --roles publisher
+pulsemq-users add subscriber --password pass2 --roles subscriber
+```
 
 ```python
 import asyncio
@@ -96,7 +124,7 @@ from pulsemq.client import ProducerClient
 async def main():
     prod = ProducerClient(
         "tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556",
-        username="user1", password="pass1",
+        username="publisher", password="pass1",
     )
     await prod.start()
     await prod.publish("market.stock.AAPL", {"price": 180.5, "volume": 1000})
@@ -108,12 +136,13 @@ asyncio.run(main())
 ### 消费者
 
 ```python
+import asyncio
 from pulsemq.client import ConsumerClient
 
 async def main():
     cons = ConsumerClient(
         "tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556",
-        username="user2", password="pass2",
+        username="subscriber", password="pass2",
     )
     await cons.start()
 
@@ -303,26 +332,33 @@ topic(N) ts(8 BE ns) record_count(4 BE) payload(变长) [CRC32?(4)]
 
 ### CLI
 
-```bash
-# 添加用户（自动 bcrypt 哈希）
-pulsemq users add trader1 secret123 --role publisher --role subscriber
+用户管理是独立入口 `pulsemq-users`（不连 Server，直接读写凭据文件，密码自动 bcrypt 哈希）：
 
-# 启动服务端
-pulsemq server
+```bash
+# 添加用户（密码自动 bcrypt 哈希；--password 可省略，改为交互输入）
+pulsemq-users add trader1 --password secret123 --roles publisher,subscriber
 
 # 列出所有用户
-pulsemq users list
+pulsemq-users list
 
-# 禁用/启用用户
-pulsemq users disable trader1
-pulsemq users enable  trader1
+# 禁用 / 启用用户
+pulsemq-users disable trader1
+pulsemq-users enable  trader1
 
 # 修改密码
-pulsemq users passwd trader1 new_secret
+pulsemq-users passwd trader1 --password new_secret
 
-# 热加载凭据（SIGHUP 或 CLI）
-pulsemq users reload
+# 热加载凭据（向 Server 进程发 SIGHUP；需 PULSEMQ_PID 环境变量，仅 POSIX）
+pulsemq-users reload
 ```
+
+启动服务端用另一个入口 `pulsemq`（等价于 `pulsemq-server`）：
+
+```bash
+pulsemq            # 启动 Server，Ctrl+C 优雅关闭
+```
+
+> 也可以指定凭据文件：把 `--file <path>` 放在子命令**之后**（如 `pulsemq-users list --file /etc/pulsemq/users.toml`）。
 
 ### 文件格式 (`pulsemq_users.toml`)
 
@@ -360,49 +396,46 @@ stderr 同步输出（容器/交互可见）。
 
 ## 性能基准
 
-### 单条消息（dict，每帧 1 条）
+### 运行基准
 
-| 序列化 | 压缩 | 吞吐量 | P50 延迟 |
-|--------|------|--------|----------|
-| msgpack | none | **18.9 K/s** | 183.9 ms |
-| msgpack | lz4 | 18.4 K/s | 124.1 ms |
-| json | none | 18.6 K/s | 151.4 ms |
-| pyarrow | none | 2.1 K/s | 781.6 ms |
-
-> pyarrow 适用于批处理，单条 dict 场景序列化开销过大（8-9x 慢于 msgpack）。
-> 压缩对< 200B payload 为负收益。机器：Windows 11, Python 3.14, 单机 localhost。
-
-### 批量 DataFrame（1000 行/帧）
-
-| 序列化 | 压缩 | 记录/s | P50 延迟 |
-|--------|------|--------|----------|
-| **pyarrow** | **zstd** | **363.6 K/s** | 1677 ms |
-| pyarrow | lz4 | 341.1 K/s | 1481 ms |
-| msgpack | none | 292.5 K/s | 1955 ms |
-| json | none | 290.5 K/s | 1983 ms |
-
-> 批量场景 pyarrow + 压缩是**最优组合**（直接序列化 DataFrame，无需格式转换）。
-> 延迟为压测下 ZMQ 缓冲区排队所致，真实场景以固定间隔发送时远低于此。
-
-### 基准脚本
+仓库自带可运行的端到端基准脚本（单进程内启动 Server + Producer + Consumer）：
 
 ```bash
-# 端到端压测（单进程 consumer + producer）
-python bench_v2_e2e.py --duration 10
+# 单条 dict 消息，msgpack/none
+python scripts/bench_simple.py --duration 5
 
-# 分离进程行情压测
-python bench_v2_market.py producer --duration 10
-python bench_v2_market.py consumer --duration 13
+# 批量 DataFrame（1000 行/帧）+ pyarrow + lz4
+python scripts/bench_simple.py --duration 5 --records-per-frame 1000 --serializer pyarrow --compression lz4
 
-# 全矩阵 ser × comp × data_type 类型保真验证
-python bench_v2_matrix.py
-
-# 行情全矩阵性能（12 组合）
-python bench_market_full.py --duration 5
-
-# DataFrame 批量性能（1000 行/帧）
-python bench_df_batch.py --duration 5
+# 可选参数：--serializer {msgpack,json,pyarrow,str,bytes}
+#           --compression {none,snappy,lz4,zstd}
 ```
+
+脚本输出帧/记录吞吐量与 p50/p90/p99/max 帧延迟。
+
+### 参考数据
+
+下列数值来自上述脚本在本机（Windows 11, Python 3.14, 单机 localhost）的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
+
+**单条消息（dict，每帧 1 条）**
+
+| 序列化 | 压缩 | 量级 |
+|--------|------|------|
+| msgpack | none | ~1e4 frames/s |
+| json | none | ~1e4 frames/s |
+
+> 小消息场景 pyarrow 单帧开销过大（序列化 + schema），不推荐用于单条 dict。
+> 压缩对 <200B payload 通常为负收益。
+
+**批量 DataFrame（1000 行/帧）**
+
+| 序列化 | 压缩 | 量级 |
+|--------|------|------|
+| pyarrow | lz4/zstd | ~1e6 records/s |
+| pyarrow | none | 略高于带压缩（取决于数据可压缩性） |
+
+> 批量场景 pyarrow 是**最优选择**（直接序列化 DataFrame，无需 dict 转换）。
+> 帧延迟为压测下 ZMQ 缓冲区排队所致，真实场景以固定间隔发送时远低于此。
 
 ---
 
@@ -414,16 +447,14 @@ python bench_df_batch.py --duration 5
 |------|------|------|
 | `PULSEMQ_DATA_ENDPOINT` | 数据面绑定地址 | `tcp://0.0.0.0:5555` |
 | `PULSEMQ_CONTROL_ENDPOINT` | 控制面绑定地址 | `tcp://0.0.0.0:5556` |
-| `PULSEMQ_ADMIN_ENDPOINT` | 管理 HTTP 绑定地址 | `0.0.0.0:9090` |
+| `PULSEMQ_ADMIN_BIND` | 管理 HTTP 绑定地址 | `0.0.0.0:9090` |
 | `PULSEMQ_CREDENTIALS_FILE` | 凭据 TOML 路径 | `./pulsemq_users.toml` |
-| `PULSEMQ_ADMIN_TOKEN` | 监控接口 token | 自动生成 |
-| `PULSEMQ_ADMIN_TOKEN_FILE` | token 文件路径 | `./pulsemq_admin.token` |
-| `PULSEMQ_ADMIN_PASSWORD` | 首次启动默认密码 | 随机 16 字符 |
-| `PULSEMQ_STATS_DB` | SQLite 路径 | `./pulsemq_stats.sqlite` |
-| `PULSEMQ_HEARTBEAT_TIMEOUT` | 心跳超时（秒） | 6.0 |
-| `PULSEMQ_LATENCY_SAMPLE_RATE` | 延迟采样率 | 0.01 (1%) |
-| `PULSEMQ_STATS_RETENTION` | 内存窗口（分钟） | 480 (8h) |
-| `PULSEMQ_BCRYPT_COST` | bcrypt 代价因子 | 12 |
+| `PULSEMQ_ADMIN_TOKEN` | 监控接口 token（覆盖随机生成） | 自动生成 |
+| `PULSEMQ_ADMIN_PASSWORD` | 首次启动默认 admin 密码 | 随机 16 字符 |
+
+### 配置文件（TOML）
+
+更多参数（`stats_db`、`heartbeat_timeout`、`latency_sample_rate`、`stats_retention_minutes`、`bcrypt_cost`、`admin_token_file`、`sse_interval`、`event_ring_size` 等）需通过 TOML 配置文件设置，**不支持**环境变量覆盖。在 `Server(config=...)` 中传入自定义 `ServerConfig` 即可生效。完整字段见 [`ServerConfig`](src/pulsemq/config.py)。
 
 ---
 
@@ -441,7 +472,7 @@ python bench_df_batch.py --duration 5
 - **自动重连**：运行期指数退避重连（1s→2s→4s→...→30s）
 - **日志系统**：loguru 统一，每日滚动写入 `logs/`，30 天保留
 - **安全性**：密码 bcrypt 哈希、admin token 随机生成（0600）、凭据文件原子写入
-- **批次处理**：DataFrame 批量 1000 行/帧 达到 363 K records/s（pyarrow+zstd）
+- **批次处理**：DataFrame 批量 1000 行/帧，pyarrow 直序列化（见上文「性能基准」）
 
 ---
 
