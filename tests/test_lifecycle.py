@@ -9,7 +9,7 @@ from pulsemq.server import Server
 
 
 def test_version_bumped():
-    assert __version__ == "5.0.0"
+    assert __version__ == "6.0.0"
 
 
 def _fp():
