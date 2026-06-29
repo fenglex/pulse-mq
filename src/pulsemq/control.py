@@ -59,6 +59,34 @@ class OnlineRegistry:
         if info:
             info.last_seen = time.time()
 
+    def get_username(self, client_id: str) -> str:
+        """反查 client_id 对应的用户名（不在表则返回空串）。"""
+        info = self._by_client.get(client_id)
+        return info.username if info is not None else ""
+
+    def subscribe(self, client_id: str, topic_pattern: str) -> None:
+        """记录一个订阅，回写 client 的 topics（幂等）。
+
+        注册时写入的 ``topics`` 是首次注册快照；后续 SUBSCRIBE 必须回写，否则
+        在线快照/订阅计数（监控）会与实际订阅表脱节。
+        """
+        info = self._by_client.get(client_id)
+        if info is None:
+            return
+        # 用 set 去重，保持 snapshot 输出稳定排序。
+        topics = set(info.topics)
+        topics.add(topic_pattern)
+        info.topics = sorted(topics)
+
+    def unsubscribe(self, client_id: str, topic_pattern: str) -> None:
+        """移除一个订阅，回写 client 的 topics。"""
+        info = self._by_client.get(client_id)
+        if info is None:
+            return
+        topics = set(info.topics)
+        topics.discard(topic_pattern)
+        info.topics = sorted(topics)
+
     def unregister(self, client_id: str) -> None:
         info = self._by_client.pop(client_id, None)
         if info:

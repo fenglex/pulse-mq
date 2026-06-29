@@ -332,6 +332,11 @@ class AdminServer:
                 for e in self._connections.recent_events(10)
             ]
         snap["server_time"] = time.time()
+        # start_time：供前端 SSE 实时计算 uptime = server_time - start_time。
+        # 若缺失，前端 uptime 卡片只能靠页面加载时一次性 fetch /system/status，
+        # 之后不再增长（会冻结在一个数）。
+        if self._start_time:
+            snap["start_time"] = self._start_time
         return snap
 
     def _clients_snapshot(self) -> dict:

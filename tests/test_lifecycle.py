@@ -1,5 +1,6 @@
 import asyncio
 import socket as _sock
+from importlib.metadata import version as _pkg_version
 
 import pytest
 
@@ -8,8 +9,13 @@ from pulsemq.lifecycle import run_server
 from pulsemq.server import Server
 
 
-def test_version_bumped():
-    assert __version__ == "6.0.0"
+def test_version_matches_package_metadata():
+    """``pulsemq.__version__`` 必须与 pyproject.toml 声明的包版本一致。
+
+    回归：此前硬编码 ``"6.0.0"``，bump 后测试腐化失败。改为以包元数据为准，
+    使该测试成为「单一来源一致性」校验而非易过期的魔法字符串。
+    """
+    assert __version__ == _pkg_version("pulse-mq")
 
 
 def _fp():

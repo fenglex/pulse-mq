@@ -47,7 +47,7 @@ def test_on_auth_records_failure_reason():
     e = cs.recent_events(10)[0]
     assert e.level == "WARNING"
     assert "invalid_password" in e.message
-    assert e.type == "AUTH"
+    assert e.type == "auth"
 
 
 def test_on_auth_records_user_not_found_reason():
@@ -58,7 +58,42 @@ def test_on_auth_records_user_not_found_reason():
     assert e.level == "WARNING"
     assert "user_not_found" in e.message
     assert "invalid_password" not in e.message
-    assert e.type == "AUTH"
+    assert e.type == "auth"
+
+
+def test_event_types_are_lowercase_and_frontend_matching():
+    """事件 type 必须用前端 tCls 识别的小写词表，否则颜色分类失效。
+
+    回归 Bug：后端曾用 ``CLIENT``/``AUTH`` 大写、且无 subscribe/unsubscribe，
+    前端 tCls 匹配 ``['connect','disconnect','subscribe','unsubscribe','auth']``，
+    交集为空 → 所有事件掉进默认灰色样式。
+    """
+    cs = ConnectionStats(_reg_snap_factory([]))
+    cs.on_auth("alice", "ep", success=True, reason=None)
+    cs.on_connect("c1", "alice", "ep", "consumer")
+    cs.on_subscribe("c1", "alice", "market.*")
+    cs.on_unsubscribe("c1", "alice", "market.*")
+    cs.on_disconnect("c1", "disconnect")
+    types = [e.type for e in cs.recent_events(10)]
+    assert types == ["auth", "connect", "subscribe", "unsubscribe", "disconnect"]
+
+
+def test_on_subscribe_records_event():
+    cs = ConnectionStats(_reg_snap_factory([]))
+    cs.on_subscribe("c1", "alice", "market.*")
+    e = cs.recent_events(10)[0]
+    assert e.type == "subscribe"
+    assert "market.*" in e.message
+    assert "alice" in e.message
+    assert e.level == "INFO"
+
+
+def test_on_unsubscribe_records_event():
+    cs = ConnectionStats(_reg_snap_factory([]))
+    cs.on_unsubscribe("c1", "alice", "market.*")
+    e = cs.recent_events(10)[0]
+    assert e.type == "unsubscribe"
+    assert "market.*" in e.message
 
 
 def test_online_clients_snapshot():

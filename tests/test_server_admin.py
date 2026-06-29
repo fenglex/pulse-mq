@@ -63,3 +63,30 @@ async def test_admin_realtime_snapshot_includes_online_clients():
         assert "subscriptions" in resp
     finally:
         await srv.stop()
+
+
+async def test_admin_realtime_includes_start_time_for_uptime():
+    """realtime/SSE 快照必须含 ``start_time``，使前端 uptime 卡片能每秒自增。
+
+    回归 Bug：SSE payload 仅含 ``server_time``，缺 ``start_time``/``uptime_seconds``，
+    前端 SSE 处理里 ``d.start_time && d.server_time`` 不成立、``d.uptime_seconds``
+    也不存在 → ``state.uptime`` 只在页面加载时一次性 fetch /system/status 后冻结，
+    永远不再增长（运行时间卡片「自启动以来」显示停在一个数）。
+    """
+    dp, cp, ap = _free_port(), _free_port(), _free_port()
+    srv = Server(
+        data_endpoint=f"tcp://127.0.0.1:{dp}",
+        control_endpoint=f"tcp://127.0.0.1:{cp}",
+        admin_endpoint=f"127.0.0.1:{ap}",
+        credentials={"a": "b"},
+        admin_token="",
+    )
+    await srv.start()
+    try:
+        await asyncio.sleep(0.3)
+        resp = await _http_get("127.0.0.1", ap, "/api/v1/stats/realtime")
+        assert "200" in resp
+        # start_time 必须出现在 SSE payload，前端才能算 uptime = server_time - start_time
+        assert '"start_time"' in resp, "realtime 快照缺 start_time，uptime 卡片会冻结"
+    finally:
+        await srv.stop()

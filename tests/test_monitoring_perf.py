@@ -62,7 +62,7 @@ async def test_connection_events_emitted():
         await asyncio.sleep(0.3)
         evts = srv._connections.recent_events(50)
         # 至少有 connect 事件（REGISTER）或 auth 事件
-        assert any(e.type == "CLIENT" for e in evts) or any(e.type == "AUTH" for e in evts)
+        assert any(e.type == "connect" for e in evts) or any(e.type == "auth" for e in evts)
         await cons.stop()
     finally:
         await srv.stop()

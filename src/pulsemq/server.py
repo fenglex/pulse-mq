@@ -307,10 +307,21 @@ class Server:
         return deco
 
     async def _on_server_produce(self, spec, data) -> None:
-        """内置 producer 回调：编码 → 路由 → 广播给所有匹配的订阅者。"""
+        """内置 producer 回调：编码 → 统计 → 路由 → 广播给所有匹配的订阅者。
+
+        复用 ``_data_loop`` 的统计口径（``TrafficStats.record`` + 采样延迟），
+        使服务端 producer 推送的 topic 与客户端发来的消息一样在监控中可见。
+        （回归修复：此前直接 encode→route→send 绕过了统计，导致 server 端
+        producer 的 topic 在 /api/v1/stats 中完全不出现。）
+        """
         from pulsemq.protocol.frames import encode
         frame = encode(spec.name, data, serializer=spec.serializer,
                        compression=spec.compression, data_type=DataType.UNKNOWN)
+        # 与 _data_loop 一致的轻量统计（仅头部解码）。
+        hdr = frames.decode_header(frame)
+        self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
+        if self._latency.should_sample():
+            self._latency.record(time.time_ns() - hdr.timestamp_ns)
         for target in self._routing.match(spec.name):
             try:
                 await self._transport.send(target, frame, role="server_ingress")
@@ -359,6 +370,10 @@ class Server:
             except Exception:
                 logger.exception("控制命令处理异常（可能 DEALER 已断开导致 ROUTER_MANDATORY 发送失败）")
 
+    def _username_of(self, client_id: str) -> str:
+        """从 registry 反查 username（供 SUBSCRIBE/UNSUBSCRIBE 事件埋点用）。"""
+        return self._registry.get_username(client_id)
+
     async def _dispatch_control(self, ident: bytes, cmd_msg: ControlMessage) -> None:
         """分发控制命令。
 
@@ -405,6 +420,10 @@ class Server:
         elif cmd_msg.cmd == ControlCmd.SUBSCRIBE:
             pattern = cmd_msg.payload.get("topic", "")
             self._routing.subscribe(ident, pattern)
+            # 回写 registry 的 topics，使在线快照/订阅计数（监控）与实际订阅一致。
+            self._registry.subscribe(cid, pattern)
+            # 订阅事件（Spec 3）：SUBSCRIBE → on_subscribe
+            self._connections.on_subscribe(cid, self._username_of(cid), pattern)
             await self._transport.send(
                 ident,
                 frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
@@ -414,6 +433,8 @@ class Server:
         elif cmd_msg.cmd == ControlCmd.UNSUBSCRIBE:
             pattern = cmd_msg.payload.get("topic", "")
             self._routing.unsubscribe(ident, pattern)
+            self._registry.unsubscribe(cid, pattern)
+            self._connections.on_unsubscribe(cid, self._username_of(cid), pattern)
             await self._transport.send(
                 ident,
                 frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
@@ -426,11 +447,17 @@ class Server:
             self._registry.unregister(cid)
             # 断开事件（Spec 3）：DISCONNECT → on_disconnect
             self._connections.on_disconnect(cid, "disconnect")
-            await self._transport.send(
-                ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
-                role="control",
-            )
+            # 回执 OK：客户端发完 DISCONNECT 通常已立即关闭 socket，回执 send 命中
+            # ROUTER_MANDATORY 的 ``Host unreachable`` 是预期竞态，不作为错误记录
+            # （否则每次正常下线都会刷一条 ERROR 异常栈，误导排查）。降为 debug。
+            try:
+                await self._transport.send(
+                    ident,
+                    frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
+                    role="control",
+                )
+            except Exception:
+                logger.debug("DISCONNECT 回执发送失败（peer 已离开），忽略")
 
         else:
             logger.debug("未知控制命令: {}", cmd_msg.cmd)

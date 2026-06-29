@@ -45,22 +45,35 @@ class ConnectionStats:
         self._events: deque[LifecycleEvent] = deque(maxlen=ring_size)
 
     # ---- 事件埋点（Server 数据线程调用）----
+    # type 词表：auth / connect / disconnect / subscribe / unsubscribe（统一小写，
+    # 与前端 web_ui 的 tCls 颜色分类 ['connect','disconnect','subscribe',
+    # 'unsubscribe','auth'] 对齐，否则事件会掉进默认灰色样式）。
     def on_connect(self, client_id: str, username: str, endpoint: str, role: str) -> None:
         self._events.append(LifecycleEvent(
-            ts=time.time(), level="INFO", type="CLIENT",
+            ts=time.time(), level="INFO", type="connect",
             message=f"{username} 上线 role={role} endpoint={endpoint}"))
 
     def on_disconnect(self, client_id: str, reason: str) -> None:
         self._events.append(LifecycleEvent(
-            ts=time.time(), level="INFO", type="CLIENT",
+            ts=time.time(), level="INFO", type="disconnect",
             message=f"{client_id} 离线 reason={reason}"))
+
+    def on_subscribe(self, client_id: str, username: str, pattern: str) -> None:
+        self._events.append(LifecycleEvent(
+            ts=time.time(), level="INFO", type="subscribe",
+            message=f"{username} 订阅 {pattern}"))
+
+    def on_unsubscribe(self, client_id: str, username: str, pattern: str) -> None:
+        self._events.append(LifecycleEvent(
+            ts=time.time(), level="INFO", type="unsubscribe",
+            message=f"{username} 取消订阅 {pattern}"))
 
     def on_auth(self, username: str, endpoint: str, success: bool,
                 reason: str | None) -> None:
         level = "INFO" if success else "WARNING"
         msg = (f"{username} 认证成功" if success
                else f"{username} 认证失败: {reason or 'unknown'}")
-        self._events.append(LifecycleEvent(ts=time.time(), level=level, type="AUTH", message=msg))
+        self._events.append(LifecycleEvent(ts=time.time(), level=level, type="auth", message=msg))
 
     # ---- 读取（admin 线程调用，只读快照）----
     def online_clients(self) -> list[ClientSnapshot]:
