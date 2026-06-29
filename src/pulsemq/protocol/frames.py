@@ -97,6 +97,24 @@ def _restore_type(data: Any, data_type: int, serializer: str) -> Any:
     return data
 
 
+def _infer_record_count(data: Any) -> int:
+    """从数据对象自动推断记录数。
+
+    - ``list`` → ``len(data)``
+    - ``pandas.DataFrame`` → ``len(data)``（pandas 可用时）
+    - 标量/dict/其他 → ``1``
+    """
+    if isinstance(data, list):
+        return max(1, len(data))
+    try:
+        import pandas as pd
+        if isinstance(data, pd.DataFrame):
+            return max(1, len(data))
+    except ImportError:
+        pass
+    return 1
+
+
 def encode(
     topic: str,
     data: Any,
@@ -104,7 +122,7 @@ def encode(
     msg_type: int = MsgType.DATA,
     serializer: str = "msgpack",
     compression: str = "none",
-    record_count: int = 1,
+    record_count: int | None = None,
     data_type: int = DataType.UNKNOWN,
     crc: bool = False,
     ts_ns: int | None = None,
@@ -117,7 +135,8 @@ def encode(
         msg_type: 帧类型（MsgType 常量）。
         serializer: 序列化格式名。
         compression: 压缩格式名。
-        record_count: 本帧记录数，最大 1,000,000。
+        record_count: 本帧记录数。None 时自动推断（list 取 len，Df 取行数，
+            标量/dict 取 1）；显式传值则覆盖推断。最大 1,000,000。
         data_type: 原始数据类型标记（DataType 常量）。
         crc: 是否追加 CRC32 校验。
         ts_ns: 纳秒时间戳；None 表示取当前 time.time_ns()。
@@ -129,6 +148,8 @@ def encode(
         FrameError: record_count 超限或 topic 过长。
         SerializationError: 未注册的序列化/压缩格式。
     """
+    if record_count is None:
+        record_count = _infer_record_count(data)
     if record_count > 1_000_000:
         raise FrameError(f"record_count 超限: {record_count}")
     ts = ts_ns if ts_ns is not None else time.time_ns()

@@ -37,6 +37,32 @@ def test_encode_decode_roundtrip_dict():
     assert msg.record_count == 1
 
 
+def test_encode_auto_infers_record_count_from_list():
+    """list 类型应自动推断 record_count = len(list)，而非恒为 1。
+
+    回归 Bug：record_count 默认 1，且 ``_infer_record_count`` 虽在 docstring
+    中提及但从未实现。导致发送 100 条记录的 list 和发送 1 条 dict 的
+    record_count 相同，Web UI 消息量显示与实际不符。
+    """
+    data = [{"i": i} for i in range(50)]
+    raw = encode("batch.topic", data, serializer="msgpack")
+    msg = decode(raw)
+    assert msg.record_count == 50, f"list 长度=50，record_count 应为 50，实际={msg.record_count}"
+
+
+def test_encode_does_not_infer_for_scalar():
+    """单条 dict 应保持 record_count=1（list 以外不做推断）。"""
+    raw = encode("t", {"x": 1}, serializer="msgpack")
+    assert decode(raw).record_count == 1
+
+
+def test_encode_explicit_record_count_overrides_inference():
+    """显式传 record_count 应覆盖自动推断。"""
+    data = [{"i": i} for i in range(10)]
+    raw = encode("t", data, serializer="msgpack", record_count=3)
+    assert decode(raw).record_count == 3
+
+
 def test_decode_bad_magic():
     bad = b"XX" + b"\x00" * 20
     with pytest.raises(FrameError):
