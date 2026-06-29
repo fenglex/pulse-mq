@@ -18,6 +18,11 @@ class TokenAuth:
     def enabled(self) -> bool:
         return bool(self._expected)
 
+    @property
+    def token(self) -> str:
+        """当前生效的 token（空串表示禁用）。供启动日志输出可点击 URL。"""
+        return self._expected
+
     def validate(self, headers: dict[str, str], query: dict[str, list[str]]) -> bool:
         if not self.enabled:
             return True

@@ -146,6 +146,12 @@ class AdminServer:
         # 通知等待方 server 已就绪（独立线程模式下尤为关键）
         self._thread_started.set()
         logger.info("AdminServer 启动: http://{}:{}", self._host, self._port)
+        # token 启用时，额外打一条带 token 的可点击 URL，方便直接进监控面板。
+        # host 为 0.0.0.0（监听所有网卡）时显示 localhost 以便浏览器访问。
+        if self._token_auth is not None and self._token_auth.enabled:
+            display_host = "localhost" if self._host in ("0.0.0.0", "::") else self._host
+            logger.info("AdminServer 监控面板: http://{}:{}/?token={}",
+                        display_host, self._port, self._token_auth.token)
         if self._admin_thread:
             async with self._server:
                 await self._server.serve_forever()

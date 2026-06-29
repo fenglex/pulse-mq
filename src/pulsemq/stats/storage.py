@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,16 @@ from pulsemq.stats.traffic import MinuteSlot
 
 
 class StatsStorage:
-    """分钟统计 SQLite 持久化。"""
+    """分钟统计 SQLite 持久化。
+
+    线程模型：``AdminServer`` 默认在独立线程（``admin_thread=True``）调用
+    ``load_history``（读），而写（``save_minutes_batch``）在主线程的
+    ``AsyncArchiveWriter`` consumer 任务中执行。SQLite 连接默认
+    ``check_same_thread=True``，跨线程访问会抛 ``ProgrammingError``。
+    解决：连接用 ``check_same_thread=False`` 打开 + ``threading.Lock`` 串行化
+    所有连接操作。锁只在「主线程归档任务」与「admin 线程」之间共享，zmq
+    数据接收循环（``_data_loop``）从不触碰 SQLite，因此 DB 读写不会阻塞 zmq。
+    """
 
     def __init__(self, db_path: str = "./stats.sqlite") -> None:
         # 解析 sqlite:// 前缀
@@ -25,41 +35,47 @@ class StatsStorage:
             db_path = db_path[len("sqlite://"):]
         self._db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        # 保护 _conn 的所有读写（跨线程：主线程写 + admin 线程读）。
+        self._lock = threading.Lock()
 
     def connect(self) -> None:
         """建立 SQLite 连接并创建表。"""
-        self._conn = sqlite3.connect(self._db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS minute_stats (
-                topic TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                msg_count INTEGER DEFAULT 0,
-                record_count INTEGER DEFAULT 0,
-                bytes_total INTEGER DEFAULT 0,
-                PRIMARY KEY (topic, timestamp)
-            )
-        """)
-        self._conn.commit()
+        # check_same_thread=False：允许 admin 线程读此连接；线程安全由 _lock 保证。
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS minute_stats (
+                    topic TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    msg_count INTEGER DEFAULT 0,
+                    record_count INTEGER DEFAULT 0,
+                    bytes_total INTEGER DEFAULT 0,
+                    PRIMARY KEY (topic, timestamp)
+                )
+            """)
+            self._conn.commit()
         logger.info("StatsStorage 连接: {}", self._db_path)
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
 
     def save_minute(self, topic: str, slot: MinuteSlot) -> None:
         """同步写入一条分钟记录。"""
         if self._conn is None:
             return
         try:
-            self._conn.execute(
-                """INSERT OR REPLACE INTO minute_stats
-                   (topic, timestamp, msg_count, record_count, bytes_total)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (topic, slot.timestamp, slot.msg_count, slot.record_count, slot.bytes_total),
-            )
-            self._conn.commit()
+            with self._lock:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO minute_stats
+                       (topic, timestamp, msg_count, record_count, bytes_total)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (topic, slot.timestamp, slot.msg_count, slot.record_count, slot.bytes_total),
+                )
+                self._conn.commit()
         except Exception:
             logger.debug("save_minute 失败", exc_info=True)
 
@@ -68,29 +84,35 @@ class StatsStorage:
         if self._conn is None or not data:
             return
         try:
-            for topic, slot in data.items():
-                self._conn.execute(
-                    """INSERT OR REPLACE INTO minute_stats
-                       (topic, timestamp, msg_count, record_count, bytes_total)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (topic, slot.timestamp, slot.msg_count, slot.record_count, slot.bytes_total),
-                )
-            self._conn.commit()
+            with self._lock:
+                for topic, slot in data.items():
+                    self._conn.execute(
+                        """INSERT OR REPLACE INTO minute_stats
+                           (topic, timestamp, msg_count, record_count, bytes_total)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (topic, slot.timestamp, slot.msg_count, slot.record_count, slot.bytes_total),
+                    )
+                self._conn.commit()
         except Exception:
             logger.debug("save_minutes_batch 失败", exc_info=True)
 
     def load_history(self, topic: str, since_ts: int) -> list[dict]:
-        """加载历史数据（进程重启后恢复图表用）。"""
+        """加载历史数据（进程重启后恢复图表用）。
+
+        可被 admin 独立线程调用；与写路径共用同一连接，由 ``_lock`` 串行化。
+        """
         if self._conn is None:
             return []
         try:
-            cursor = self._conn.execute(
-                """SELECT timestamp, msg_count, record_count, bytes_total
-                   FROM minute_stats
-                   WHERE topic = ? AND timestamp >= ?
-                   ORDER BY timestamp""",
-                (topic, since_ts),
-            )
+            with self._lock:
+                cursor = self._conn.execute(
+                    """SELECT timestamp, msg_count, record_count, bytes_total
+                       FROM minute_stats
+                       WHERE topic = ? AND timestamp >= ?
+                       ORDER BY timestamp""",
+                    (topic, since_ts),
+                )
+                rows = cursor.fetchall()
             return [
                 {
                     "timestamp": row[0],
@@ -99,7 +121,7 @@ class StatsStorage:
                     "bytes_total": row[3],
                     "msg_rate": round(row[1] / 60.0, 2),
                 }
-                for row in cursor.fetchall()
+                for row in rows
             ]
         except Exception:
             logger.debug("load_history 失败", exc_info=True)
@@ -111,11 +133,12 @@ class StatsStorage:
             return 0
         cutoff = int(time.time()) - retention_days * 86400
         try:
-            cursor = self._conn.execute(
-                "DELETE FROM minute_stats WHERE timestamp < ?", (cutoff,)
-            )
-            self._conn.commit()
-            return cursor.rowcount
+            with self._lock:
+                cursor = self._conn.execute(
+                    "DELETE FROM minute_stats WHERE timestamp < ?", (cutoff,)
+                )
+                self._conn.commit()
+                return cursor.rowcount
         except Exception:
             logger.debug("cleanup 失败", exc_info=True)
             return 0

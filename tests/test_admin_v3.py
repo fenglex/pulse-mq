@@ -111,6 +111,61 @@ async def test_admin_thread_mode_serves_on_independent_loop():
     assert adm._thread is None or not adm._thread.is_alive()
 
 
+async def test_admin_startup_logs_token_url_when_enabled():
+    """token 启用时，启动日志应额外打一条带 token 的可点击 URL。
+
+    回归：原启动日志只打 ``AdminServer 启动: http://0.0.0.0:9090``，token 启用
+    时用户无法直接点进监控面板（需手动拼 ``?token=``）。
+    """
+    from io import StringIO
+    from loguru import logger
+    from pulsemq.admin.auth import TokenAuth
+    from pulsemq.admin.server import AdminServer
+
+    buf = StringIO()
+    handle = logger.add(buf, level="INFO", format="{level}|{message}", catch=False)
+
+    adm = AdminServer(
+        bind="127.0.0.1:0",
+        token_auth=TokenAuth("MySecretTok"),
+        admin_thread=False,
+    )
+    try:
+        await adm.start()
+    finally:
+        await adm.stop()
+        logger.remove(handle)
+
+    log_text = buf.getvalue()
+    # 启动日志必须含一条带 ?token=MySecretTok 的 URL
+    assert "?token=MySecretTok" in log_text, log_text
+
+
+async def test_admin_startup_no_token_url_when_disabled():
+    """token 禁用时（空串），启动日志不应出现 ?token=。"""
+    from io import StringIO
+    from loguru import logger
+    from pulsemq.admin.auth import TokenAuth
+    from pulsemq.admin.server import AdminServer
+
+    buf = StringIO()
+    handle = logger.add(buf, level="INFO", format="{level}|{message}", catch=False)
+
+    adm = AdminServer(
+        bind="127.0.0.1:0",
+        token_auth=TokenAuth(""),  # 禁用
+        admin_thread=False,
+    )
+    try:
+        await adm.start()
+    finally:
+        await adm.stop()
+        logger.remove(handle)
+
+    log_text = buf.getvalue()
+    assert "?token=" not in log_text, log_text
+
+
 # ---- Server 集成测试：Task 8 接线后转 GREEN ----
 
 
