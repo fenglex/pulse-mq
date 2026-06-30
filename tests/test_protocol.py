@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import pytest
 
 from pulsemq.protocol.flags import decode_flags, encode_flags
@@ -37,20 +38,25 @@ class TestDataType:
         msg = decode(raw)
         assert msg.data_type == DataType.DICT
 
-    def test_data_type_default_unknown(self):
-        """未传 data_type 时默认 UNKNOWN，decode 读出 UNKNOWN。"""
-        raw = encode("t", {"x": 1}, serializer="msgpack")
+    def test_data_type_default_inferred(self):
+        """未传 data_type 时自动推断，dict→DICT。"""
+        raw = encode("t", {"x": 1})
         msg = decode(raw)
-        assert msg.data_type == DataType.UNKNOWN
+        assert msg.data_type == DataType.DICT
 
-    @pytest.mark.parametrize("data_type", [
-        DataType.DICT, DataType.DATAFRAME, DataType.STR, DataType.BYTES,
+    @pytest.mark.parametrize("data_type,data,serializer", [
+        (DataType.DICT,      {"x": 1},                       "msgpack"),
+        (DataType.DATAFRAME, pd.DataFrame({"a": [1]}),       "pyarrow"),
+        (DataType.DATAFRAME, pd.DataFrame({"a": [1]}),       "msgpack"),
+        (DataType.STR,       "hello",                        "str"),
+        (DataType.BYTES,     b"data",                        "bytes"),
     ])
-    def test_data_type_roundtrip(self, data_type):
-        """各种 data_type 值都能无损往返。"""
-        raw = encode("t", {"x": 1}, serializer="msgpack", data_type=data_type)
+    def test_data_type_roundtrip(self, data_type, data, serializer):
+        """各种 data_type × 合法序列化器无损往返。"""
+        raw = encode("t", data, serializer=serializer, data_type=data_type)
         msg = decode(raw)
         assert msg.data_type == data_type
+        assert msg.serializer == serializer
 
 
 class TestFlags:

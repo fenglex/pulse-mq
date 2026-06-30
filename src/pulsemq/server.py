@@ -265,7 +265,7 @@ class Server:
         topic: str,
         *,
         interval: float = 5.0,
-        serializer: str = "msgpack",
+        serializer: str | None = None,
         compression: str = "none",
     ):
         """注册一个定时 producer：回调返回的数据通过服务端内置广播推送到 topic。
@@ -292,7 +292,7 @@ class Server:
         self,
         topic: str,
         *,
-        serializer: str = "msgpack",
+        serializer: str | None = None,
         compression: str = "none",
     ):
         """注册一个 burst producer：无间隔连续发送，回调返回 None 时停止。"""
@@ -316,7 +316,7 @@ class Server:
         """
         from pulsemq.protocol.frames import encode
         frame = encode(spec.name, data, serializer=spec.serializer,
-                       compression=spec.compression, data_type=DataType.UNKNOWN)
+                       compression=spec.compression)
         # 与 _data_loop 一致的轻量统计（仅头部解码）。
         hdr = frames.decode_header(frame)
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))

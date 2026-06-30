@@ -25,7 +25,7 @@ class ProducerSpec:
     callback: ProducerCallback      # async 回调
     interval: float = 5.0           # 推送间隔（秒）
     cache_size: int = 100_000       # 环形缓存大小
-    serializer: str = "msgpack"     # 序列化格式
+    serializer: str | None = None   # 序列化格式；None = encode 时按数据类型自动选择
     compression: str = "none"       # 压缩格式
     inject_sender: bool = False      # 是否向回调注入手动发送端
 
@@ -53,7 +53,7 @@ class ProducerManager:
         name: str,
         interval: float = 5.0,
         cache_size: int = 100_000,
-        serializer: str = "msgpack",
+        serializer: str | None = None,
         compression: str = "none",
         inject_sender: bool = False,
     ) -> None:
@@ -75,7 +75,7 @@ class ProducerManager:
         callback: ProducerCallback,
         name: str,
         cache_size: int = 100_000,
-        serializer: str = "msgpack",
+        serializer: str | None = None,
         compression: str = "none",
         inject_sender: bool = False,
     ) -> None:

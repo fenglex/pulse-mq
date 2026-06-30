@@ -94,6 +94,16 @@ def _restore_type(data: Any, data_type: int, serializer: str) -> Any:
                 return lst[0] if lst else data
         return data
 
+    if data_type == DataType.STR:
+        if isinstance(data, bytes):
+            return data.decode("utf-8")
+        return data
+
+    if data_type == DataType.BYTES:
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        return data
+
     return data
 
 
@@ -115,15 +125,43 @@ def _infer_record_count(data: Any) -> int:
     return 1
 
 
+# —— 数据类型 × 序列化器兼容规则 ——
+# 值: (允许的序列化器集合, 默认序列化器)
+_SERIALIZER_RULES: dict[int, tuple[set[str], str]] = {
+    DataType.DICT:     ({"msgpack", "json"},        "msgpack"),
+    DataType.DATAFRAME:({"msgpack", "json", "pyarrow"}, "pyarrow"),
+    DataType.STR:      ({"str"},                    "str"),
+    DataType.BYTES:    ({"bytes"},                  "bytes"),
+}
+
+
+def _infer_data_type(data: Any) -> int:
+    """根据 Python 类型推断 DataType 标记。"""
+    try:
+        import pandas as pd
+
+        if isinstance(data, pd.DataFrame):
+            return DataType.DATAFRAME
+    except ImportError:
+        pass
+    if isinstance(data, dict):
+        return DataType.DICT
+    if isinstance(data, str):
+        return DataType.STR
+    if isinstance(data, bytes):
+        return DataType.BYTES
+    return DataType.UNKNOWN
+
+
 def encode(
     topic: str,
     data: Any,
     *,
     msg_type: int = MsgType.DATA,
-    serializer: str = "msgpack",
+    serializer: str | None = None,
     compression: str = "none",
     record_count: int | None = None,
-    data_type: int = DataType.UNKNOWN,
+    data_type: int | None = None,
     crc: bool = False,
     ts_ns: int | None = None,
 ) -> bytes:
@@ -133,11 +171,11 @@ def encode(
         topic: 主题（UTF-8，最长 65535 字节）。
         data: 待编码对象。
         msg_type: 帧类型（MsgType 常量）。
-        serializer: 序列化格式名。
+        serializer: 序列化格式名。None 时根据 data_type 自动选择默认值。
         compression: 压缩格式名。
         record_count: 本帧记录数。None 时自动推断（list 取 len，Df 取行数，
             标量/dict 取 1）；显式传值则覆盖推断。最大 1,000,000。
-        data_type: 原始数据类型标记（DataType 常量）。
+        data_type: 原始数据类型标记（DataType 常量）。None 时自动推断。
         crc: 是否追加 CRC32 校验。
         ts_ns: 纳秒时间戳；None 表示取当前 time.time_ns()。
 
@@ -146,8 +184,36 @@ def encode(
 
     Raises:
         FrameError: record_count 超限或 topic 过长。
+        TypeError: serializer 与 data_type 不兼容。
         SerializationError: 未注册的序列化/压缩格式。
     """
+    # ---- 1. 推断 data_type ----
+    if data_type is None:
+        data_type = _infer_data_type(data)
+
+    # ---- 2. 校验 + 选择默认序列化器 ----
+    if data_type in _SERIALIZER_RULES:
+        allowed, default = _SERIALIZER_RULES[data_type]
+        if serializer is None:
+            serializer = default
+        elif serializer not in allowed:
+            raise TypeError(
+                f"数据类型 {data_type} 不支持 serializer={serializer!r}，"
+                f"可选: {sorted(allowed)}"
+            )
+
+    # 兜底：serializer 仍为 None 时用 "msgpack"（对 UNKNOWN 等不在规则内的类型）
+    if serializer is None:
+        serializer = "msgpack"
+
+    # ---- 3. DataFrame + msgpack/json → 转 list[dict] 预处理 ----
+    if data_type == DataType.DATAFRAME and serializer in ("msgpack", "json"):
+        import pandas as pd
+
+        if isinstance(data, pd.DataFrame):
+            data = data.to_dict(orient="records")
+
+    # ---- 4. 常规编码 ----
     if record_count is None:
         record_count = _infer_record_count(data)
     if record_count > 1_000_000:

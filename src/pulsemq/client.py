@@ -491,8 +491,12 @@ class Client:
     # ---------------------------------------------------------------- publish
 
     @require_connected
-    async def publish(self, topic: str, data: Any) -> None:
-        frame = frames.encode(topic, data)
+    async def publish(self, topic: str, data: Any, *,
+                      serializer: str | None = None,
+                      compression: str = "none",
+                      data_type: int | None = None) -> None:
+        frame = frames.encode(topic, data, serializer=serializer,
+                              compression=compression, data_type=data_type)
         await self._transport.send(b"", frame, role="consumer")
 
     # -------------------------------------------------------------- recv loop
@@ -645,7 +649,9 @@ class ProducerClient(Client):
 
     async def _on_produce(self, spec, data) -> None:
         # spec.name == topic（注册时以 topic 为 name）
-        await self.publish(spec.name, data)
+        await self.publish(spec.name, data,
+                           serializer=spec.serializer,
+                           compression=spec.compression)
 
     async def run_forever(self) -> None:
         """连接 + 认证 + 注册，启动所有 producer 调度，运行直到 stop()。
