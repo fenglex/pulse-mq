@@ -137,12 +137,14 @@ class Server:
 
     async def start(self) -> None:
         self._storage.connect()
-        # 数据面 bind 传 on_auth：ZAP 是 ctx 单例，仅首次 auth bind 创建 handler，
-        # 故 on_auth 必须在数据面 bind 提供；控制面 bind 复用同一 ZAP，不传。
-        await self._transport.bind(
-            self._data_endpoint, "server_ingress",
+        # 数据面：同步线程（低延迟，独立 ctx + 独立线程）
+        loop = asyncio.get_running_loop()
+        self._transport.bind_sync_data(
+            self._data_endpoint,
             auth=self._auth, on_auth=self._auth_on_auth,
+            on_message=self._on_data_message, loop=loop,
         )
+        # 控制面：异步（保持原有 ROUTER + ZAP）
         await self._transport.bind(self._control_endpoint, "control", auth=self._auth)
         # 异步归档 writer：在 minute_roll_loop 启动前 start。
         await self._archive_writer.start()
@@ -166,7 +168,6 @@ class Server:
         await self._admin.start()
         self._running = True
         self._tasks = [
-            asyncio.create_task(self._data_loop()),
             asyncio.create_task(self._control_loop()),
             asyncio.create_task(self._heartbeat_sweep_loop()),
             asyncio.create_task(self._minute_roll_loop()),
@@ -319,39 +320,36 @@ class Server:
         from pulsemq.protocol.frames import encode
         frame = encode(spec.name, data, serializer=spec.serializer,
                        compression=spec.compression)
-        # 与 _data_loop 一致的轻量统计（仅头部解码）。
+        # 与 _on_data_message 一致的轻量统计（仅头部解码）。
         hdr = frames.decode_header(frame)
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
         if self._latency.should_sample():
             self._latency.record(time.time_ns() - hdr.timestamp_ns)
         for target in self._routing.match(spec.name):
             try:
-                await self._transport.send(target, frame, role="server_ingress")
+                self._transport.send_sync_data(target, frame)
             except Exception:
                 pass
 
-    async def _data_loop(self) -> None:
-        while self._running:
+    def _on_data_message(self, ident: bytes, frame_bytes: bytes) -> None:
+        """同步数据面回调（在数据面线程中调用）。
+
+        轻量头部解码 -> 统计 -> 路由匹配 -> 同步转发。
+        全程同步，无 asyncio 调度延迟。
+        """
+        try:
+            hdr = frames.decode_header(frame_bytes)
+        except Exception:
+            logger.debug("数据面帧头部解码失败，丢弃")
+            return
+        self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
+        if self._latency.should_sample():
+            self._latency.record(time.time_ns() - hdr.timestamp_ns)
+        for target in self._routing.match(hdr.topic):
             try:
-                ident, frame_bytes = await self._transport.recv("server_ingress")
-            except asyncio.CancelledError:
-                break
+                self._transport.send_sync_direct(target, frame_bytes)
             except Exception:
-                logger.exception("数据面 recv 异常")
-                continue
-            # 轻量头部解码（不解压/不反序列化），消除完整 frames.decode 在服务端的开销。
-            try:
-                hdr = frames.decode_header(frame_bytes)
-            except Exception:
-                logger.debug("数据面帧头部解码失败，丢弃")
-                continue
-            self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
-            # 延迟采样：帧已携带 timestamp_ns（生产者发送时刻），差值为端到端延迟。
-            if self._latency.should_sample():
-                self._latency.record(time.time_ns() - hdr.timestamp_ns)
-            # match() 返回 bytes identity，直接给 send_multipart。
-            for target in self._routing.match(hdr.topic):
-                await self._transport.send(target, frame_bytes, role="server_ingress")
+                pass
 
     async def _control_loop(self) -> None:
         while self._running:

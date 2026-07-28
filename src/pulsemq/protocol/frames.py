@@ -17,6 +17,12 @@ from pulsemq.protocol import compression, serialization
 from pulsemq.protocol.flags import decode_flags, encode_flags, has_crc
 from pulsemq.protocol.msg_type import DataType, MsgType
 
+# 模块级缓存 pandas 引用，避免每次 encode 都做 import 查找（热路径优化）
+try:
+    import pandas as _pd
+except ImportError:
+    _pd = None
+
 MAGIC = b"PM"
 VERSION = 0x01
 
@@ -91,8 +97,7 @@ def _restore_type(data: Any, data_type: int, serializer: str) -> Any:
             import pyarrow as pa
             return data.to_pandas() if isinstance(data, pa.Table) else data
         # msgpack / json: list[dict] → DataFrame
-        import pandas as _pd
-        if isinstance(data, list):
+        if _pd is not None and isinstance(data, list):
             return _pd.DataFrame(data)
         return data
 
@@ -126,12 +131,8 @@ def _infer_record_count(data: Any) -> int:
     """
     if isinstance(data, list):
         return max(1, len(data))
-    try:
-        import pandas as pd
-        if isinstance(data, pd.DataFrame):
-            return max(1, len(data))
-    except ImportError:
-        pass
+    if _pd is not None and isinstance(data, _pd.DataFrame):
+        return max(1, len(data))
     return 1
 
 
@@ -147,13 +148,8 @@ _SERIALIZER_RULES: dict[int, tuple[set[str], str]] = {
 
 def _infer_data_type(data: Any) -> int:
     """根据 Python 类型推断 DataType 标记。"""
-    try:
-        import pandas as pd
-
-        if isinstance(data, pd.DataFrame):
-            return DataType.DATAFRAME
-    except ImportError:
-        pass
+    if _pd is not None and isinstance(data, _pd.DataFrame):
+        return DataType.DATAFRAME
     if isinstance(data, dict):
         return DataType.DICT
     if isinstance(data, str):
@@ -218,9 +214,7 @@ def encode(
 
     # ---- 3. DataFrame + msgpack/json → 转 list[dict] 预处理 ----
     if data_type == DataType.DATAFRAME and serializer in ("msgpack", "json"):
-        import pandas as pd
-
-        if isinstance(data, pd.DataFrame):
+        if _pd is not None and isinstance(data, _pd.DataFrame):
             data = data.to_dict(orient="records")
 
     # ---- 4. 常规编码 ----

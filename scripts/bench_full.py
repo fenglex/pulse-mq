@@ -74,7 +74,7 @@ def _make_server() -> Server:
         data_endpoint=f"tcp://127.0.0.1:{dp}",
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         admin_endpoint=f"127.0.0.1:{ap}",
-        credentials={"pub": "s", "sub": "s"},
+        credentials={"pub": "s", "sub": "s", **{f"sub{i}": "s" for i in range(10)}},
         admin_token="bench-token",  # 禁用随机生成，避免写 pulsemq_admin.token
     )
 
@@ -187,10 +187,9 @@ async def run_e2e(duration: float, index: int | None = None) -> list[dict]:
                                       compression=comp, data_type=dtype, record_count=rc)
                 await prod._transport.send(b"", frame, role="consumer")
                 sent += 1
-                if sent % 1000 == 0:
-                    # 强制让出 event loop，避免 produce 协程饿死 server _data_loop
-                    # 与 consumer _recv_loop（pyzmq DONTWAIT send 成功时 await 不 yield）
-                    await asyncio.sleep(0)
+                # 每帧让出 event loop，让 server _data_loop 和 consumer _recv_loop
+                # 有机会在本帧到达后立即处理，降低端到端延迟（行情场景关键优化）
+                await asyncio.sleep(0)
                 if sent % 20000 == 0:
                     print(f"    ... {dtype_name}/{ser}/{comp} sent={sent:,}", flush=True)
 
@@ -273,7 +272,7 @@ async def run_fanout(duration: float, index: int | None = None) -> list[dict]:
             counts = [0] * n
             consumers: list[ConsumerClient] = []
             for i in range(n):
-                c = ConsumerClient(dp, cp, "sub", "s")
+                c = ConsumerClient(dp, cp, f"sub{i}", "s")
                 await c.start()
 
                 def mk_cb(idx):
@@ -454,7 +453,7 @@ def main() -> None:
     p.add_argument("--part", choices=["1", "2", "3", "all"], default="all",
                    help="运行部分：1/2/3/all（默认 all）")
     p.add_argument("--index", type=int, default=None,
-                   help="单组合索引（Part1:0-23, Part2:0-14, Part3:0-2）；仅 --part 指定单部分时生效")
+                   help="单组合索引（Part1:0-23, Part2:0-27, Part3:0-2）；仅 --part 指定单部分时生效")
     args = p.parse_args()
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

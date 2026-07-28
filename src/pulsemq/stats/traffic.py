@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -23,8 +24,8 @@ class MinuteSlot:
 class TrafficStats:
     """分钟粒度流量统计，内存 8 小时窗口。
 
-    线程安全：单写者（publisher 主线程）+ 多读者（admin HTTP）。
-    使用 GIL 保证安全，无需加锁。
+    线程安全：数据面线程写 record()，admin 协程读 snapshot()，
+    分钟滚动协程写 roll_minute()。使用 threading.Lock 保护。
     """
 
     def __init__(self, retention_minutes: int = 480) -> None:
@@ -34,24 +35,26 @@ class TrafficStats:
         # 当前分钟累积器: {topic: MinuteSlot}
         self._current: dict[str, MinuteSlot] = {}
         self._current_minute: int = self._minute_now()
+        self._lock = threading.RLock()
 
     def record(self, topic: str, record_count: int, payload_size: int) -> None:
-        """记录一条消息。单写者无锁，使用单次 dict.get 避免二次查找。"""
-        cur = self._current.get(topic)
-        if cur is None:
-            now_minute = self._minute_now()
-            if now_minute != self._current_minute:
-                self.roll_minute()
-                now_minute = self._current_minute
-            self._current[topic] = cur = MinuteSlot(timestamp=now_minute)
-        cur.msg_count += 1
-        cur.record_count += record_count
-        cur.bytes_total += payload_size
-        # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
-        if (cur.msg_count & 0x3FF) == 0:
-            now = self._minute_now()
-            if now != self._current_minute:
-                self.roll_minute()
+        """记录一条消息（线程安全）。"""
+        with self._lock:
+            cur = self._current.get(topic)
+            if cur is None:
+                now_minute = self._minute_now()
+                if now_minute != self._current_minute:
+                    self.roll_minute()
+                    now_minute = self._current_minute
+                self._current[topic] = cur = MinuteSlot(timestamp=now_minute)
+            cur.msg_count += 1
+            cur.record_count += record_count
+            cur.bytes_total += payload_size
+            # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
+            if (cur.msg_count & 0x3FF) == 0:
+                now = self._minute_now()
+                if now != self._current_minute:
+                    self.roll_minute()
 
     def roll_minute(self) -> dict[str, MinuteSlot]:
         """整分钟时调用：归档当前累积器 → 滚动窗口淘汰过期数据。
@@ -59,35 +62,36 @@ class TrafficStats:
         Returns:
             刚归档的分钟数据（用于 SQLite 落库）。
         """
-        now_minute = self._minute_now()
-        if now_minute == self._current_minute:
-            return {}  # 同一分钟内不重复归档
+        with self._lock:
+            now_minute = self._minute_now()
+            if now_minute == self._current_minute:
+                return {}  # 同一分钟内不重复归档
 
-        archived: dict[str, MinuteSlot] = {}
+            archived: dict[str, MinuteSlot] = {}
 
-        for topic, slot in self._current.items():
-            if slot.msg_count > 0:
-                archived[topic] = MinuteSlot(
-                    timestamp=slot.timestamp,
-                    msg_count=slot.msg_count,
-                    record_count=slot.record_count,
-                    bytes_total=slot.bytes_total,
-                )
-                # 加入滚动窗口
-                if topic not in self._slots:
-                    self._slots[topic] = deque(maxlen=self._retention)
-                self._slots[topic].append(archived[topic])
+            for topic, slot in self._current.items():
+                if slot.msg_count > 0:
+                    archived[topic] = MinuteSlot(
+                        timestamp=slot.timestamp,
+                        msg_count=slot.msg_count,
+                        record_count=slot.record_count,
+                        bytes_total=slot.bytes_total,
+                    )
+                    # 加入滚动窗口
+                    if topic not in self._slots:
+                        self._slots[topic] = deque(maxlen=self._retention)
+                    self._slots[topic].append(archived[topic])
 
-        # 切换到新分钟
-        self._current_minute = now_minute
-        self._current.clear()
+            # 切换到新分钟
+            self._current_minute = now_minute
+            self._current.clear()
 
-        # 淘汰过期数据（deque maxlen 已自动处理，这里清理空 topic）
-        empty_topics = [t for t, q in self._slots.items() if len(q) == 0]
-        for t in empty_topics:
-            del self._slots[t]
+            # 淘汰过期数据（deque maxlen 已自动处理，这里清理空 topic）
+            empty_topics = [t for t, q in self._slots.items() if len(q) == 0]
+            for t in empty_topics:
+                del self._slots[t]
 
-        return archived
+            return archived
 
     def get_history(self, topic: str, minutes: int = 60) -> list[dict]:
         """获取 topic 最近 N 分钟流量数据（给 Admin 曲线用）。"""

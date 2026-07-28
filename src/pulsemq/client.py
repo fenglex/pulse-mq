@@ -98,6 +98,8 @@ class Client:
         self._registered = False
         # pattern -> callback（同步或异步均可）
         self._subscriptions: dict[str, Callable] = {}
+        # pattern -> header_only 标记：True 表示回调只接收 FrameHeader，跳过完整 decode
+        self._sub_header_only: dict[str, bool] = {}
         self._recv_task: asyncio.Task | None = None
         self._hb_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -484,8 +486,18 @@ class Client:
             logger.debug("SUBSCRIBE 排空 ack 失败", exc_info=True)
 
     @require_connected
-    async def subscribe(self, topic_pattern: str, callback: Callable) -> None:
+    async def subscribe(self, topic_pattern: str, callback: Callable,
+                        *, header_only: bool = False) -> None:
+        """订阅 topic 模式。
+
+        Args:
+            topic_pattern: 主题模式（支持 ``foo.*`` 前缀通配）。
+            callback: 消息回调。``header_only=False`` 时接收 ``PulseMessage``，
+                ``header_only=True`` 时接收 ``FrameHeader``（跳过完整 decode，降低延迟）。
+            header_only: 仅需 topic/record_count/timestamp_ns 时设 True，跳过反序列化。
+        """
         self._subscriptions[topic_pattern] = callback
+        self._sub_header_only[topic_pattern] = header_only
         await self._send_subscribe(topic_pattern)
 
     # ---------------------------------------------------------------- publish
@@ -504,8 +516,8 @@ class Client:
     async def _recv_loop(self) -> None:
         """消费数据面帧，按 topic 前缀匹配分发给订阅回调。
 
-        先 decode_header 用 topic 快速过滤，不匹配的帧跳过完整 decode，
-        减少 consumer CPU 开销（特别是大 payload 场景）。
+        先 decode_header 用 topic 快速过滤，不匹配的帧跳过完整 decode。
+        header_only 回调只接收 FrameHeader，跳过完整 decode 以降低延迟。
         """
         while not self._stop.is_set():
             try:
@@ -520,22 +532,28 @@ class Client:
             except Exception:
                 logger.debug("client 帧头部解码失败，丢弃")
                 continue
-            # 快速过滤：先用 header 的 topic 匹配订阅，不匹配则跳过完整 decode
-            matched_cbs = [cb for pattern, cb in list(self._subscriptions.items())
-                           if _matches(pattern, hdr.topic)]
-            if not matched_cbs:
+            # 快速过滤：先用 header 的 topic 匹配订阅
+            matched = [(cb, self._sub_header_only.get(p, False))
+                       for p, cb in list(self._subscriptions.items())
+                       if _matches(p, hdr.topic)]
+            if not matched:
                 continue
-            try:
-                msg = frames.decode(frame_bytes)
-            except Exception:
-                logger.debug("client 帧解码失败，丢弃")
-                continue
-            for cb in matched_cbs:
+            # 有非 header_only 回调时才做完整 decode
+            need_decode = any(not ho for _, ho in matched)
+            msg = None
+            if need_decode:
                 try:
+                    msg = frames.decode(frame_bytes)
+                except Exception:
+                    logger.debug("client 帧解码失败，丢弃")
+                    continue
+            for cb, ho in matched:
+                try:
+                    target = hdr if ho else msg
                     if inspect.iscoroutinefunction(cb):
-                        await cb(msg)
+                        await cb(target)
                     else:
-                        cb(msg)
+                        cb(target)
                 except Exception:
                     logger.exception("订阅回调异常")
 
@@ -685,7 +703,8 @@ class ProducerClient(Client):
                 self._reconnect_fatal = None
                 raise fatal
 
-    async def subscribe(self, topic_pattern: str, callback: Callable) -> None:  # type: ignore[override]
+    async def subscribe(self, topic_pattern: str, callback: Callable,
+                        *, header_only: bool = False) -> None:  # type: ignore[override]
         raise NotImplementedError("ProducerClient 不支持订阅")
 
 

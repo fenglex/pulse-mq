@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Awaitable, Callable
 
 import zmq
@@ -99,6 +100,176 @@ class AsyncZAPHandler:
             pass  # 单次 send 失败不杀循环
 
 
+class SyncZAPHandler:
+    """同步 ZAP PLAIN 认证 handler（独立线程，用于同步数据面）。
+
+    bcrypt.checkpw 在本线程中直接调用（~200ms 阻塞但不影响事件循环）。
+    on_auth 回调通过 run_coroutine_threadsafe 调度到主线程事件循环。
+    """
+
+    def __init__(self, ctx: zmq.Context, auth: PlainAuthDict,
+                 on_auth: AuthCallback | None = None,
+                 loop: asyncio.AbstractEventLoop | None = None) -> None:
+        self._ctx = ctx
+        self._auth = auth
+        self._on_auth = on_auth
+        self._async_loop = loop
+        self._socket: zmq.Socket | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    def start(self) -> None:
+        self._socket = self._ctx.socket(zmq.REP)
+        self._socket.bind("inproc://zeromq.zap.01")
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        # 不 close socket：Windows 上 bundled libzmq close 同步 ctx 的 socket
+        # 触发 signaler Assertion failed。线程用 Poller 轮询，100ms 内退出。
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._socket = None
+
+    def _loop(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        while self._running:
+            events = dict(poller.poll(timeout=100))
+            if self._socket in events:
+                try:
+                    msg = self._socket.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    continue
+                self._handle(msg)
+
+    def _handle(self, msg: list[bytes]) -> None:
+        if len(msg) < 7:
+            return
+        request_id = msg[1]
+        username = msg[6].decode("utf-8", "replace") if len(msg) > 6 else ""
+        password = msg[7].decode("utf-8", "replace") if len(msg) > 7 else ""
+        ok, reason = self._auth.verify(username, password)
+        status = b"200" if ok else b"400"
+        text = b"OK" if ok else b"INVALID"
+        reply = [b"1.0", request_id, status, text,
+                 username.encode() if ok else b"", b""]
+        try:
+            self._socket.send_multipart(reply)
+        except Exception:
+            pass
+        if self._on_auth and self._async_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._on_auth(username, "", ok, reason), self._async_loop
+                )
+            except Exception:
+                pass
+
+
+class SyncDataThread:
+    """同步数据面线程：ROUTER recv -> on_message 回调 -> ROUTER send。
+
+    用 zmq.Poller 同时监听 ROUTER（recv）和 PULL（来自主线程的发送请求），
+    所有 socket 操作都在本线程内完成，线程安全。
+    主线程通过 send_from_main() 经 PUSH -> PULL 投递发送请求。
+    """
+
+    def __init__(self, ctx: zmq.Context, endpoint: str,
+                 auth: PlainAuthDict | None = None,
+                 on_auth: AuthCallback | None = None,
+                 loop: asyncio.AbstractEventLoop | None = None,
+                 sndhwm: int = 1000, rcvhwm: int = 1000) -> None:
+        self._ctx = ctx
+        self._endpoint = endpoint
+        self._auth = auth
+        self._on_auth = on_auth
+        self._async_loop = loop
+        self._sndhwm = sndhwm
+        self._rcvhwm = rcvhwm
+        self._socket: zmq.Socket | None = None
+        self._zap: SyncZAPHandler | None = None
+        self._pull: zmq.Socket | None = None
+        self._push: zmq.Socket | None = None
+        self._thread: threading.Thread | None = None
+        self._running = False
+        self._on_message: Callable[[bytes, bytes], None] | None = None
+
+    def start(self, on_message: Callable[[bytes, bytes], None]) -> None:
+        self._socket = self._ctx.socket(zmq.ROUTER)
+        self._socket.setsockopt(zmq.LINGER, 1000)
+        self._socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self._socket.setsockopt(zmq.SNDHWM, self._sndhwm)
+        self._socket.setsockopt(zmq.RCVHWM, self._rcvhwm)
+        if self._auth is not None:
+            self._socket.plain_server = True
+            self._zap = SyncZAPHandler(self._ctx, self._auth,
+                                       on_auth=self._on_auth, loop=self._async_loop)
+            self._zap.start()
+        self._socket.bind(self._endpoint)
+        # PUSH/PULL 对：主线程 -> 数据面线程的发送请求通道
+        pull_addr = f"inproc://sync_data_pull_{id(self)}"
+        self._pull = self._ctx.socket(zmq.PULL)
+        self._pull.bind(pull_addr)
+        self._push = self._ctx.socket(zmq.PUSH)
+        self._push.connect(pull_addr)
+        self._on_message = on_message
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        poller.register(self._pull, zmq.POLLIN)
+        while self._running:
+            events = dict(poller.poll(timeout=100))  # 100ms 超时以便检查 _running
+            if self._socket in events:
+                try:
+                    parts = self._socket.recv_multipart(zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                else:
+                    if len(parts) >= 2:
+                        try:
+                            self._on_message(parts[0], parts[-1])
+                        except Exception:
+                            pass
+            if self._pull in events:
+                while True:
+                    try:
+                        msg = self._pull.recv_multipart(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    if len(msg) >= 2:
+                        try:
+                            self._socket.send_multipart([msg[0], msg[1]])
+                        except Exception:
+                            pass
+
+    def send(self, ident: bytes, frame_bytes: bytes) -> None:
+        """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
+        self._socket.send_multipart([ident, frame_bytes])
+
+    def send_from_main(self, ident: bytes, frame_bytes: bytes) -> None:
+        """主线程调用：通过 PUSH -> PULL 投递到数据面线程。"""
+        self._push.send_multipart([ident, frame_bytes])
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        if self._zap:
+            self._zap.stop()
+        # 不 close socket：Windows 上 close 同步 ctx 的 socket 触发
+        # signaler Assertion failed。线程用 Poller 轮询，100ms 内退出。
+        self._socket = None
+        self._pull = None
+        self._push = None
+
+
 class Transport:
     """数据面/控制面 ROUTER(serve) 或 DEALER(client)。"""
 
@@ -115,9 +286,42 @@ class Transport:
         self._zap_started = False
         self._sndhwm = sndhwm
         self._rcvhwm = rcvhwm
+        # 同步数据面线程（低延迟模式）；None 表示未启用
+        self._sync_data: SyncDataThread | None = None
 
     def set_monitor_callback(self, cb: Callable[[str], Awaitable[None]]) -> None:
         self._on_monitor = cb
+
+    # ---- 同步数据面（低延迟模式）----
+
+    def bind_sync_data(self, endpoint: str,
+                       *, auth: PlainAuthDict | None = None,
+                       on_auth: AuthCallback | None = None,
+                       on_message: Callable[[bytes, bytes], None] | None = None,
+                       loop: asyncio.AbstractEventLoop | None = None) -> None:
+        """启动同步数据面线程（独立 zmq.Context + 独立线程）。
+
+        与异步 bind() 完全隔离：使用单独的同步 ctx，ZAP 各自独立。
+        on_message 回调在数据面线程中执行，可调用 send_sync_direct() 转发消息。
+        """
+        sync_ctx = zmq.Context()
+        self._sync_data = SyncDataThread(
+            ctx=sync_ctx, endpoint=endpoint, auth=auth, on_auth=on_auth,
+            loop=loop, sndhwm=self._sndhwm, rcvhwm=self._rcvhwm,
+        )
+        self._sync_data.start(on_message)
+
+    def send_sync_direct(self, ident: bytes, frame_bytes: bytes) -> None:
+        """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
+        if self._sync_data:
+            self._sync_data.send(ident, frame_bytes)
+
+    def send_sync_data(self, ident: bytes, frame_bytes: bytes) -> None:
+        """主线程调用（内置 producer）：通过 PUSH -> PULL 投递到数据面线程。"""
+        if self._sync_data:
+            self._sync_data.send_from_main(ident, frame_bytes)
+
+    # ---- 异步 bind/connect ----
 
     async def bind(self, endpoint: str, role: str,
                    *, auth: PlainAuthDict | None = None,
@@ -222,6 +426,10 @@ class Transport:
         return b"", parts[0]
 
     async def close(self) -> None:
+        # 同步数据面先关（独立线程 + 独立 ctx）
+        if self._sync_data:
+            self._sync_data.stop()
+            self._sync_data = None
         # monitor 先于业务 socket 关闭
         for t in self._monitor_tasks:
             t.cancel()

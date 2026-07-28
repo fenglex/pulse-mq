@@ -23,6 +23,9 @@ logs/
 # Spec 2：运行时生成的敏感文件（凭据 / admin token）
 pulsemq_users.toml
 pulsemq_admin.token
+# 基准测试产物
+bench_results.md
+bench_state.json
 # C 扩展编译产物
 *.pyd
 *.so

@@ -173,6 +173,11 @@ PULSEMQ_BCRYPT_COST=12
 提交之前，把完整的改动差异展示给用户，并获得明确批准。
 ### 约束8：没跑过测试不算完成
 在宣布实现就绪前，针对改动的包跑一遍能覆盖 lint、类型检查和测试失败的最小验证。
+### 约束9：Windows 下禁用 CMD 风格 shell 命令
+在 Bash 工具（Git Bash/MSYS）中严禁使用 Windows CMD 语法：
+- 丢弃输出用 `> /dev/null 2>&1`，禁止 `> nul` / `2>nul` / `>NUL`（Git Bash 不认 `nul` 设备，会在当前目录创建名为 `nul` 的真实文件）
+- 列文件用 `find <dir> -type f` 或 `ls`，禁止 `dir /s /b`（bash 的 `dir` 是 GNU coreutils，参数不兼容）
+- 路径用 `/` 或加引号转义，禁止裸写 `D:\foo\bar`（反斜杠在 bash 里是转义符，会被吞掉）
 
 # 语言要求
 全程尽量使用中文
