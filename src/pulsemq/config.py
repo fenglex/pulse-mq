@@ -35,6 +35,8 @@ class ServerConfig:
     admin_thread: bool = True
     ui_enabled: bool = True
     retention_days: int = 7
+    sndhwm: int = 1000   # ZMQ 发送高水位（帧数），大 payload 可调低控制内存
+    rcvhwm: int = 1000   # ZMQ 接收高水位（帧数）
 
 
 @dataclass
@@ -99,6 +101,8 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         admin_thread=bool(m.get("admin_thread", ServerConfig.admin_thread)),
         ui_enabled=bool(m.get("ui_enabled", ServerConfig.ui_enabled)),
         retention_days=int(m.get("retention_days", ServerConfig.retention_days)),
+        sndhwm=int(s.get("sndhwm", ServerConfig.sndhwm)),
+        rcvhwm=int(s.get("rcvhwm", ServerConfig.rcvhwm)),
     )
     # 环境变量覆盖
     if (v := _env("PULSEMQ_DATA_ENDPOINT")):
@@ -111,6 +115,10 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         cfg.credentials_file = v
     if (v := _env("PULSEMQ_ADMIN_TOKEN")):
         cfg.admin_token = v
+    if (v := _env("PULSEMQ_SNDHWM")):
+        cfg.sndhwm = int(v)
+    if (v := _env("PULSEMQ_RCVHWM")):
+        cfg.rcvhwm = int(v)
     return cfg
 
 

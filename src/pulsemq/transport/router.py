@@ -102,7 +102,8 @@ class AsyncZAPHandler:
 class Transport:
     """数据面/控制面 ROUTER(serve) 或 DEALER(client)。"""
 
-    def __init__(self, ctx: zmq.asyncio.Context | None = None) -> None:
+    def __init__(self, ctx: zmq.asyncio.Context | None = None,
+                 *, sndhwm: int = 1000, rcvhwm: int = 1000) -> None:
         self._ctx = ctx or zmq.asyncio.Context.instance()
         self._sockets: dict[str, zmq.asyncio.Socket] = {}
         self._zaps: list[AsyncZAPHandler] = []
@@ -112,6 +113,8 @@ class Transport:
         # ZAP 是 context 级单例：同一 ctx 上所有 plain_server=True 的 socket
         # 共享同一个 inproc://zeromq.zap.01 REP socket。仅在首次 auth bind 时启动。
         self._zap_started = False
+        self._sndhwm = sndhwm
+        self._rcvhwm = rcvhwm
 
     def set_monitor_callback(self, cb: Callable[[str], Awaitable[None]]) -> None:
         self._on_monitor = cb
@@ -122,6 +125,8 @@ class Transport:
         sock = self._ctx.socket(zmq.ROUTER)
         sock.setsockopt(zmq.LINGER, 1000)
         sock.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        sock.setsockopt(zmq.SNDHWM, self._sndhwm)
+        sock.setsockopt(zmq.RCVHWM, self._rcvhwm)
         if auth is not None:
             sock.plain_server = True
             # ZAP REP socket 绑定的是 inproc 单例端点，同一 ctx 只能 bind 一次。
@@ -142,6 +147,8 @@ class Transport:
                       identity: bytes | None = None) -> None:
         sock = self._ctx.socket(zmq.DEALER)
         sock.setsockopt(zmq.LINGER, 1000)
+        sock.setsockopt(zmq.SNDHWM, self._sndhwm)
+        sock.setsockopt(zmq.RCVHWM, self._rcvhwm)
         # 显式设置 identity：让同一 client 的数据面/控制面两个 DEALER
         # 在各自 ROUTER 上呈现相同的 bytes identity，这样 server 的
         # routing 表（以 control 面的 ident 为 key）能直接用于数据面转发。

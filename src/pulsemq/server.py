@@ -99,7 +99,9 @@ class Server:
         # 显式传 admin_token="" 视为「禁用 token 校验」（向后兼容 Spec 1 测试）。
         self.admin_token = self._resolve_admin_token(admin_token, admin_token_file)
         self._token_auth = TokenAuth(self.admin_token)
-        self._transport = Transport()
+        self._transport = Transport(
+            sndhwm=self._cfg.sndhwm, rcvhwm=self._cfg.rcvhwm,
+        )
         self._routing = SubscriptionTable()
         self._registry = OnlineRegistry(heartbeat_timeout=self._cfg.heartbeat_timeout)
         self._stats = TrafficStats(retention_minutes=self._cfg.stats_retention_minutes)
