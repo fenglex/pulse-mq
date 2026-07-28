@@ -502,7 +502,11 @@ class Client:
     # -------------------------------------------------------------- recv loop
 
     async def _recv_loop(self) -> None:
-        """消费数据面帧，按 topic 前缀匹配分发给订阅回调。"""
+        """消费数据面帧，按 topic 前缀匹配分发给订阅回调。
+
+        先 decode_header 用 topic 快速过滤，不匹配的帧跳过完整 decode，
+        减少 consumer CPU 开销（特别是大 payload 场景）。
+        """
         while not self._stop.is_set():
             try:
                 _, frame_bytes = await self._transport.recv("consumer")
@@ -512,19 +516,28 @@ class Client:
                 logger.exception("client 数据面 recv 异常")
                 continue
             try:
+                hdr = frames.decode_header(frame_bytes)
+            except Exception:
+                logger.debug("client 帧头部解码失败，丢弃")
+                continue
+            # 快速过滤：先用 header 的 topic 匹配订阅，不匹配则跳过完整 decode
+            matched_cbs = [cb for pattern, cb in list(self._subscriptions.items())
+                           if _matches(pattern, hdr.topic)]
+            if not matched_cbs:
+                continue
+            try:
                 msg = frames.decode(frame_bytes)
             except Exception:
                 logger.debug("client 帧解码失败，丢弃")
                 continue
-            for pattern, cb in list(self._subscriptions.items()):
-                if _matches(pattern, msg.topic):
-                    try:
-                        if inspect.iscoroutinefunction(cb):
-                            await cb(msg)
-                        else:
-                            cb(msg)
-                    except Exception:
-                        logger.exception("订阅回调异常")
+            for cb in matched_cbs:
+                try:
+                    if inspect.iscoroutinefunction(cb):
+                        await cb(msg)
+                    else:
+                        cb(msg)
+                except Exception:
+                    logger.exception("订阅回调异常")
 
     # -------------------------------------------------------- heartbeat loop
 

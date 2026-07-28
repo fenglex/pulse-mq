@@ -52,14 +52,24 @@ class FrameHeader:
     raw_payload: bytes
 
 
-def _encode_payload(obj: Any, serializer: str, compression_fmt: str) -> bytes:
+def _encode_payload(obj: Any, serializer: str, compression_fmt: str) -> tuple[bytes, str]:
+    """序列化 + 压缩 payload。返回 (压缩后 bytes, 实际使用的压缩算法)。
+
+    compression_fmt="auto" 时根据序列化后 raw bytes 长度自动选择：
+    <256B 用 none（压缩开销 > 节省），>=256B 用 lz4。
+    """
     try:
         ser = serialization.get(serializer)
+    except KeyError as e:
+        raise SerializationError(f"未注册的序列化器: {e}") from e
+    raw = ser.serialize(obj)
+    if compression_fmt == "auto":
+        compression_fmt = "none" if len(raw) < 256 else "lz4"
+    try:
         comp = compression.get(compression_fmt)
     except KeyError as e:
-        raise SerializationError(f"未注册的序列化/压缩: {e}") from e
-    raw = ser.serialize(obj)
-    return comp.compress(raw)
+        raise SerializationError(f"未注册的压缩算法: {e}") from e
+    return comp.compress(raw), compression_fmt
 
 
 def _decode_payload(raw: bytes, serializer: str, compression_fmt: str) -> Any:
@@ -222,7 +232,7 @@ def encode(
     topic_bytes = topic.encode("utf-8")
     if len(topic_bytes) > 65535:
         raise FrameError("topic 过长")
-    payload = _encode_payload(data, serializer, compression)
+    payload, compression = _encode_payload(data, serializer, compression)
     flags = encode_flags(serializer, compression, crc=crc)
     head = _HEAD_BEFORE_TOPIC.pack(MAGIC, VERSION, msg_type, flags, data_type,
                                    len(topic_bytes))
