@@ -422,27 +422,29 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 
 ### 参考数据
 
-下列数值来自上述脚本在本机（Windows 11, Python 3.13, 单机 localhost）的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
+下列数值来自多进程基准脚本（`bench_multiprocess.py`）在 Linux 上的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
 
-**单条消息（dict，每帧 1 条）**
+- 环境：Linux 6.12 (RHEL 10), Python 3.13.14, pulsemq v7.2.5
+- 每组合 3000 帧，生产端/服务端/消费端独立进程，localhost
 
-| 序列化 | 压缩 | 量级 |
-|--------|------|------|
-| msgpack | none | ~1e4 frames/s |
-| json | none | ~1e4 frames/s |
+**吞吐量与延迟（精选组合）**
 
-> 小消息场景 pyarrow 单帧开销过大（序列化 + schema），不推荐用于单条 dict。
-> 压缩对 <200B payload 通常为负收益。
+| 数据类型 | 序列化器 | 压缩 | 发送 f/s | 接收 f/s | p50 ms | p99 ms |
+|---|---|---|---|---|---|---|
+| dict | msgpack | none | 136,752 | 50,715 | 20.7 | 37.5 |
+| dict | msgpack | snappy | 64,815 | 42,737 | 6.9 | 24.2 |
+| dict | json | lz4 | 112,277 | 47,400 | 21.1 | 36.9 |
+| dataframe | msgpack | none | 3,224 | 3,244 | **0.42** | 1.67 |
+| dataframe | json | lz4 | 3,141 | 3,155 | 0.43 | 1.26 |
+| dataframe | pyarrow | zstd | 4,220 | 3,364 | 94.7 | 184.8 |
+| str | str | none | 130,794 | 51,779 | 19.3 | 35.3 |
+| bytes | bytes | lz4 | 116,976 | 49,634 | 18.8 | 35.2 |
+| bytes | bytes | zstd | 72,411 | 43,648 | **14.9** | 27.8 |
 
-**批量 DataFrame（1000 行/帧）**
-
-| 序列化 | 压缩 | 量级 |
-|--------|------|------|
-| pyarrow | lz4/zstd | ~1e6 records/s |
-| pyarrow | none | 略高于带压缩（取决于数据可压缩性） |
-
-> 批量场景 pyarrow 是**最优选择**（直接序列化 DataFrame，无需 dict 转换）。
-> 帧延迟为压测下 ZMQ 缓冲区排队所致，真实场景以固定间隔发送时远低于此。
+> **dataframe + msgpack/json** 延迟最低（p50 < 0.5ms），encode 限速无积压。
+> **小消息（dict/str/bytes）** 吞吐最高（>100K f/s），但 burst 发送导致队列积压，p50 较高。
+> **pyarrow** encode 快但 consumer 端 `to_pandas()` 转换是延迟瓶颈（p50 > 90ms）。
+> **zstd** 对大 payload 压缩收益明显，对 <200B 小消息通常为负收益。
 
 ---
 
