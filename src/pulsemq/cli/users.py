@@ -11,7 +11,7 @@ from pathlib import Path
 from pulsemq.errors import PulseMQError, SecurityError, exit_code_for
 from pulsemq.security import CredentialStore
 
-DEFAULT_FILE = "./pulsemq_users.toml"
+DEFAULT_FILE = "./data/pulsemq_users.toml"
 
 
 def _store(file: str) -> CredentialStore:

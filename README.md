@@ -50,7 +50,7 @@ async def main():
         data_endpoint="tcp://0.0.0.0:5555",
         control_endpoint="tcp://0.0.0.0:5556",
         admin_endpoint="0.0.0.0:9090",
-        credentials={"user1": "pass1"},  # 或省略，用 credentials_file（默认 ./pulsemq_users.toml）
+        credentials={"user1": "pass1"},  # 或省略，用 credentials_file（默认 ./data/pulsemq_users.toml）
     )
     await srv.start()
     await srv.wait_for_shutdown()  # Ctrl+C / srv.stop() 后返回
@@ -373,7 +373,7 @@ created_at = "2026-06-27T00:00:00Z"
 
 ### Admin Token
 
-首次启动自动生成 32 字节随机 base64url token，写入 `pulsemq_admin.token`（0600 权限）。
+首次启动自动生成 32 字节随机 base64url token，写入 `./data/pulsemq_admin.token`（0600 权限）。
 Web UI 和 REST API 通过 `?token=...` 或 `Authorization: Bearer ...` 传递。
 
 可通过环境变量 `PULSEMQ_ADMIN_TOKEN` 或配置文件覆盖。
@@ -382,10 +382,10 @@ Web UI 和 REST API 通过 `?token=...` 或 `Authorization: Bearer ...` 传递�
 
 ## 日志
 
-日志输出到 `logs/` 目录，每日滚动，保留 30 天：
+日志输出到 `data/logs/` 目录，每日滚动，保留 30 天：
 
 ```
-logs/
+data/logs/
 ├── pulsemq_2026-06-27.log
 ├── pulsemq_2026-06-28.log
 └── ...
@@ -455,7 +455,7 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 | `PULSEMQ_DATA_ENDPOINT` | 数据面绑定地址 | `tcp://0.0.0.0:5555` |
 | `PULSEMQ_CONTROL_ENDPOINT` | 控制面绑定地址 | `tcp://0.0.0.0:5556` |
 | `PULSEMQ_ADMIN_BIND` | 管理 HTTP 绑定地址 | `0.0.0.0:9090` |
-| `PULSEMQ_CREDENTIALS_FILE` | 凭据 TOML 路径 | `./pulsemq_users.toml` |
+| `PULSEMQ_CREDENTIALS_FILE` | 凭据 TOML 路径 | `./data/pulsemq_users.toml` |
 | `PULSEMQ_ADMIN_TOKEN` | 监控接口 token（覆盖随机生成） | 自动生成 |
 | `PULSEMQ_SNDHWM` | ZMQ 发送高水位（帧数） | `1000` |
 | `PULSEMQ_RCVHWM` | ZMQ 接收高水位（帧数） | `1000` |

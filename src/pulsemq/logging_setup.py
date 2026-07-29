@@ -13,7 +13,7 @@ _CONFIGURED = False
 def setup_logging(
     level: str = "INFO",
     json: bool = False,
-    log_dir: str = "logs",
+    log_dir: str = "data/logs",
     rotation: str = "1 day",
     retention: str = "30 days",
 ) -> None:

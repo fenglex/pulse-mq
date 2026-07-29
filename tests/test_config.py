@@ -9,7 +9,7 @@ def test_server_config_defaults():
     assert cfg.control_endpoint == "tcp://0.0.0.0:5556"
     assert cfg.admin_endpoint == "0.0.0.0:9090"
     assert cfg.heartbeat_timeout == 6.0
-    assert cfg.stats_db == "sqlite://./pulsemq_stats.sqlite"
+    assert cfg.stats_db == "sqlite://./data/pulsemq_stats.sqlite"
 
 
 def test_client_config_defaults():
@@ -51,7 +51,7 @@ def test_server_config_security_defaults():
     assert cfg.password_hash_algo == "bcrypt"
     assert cfg.bcrypt_cost == 12
     assert cfg.admin_token == ""
-    assert cfg.admin_token_file == "./pulsemq_admin.token"
+    assert cfg.admin_token_file == "./data/pulsemq_admin.token"
 
 
 def test_load_auth_block_from_toml(tmp_path):

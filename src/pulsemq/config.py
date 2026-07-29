@@ -19,15 +19,15 @@ class ServerConfig:
     data_endpoint: str = "tcp://0.0.0.0:5555"
     control_endpoint: str = "tcp://0.0.0.0:5556"
     admin_endpoint: str = "0.0.0.0:9090"
-    credentials_file: str = "./pulsemq_users.toml"
+    credentials_file: str = "./data/pulsemq_users.toml"
     heartbeat_timeout: float = 6.0
-    stats_db: str = "sqlite://./pulsemq_stats.sqlite"
+    stats_db: str = "sqlite://./data/pulsemq_stats.sqlite"
     stats_retention_minutes: int = 480
     allow_auto_generated_credentials: bool = True
     password_hash_algo: str = "bcrypt"
     bcrypt_cost: int = 12
     admin_token: str = ""
-    admin_token_file: str = "./pulsemq_admin.token"
+    admin_token_file: str = "./data/pulsemq_admin.token"
     sse_interval: float = 1.0
     latency_sample_rate: float = 0.01
     event_ring_size: int = 200
@@ -37,6 +37,10 @@ class ServerConfig:
     retention_days: int = 7
     sndhwm: int = 1000   # ZMQ 发送高水位（帧数），大 payload 可调低控制内存
     rcvhwm: int = 1000   # ZMQ 接收高水位（帧数）
+
+    def __post_init__(self) -> None:
+        """确保 data/ 目录存在，日志/SQLite/凭据/token 等运行时文件统一存放。"""
+        Path("data").mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
