@@ -210,11 +210,11 @@ asyncio.run(main())
 | Python 类型 | 可用序列化器 | record_count |
 |-------------|-------------|-------------|
 | `pd.DataFrame` | msgpack, json, **pyarrow** | 行数 |
-| `dict` | msgpack, json, **pyarrow** | 1 |
+| `dict` | msgpack, json | 1 |
 | `str` | **str**（仅此一种） | 1 |
 | `bytes` | **bytes**（仅此一种） | 1 |
 
-> pyarrow 对 DataFrame/dict 均可直接序列化；json/msgpack 下 DataFrame 先转 `list[dict]`
+> pyarrow 对 DataFrame 可直接序列化；json/msgpack 下 DataFrame 先转 `list[dict]`
 > 再以 `data_type=DATAFRAME` 标记，接收端 `_restore_type` 还原回 DataFrame。
 
 ### 序列化格式
@@ -320,7 +320,7 @@ topic(N) ts(8 BE ns) record_count(4 BE) payload(变长) [CRC32?(4)]
 ```
 
 - `magic` = `"PM"`
-- `msg_type` = DATA(0x01) / CONTROL(0x02)
+- `msg_type` = DATA(0x01) / CONTROL(0x02) / HEARTBEAT(0x03) / ADMIN(0x04)
 - `flags` = 编码序列化器(3bit) + 压缩算法(2bit) + CRC(1bit)
 - `data_type` = UNKNOWN(0x00) / DICT(0x01) / DATAFRAME(0x02) / STR(0x03) / BYTES(0x04)
 - `record_count` 上限 **1,000,000**
@@ -398,17 +398,23 @@ stderr 同步输出（容器/交互可见）。
 
 ### 运行基准
 
-仓库自带可运行的端到端基准脚本（单进程内启动 Server + Producer + Consumer）：
+仓库自带多套基准脚本：
 
 ```bash
-# 单条 dict 消息，msgpack/none
+# 1. 单进程快速基准（Server + Producer + Consumer 同进程）
 python scripts/bench_simple.py --duration 5
-
-# 批量 DataFrame（1000 行/帧）+ pyarrow + lz4
 python scripts/bench_simple.py --duration 5 --records-per-frame 1000 --serializer pyarrow --compression lz4
-
 # 可选参数：--serializer {msgpack,json,pyarrow,str,bytes}
 #           --compression {none,snappy,lz4,zstd}
+
+# 2. 全面基准（协议层微基准 + 端到端矩阵 + 扇出，单进程）
+python scripts/bench_full.py                  # 跑全部，结果写 bench_results.md
+python scripts/bench_full.py --duration 10    # 端到端/扇出每场景秒数
+
+# 3. 多进程基准（生产端/服务端/消费端独立进程，28 组合全覆盖）
+python scripts/bench_multiprocess.py          # 跑全部 28 组合
+python scripts/bench_multiprocess.py --count 3000     # 每组合发送帧数
+python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 ```
 
 脚本输出帧/记录吞吐量与 p50/p90/p99/max 帧延迟。
@@ -450,17 +456,34 @@ python scripts/bench_simple.py --duration 5 --records-per-frame 1000 --serialize
 | `PULSEMQ_ADMIN_BIND` | 管理 HTTP 绑定地址 | `0.0.0.0:9090` |
 | `PULSEMQ_CREDENTIALS_FILE` | 凭据 TOML 路径 | `./pulsemq_users.toml` |
 | `PULSEMQ_ADMIN_TOKEN` | 监控接口 token（覆盖随机生成） | 自动生成 |
-| `PULSEMQ_ADMIN_PASSWORD` | 首次启动默认 admin 密码 | 随机 16 字符 |
+| `PULSEMQ_SNDHWM` | ZMQ 发送高水位（帧数） | `1000` |
+| `PULSEMQ_RCVHWM` | ZMQ 接收高水位（帧数） | `1000` |
 
 ### 配置文件（TOML）
 
-更多参数（`stats_db`、`heartbeat_timeout`、`latency_sample_rate`、`stats_retention_minutes`、`bcrypt_cost`、`admin_token_file`、`sse_interval`、`event_ring_size` 等）需通过 TOML 配置文件设置，**不支持**环境变量覆盖。在 `Server(config=...)` 中传入自定义 `ServerConfig` 即可生效。完整字段见 [`ServerConfig`](src/pulsemq/config.py)。
+更多参数（`stats_db`、`heartbeat_timeout`、`latency_sample_rate`、`stats_retention_minutes`、`bcrypt_cost`、`admin_token_file`、`sse_interval`、`event_ring_size` 等）需通过 TOML 配置文件设置。在 `Server(config=...)` 中传入自定义 `ServerConfig` 即可生效。完整字段见 [`ServerConfig`](src/pulsemq/config.py)。
 
 ---
 
 ## 更新日志
 
-### v2 (current)
+### v7.2.0 (current)
+
+- **同步数据面线程** - SyncDataThread 独立线程 + 独立 ctx，端到端 p50 < 1ms
+- **压缩算法自适应** - `compression="auto"` 根据 payload 大小自动选择 none/lz4
+- **Consumer decode_header 快速过滤** - 跳过不匹配 topic 的完整 decode
+- **ZMQ HWM 可配置化** - `sndhwm`/`rcvhwm` 配置项 + `PULSEMQ_SNDHWM`/`PULSEMQ_RCVHWM` 环境变量
+- **多进程基准测试脚本** - `scripts/bench_multiprocess.py`，三进程独立运行，28 组合全覆盖
+
+### v7.1.0
+
+- **encode 自动推断** - serializer/data_type 自动推断，DataFrame 兼容 msgpack/json + STR/BYTES 支持
+
+### v7.0.x
+
+- **record_count 自动推断** - list/DataFrame 行数自动推断
+
+### v2
 
 完整重构：PUB/SUB → Client/Server (ROUTER/DEALER)
 
