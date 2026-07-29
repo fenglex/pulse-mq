@@ -171,15 +171,23 @@ class AdminServer:
     async def stop(self) -> None:
         """停止 AdminServer。
 
-        独立线程模式下：通过 `run_coroutine_threadsafe` 在 admin loop 上调度
-        `_stop_serve()`，再 join 线程。线程内异常或超时被吞掉，保证调用方不死锁。
+        独立线程模式下：通过 ``call_soon_threadsafe`` 在 admin loop 上直接关闭
+        server（同步操作，不创建协程），再 join 线程。避免 ``run_coroutine_threadsafe``
+        提交的协程在 loop 关闭前未被调度执行，导致 "coroutine was never awaited"
+        RuntimeWarning。
         """
         if self._admin_thread and self._loop is not None:
-            fut = asyncio.run_coroutine_threadsafe(self._stop_serve(), self._loop)
-            try:
-                fut.result(timeout=5.0)
-            except Exception:
-                pass
+            # 同步回调：关闭 HTTP server + 取消 SSE 任务。
+            # 不创建协程，避免 loop 关闭前协程未被执行的 RuntimeWarning。
+            def _do_stop() -> None:
+                if self._sse_task is not None:
+                    self._sse_task.cancel()
+                for _qid, (_q, task) in list(self._sse_clients.items()):
+                    task.cancel()
+                self._sse_clients.clear()
+                if self._server:
+                    self._server.close()
+            self._loop.call_soon_threadsafe(_do_stop)
             if self._thread:
                 self._thread.join(timeout=5.0)
         else:
