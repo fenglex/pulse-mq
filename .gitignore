@@ -26,6 +26,8 @@ pulsemq_admin.token
 # 基准测试产物
 bench_results.md
 bench_state.json
+bench_multiprocess_results.md
+bench_stats.sqlite
 # C 扩展编译产物
 *.pyd
 *.so
