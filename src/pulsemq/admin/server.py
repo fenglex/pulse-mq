@@ -126,6 +126,18 @@ class AdminServer:
             # stop() 取消 serve_forever 会抛 CancelledError，属正常关闭路径，吞掉。
             logger.debug("AdminServer 线程退出")
         finally:
+            # 取消所有未完成任务，避免 "coroutine was never awaited" RuntimeWarning。
+            # _stop_serve() 可能已通过 run_coroutine_threadsafe 提交但 loop 在
+            # serve_forever() 返回后立即关闭，导致协程未被执行。
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
             try:
                 loop.close()
             except Exception:

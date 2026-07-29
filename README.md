@@ -235,6 +235,7 @@ asyncio.run(main())
 | `snappy` | 速度优先 |
 | `lz4` | 批数据，平衡 |
 | `zstd` | 压缩比优先（带宽受限） |
+| `auto` | 自适应：<256B 用 none，>=256B 用 lz4 |
 
 小消息场景压缩是**负收益**（计算开销 > 传输节省）；批量 DataFrame 场景 `lz4`/`zstd` 有明显效果。
 
@@ -421,7 +422,7 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 
 ### 参考数据
 
-下列数值来自上述脚本在本机（Windows 11, Python 3.14, 单机 localhost）的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
+下列数值来自上述脚本在本机（Windows 11, Python 3.13, 单机 localhost）的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
 
 **单条消息（dict，每帧 1 条）**
 
@@ -467,7 +468,22 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 
 ## 更新日志
 
-### v7.2.0 (current)
+### v7.2.3 (current)
+
+- **修复 AdminServer 关闭时 RuntimeWarning** - 线程 loop 关闭前取消未完成任务
+- **修复 Ctrl+C 优雅关闭超时** - `run_server` 等待 `server.stop()` 完成，10s 超时强制退出
+- **requires-python 恢复 >=3.13**
+
+### v7.2.2
+
+- **降低 requires-python 到 3.11**（后续恢复 3.13）
+- **修复 Linux Ctrl+C 无法终止** - `lifecycle.py` 等待 stop task 完成
+
+### v7.2.1
+
+- **修正 README 文档与代码不一致**（7 处）
+
+### v7.2.0
 
 - **同步数据面线程** - SyncDataThread 独立线程 + 独立 ctx，端到端 p50 < 1ms
 - **压缩算法自适应** - `compression="auto"` 根据 payload 大小自动选择 none/lz4

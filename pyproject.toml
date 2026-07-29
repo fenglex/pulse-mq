@@ -1,10 +1,10 @@
 [project]
 name = "pulse-mq"
-version = "7.2.2"
+version = "7.2.3"
 description = "高性能 Client/Server 消息中间件 — ZeroMQ ROUTER/DEALER + bcrypt 认证 + 实时监控"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 authors = [
     { name = "haifeng" },
 ]
@@ -13,8 +13,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Networking",
