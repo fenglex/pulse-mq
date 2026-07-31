@@ -1,92 +1,127 @@
-"""topic→订阅表，前缀匹配。只由 control 面驱动，数据面只读 match()。"""
+"""topic->订阅表，前缀匹配。只由 control 面驱动，数据面只读 match()。
+
+COW（copy-on-write）无锁读：写时在 ``_write_lock`` 内构建不可变 ``_Index``
+快照并原子替换 ``_read_index`` 引用；数据面 ``match()`` 直接读引用，无锁。
+GIL 保证引用赋值原子，数据面见到的快照永远一致。写频率极低（仅订阅变更），
+拷贝成本可忽略。
+"""
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class _Index:
+    """不可变路由快照（COW 读路径直接持有引用）。"""
+    exact: dict[str, frozenset[bytes]]
+    wild: dict[str, frozenset[bytes]]
+    by_identity: dict[bytes, frozenset[str]]
+
+
+_EMPTY = frozenset()
 
 
 class SubscriptionTable:
-    def __init__(self) -> None:
-        # identity -> set[pattern]（保留用于管理/快照）
-        self._by_identity: dict[str, set[str]] = {}
-        # 精确匹配索引：pattern -> set[identity]
-        self._exact: dict[str, set[str]] = {}
-        # 通配匹配索引：prefix -> set[identity]（pattern "foo.*" 的 prefix 为 "foo"）
-        self._wild: dict[str, set[str]] = {}
-        # 线程安全锁：数据面线程读 match()，控制面协程写 subscribe/unsubscribe/remove
-        self._lock = threading.RLock()
+    """topic 前缀匹配路由表（COW 无锁读）。"""
 
-    def subscribe(self, identity: str, topic_pattern: str) -> None:
-        with self._lock:
-            self._by_identity.setdefault(identity, set()).add(topic_pattern)
+    def __init__(self) -> None:
+        self._read_index = _Index(exact={}, wild={}, by_identity={})
+        self._write_lock = threading.Lock()
+
+    def match(self, topic: str) -> set[bytes]:
+        """前缀匹配 -> identity 集合。无锁读（COW）。"""
+        idx = self._read_index  # 原子读引用，无锁
+        matched: set[bytes] = set(idx.exact.get(topic, _EMPTY))
+        matched |= idx.wild.get(topic, _EMPTY)
+        parts = topic.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            matched |= idx.wild.get(".".join(parts[:i]), _EMPTY)
+        return matched
+
+    def subscribe(self, identity: bytes, topic_pattern: str) -> None:
+        with self._write_lock:
+            base = self._read_index
+            # 拷贝并更新（写频率低，拷贝成本可忽略）
+            by_id = dict(base.by_identity)
+            pats = set(by_id.get(identity, _EMPTY))
+            pats.add(topic_pattern)
+            by_id[identity] = frozenset(pats)
+            exact = dict(base.exact)
+            wild = dict(base.wild)
             if topic_pattern.endswith(".*"):
                 prefix = topic_pattern[:-2]
-                self._wild.setdefault(prefix, set()).add(identity)
+                s = set(wild.get(prefix, _EMPTY)); s.add(identity)
+                wild[prefix] = frozenset(s)
             else:
-                self._exact.setdefault(topic_pattern, set()).add(identity)
+                s = set(exact.get(topic_pattern, _EMPTY)); s.add(identity)
+                exact[topic_pattern] = frozenset(s)
+            self._read_index = _Index(exact, wild, by_id)
 
-    def unsubscribe(self, identity: str, topic_pattern: str) -> None:
-        with self._lock:
-            pats = self._by_identity.get(identity)
+    def unsubscribe(self, identity: bytes, topic_pattern: str) -> None:
+        with self._write_lock:
+            base = self._read_index
+            by_id = dict(base.by_identity)
+            pats = set(by_id.get(identity, _EMPTY))
+            pats.discard(topic_pattern)
             if pats:
-                pats.discard(topic_pattern)
-                if not pats:
-                    self._by_identity.pop(identity, None)
-            self._remove_from_index(identity, topic_pattern)
+                by_id[identity] = frozenset(pats)
+            else:
+                by_id.pop(identity, None)
+            exact = dict(base.exact); wild = dict(base.wild)
+            if topic_pattern.endswith(".*"):
+                prefix = topic_pattern[:-2]
+                s = set(wild.get(prefix, _EMPTY)); s.discard(identity)
+                if s:
+                    wild[prefix] = frozenset(s)
+                else:
+                    wild.pop(prefix, None)
+            else:
+                s = set(exact.get(topic_pattern, _EMPTY)); s.discard(identity)
+                if s:
+                    exact[topic_pattern] = frozenset(s)
+                else:
+                    exact.pop(topic_pattern, None)
+            self._read_index = _Index(exact, wild, by_id)
 
-    def remove(self, identity: str) -> None:
-        with self._lock:
-            pats = self._by_identity.pop(identity, None)
-            if pats:
-                for pattern in pats:
-                    self._remove_from_index(identity, pattern)
+    def remove(self, identity: bytes) -> None:
+        with self._write_lock:
+            base = self._read_index
+            by_id = dict(base.by_identity)
+            pats = by_id.pop(identity, _EMPTY)
+            exact = dict(base.exact); wild = dict(base.wild)
+            for pattern in pats:
+                if pattern.endswith(".*"):
+                    prefix = pattern[:-2]
+                    s = set(wild.get(prefix, _EMPTY)); s.discard(identity)
+                    if s:
+                        wild[prefix] = frozenset(s)
+                    else:
+                        wild.pop(prefix, None)
+                else:
+                    s = set(exact.get(pattern, _EMPTY)); s.discard(identity)
+                    if s:
+                        exact[pattern] = frozenset(s)
+                    else:
+                        exact.pop(pattern, None)
+            self._read_index = _Index(exact, wild, by_id)
 
-    def _remove_from_index(self, identity: str, pattern: str) -> None:
-        """从精确/通配索引中移除 identity。"""
-        if pattern.endswith(".*"):
-            prefix = pattern[:-2]
-            s = self._wild.get(prefix)
-            if s:
-                s.discard(identity)
-                if not s:
-                    self._wild.pop(prefix, None)
-        else:
-            s = self._exact.get(pattern)
-            if s:
-                s.discard(identity)
-                if not s:
-                    self._exact.pop(pattern, None)
-
-    def match(self, topic: str) -> set[str]:
-        with self._lock:
-            # 精确匹配 O(1)
-            matched: set[str] = set()
-            matched.update(self._exact.get(topic, set()))
-            # 通配匹配：检查 topic 本身及各级父前缀
-            # "foo.*" 匹配 "foo" 和 "foo.<anything>"
-            matched.update(self._wild.get(topic, set()))
-            parts = topic.split(".")
-            for i in range(len(parts) - 1, 0, -1):
-                prefix = ".".join(parts[:i])
-                matched.update(self._wild.get(prefix, set()))
-            return matched
+    def subscribers_of(self, identity: bytes) -> set[str]:
+        """查某 identity 的订阅模式集合。"""
+        return set(self._read_index.by_identity.get(identity, _EMPTY))
 
     @staticmethod
     def _matches(pattern: str, topic: str) -> bool:
+        """单 pattern 匹配判定（供客户端等复用）。"""
         if pattern.endswith(".*"):
             prefix = pattern[:-2]
             return topic == prefix or topic.startswith(prefix + ".")
         return pattern == topic
 
-    def subscribers_of(self, identity: str) -> set[str]:
-        with self._lock:
-            return set(self._by_identity.get(identity, set()))
-
     def snapshot(self) -> dict:
-        with self._lock:
-            # routing key 是 ROUTER bytes identity（server.py 用 ident 作为 key），
-            # JSON 序列化需要 str 键。client_id 是 uuid-hex ASCII，decode 无损。
-            return {
-                (k.decode("utf-8", "replace") if isinstance(k, (bytes, bytearray)) else k):
-                    sorted(v)
-                for k, v in self._by_identity.items()
-            }
+        """快照（bytes key decode 为 str，供 JSON 序列化）。"""
+        idx = self._read_index
+        return {
+            (k.decode("utf-8", "replace") if isinstance(k, (bytes, bytearray)) else k):
+                sorted(v) for k, v in idx.by_identity.items()
+        }
