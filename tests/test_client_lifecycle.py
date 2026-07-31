@@ -130,6 +130,38 @@ async def test_consumer_rejects_publish():
         await c.publish("t", {"a": 1})
 
 
+async def test_consumer_run_forever_replaces_sleep():
+    """ConsumerClient.run_forever 替代 asyncio.sleep，收到 stop 后退出。"""
+    cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
+                          username="u", password="p")
+    # 用 monkeypatch 替换 start 为 no-op，避免真实连接
+    async def fake_start():
+        cons._connected = True
+    cons.start = fake_start  # type: ignore
+    # 0.1s 后触发 stop
+    async def stopper():
+        await asyncio.sleep(0.1)
+        cons._stop.set()
+    asyncio.create_task(stopper())
+    await cons.run_forever()  # 应在 stopper 触发后正常返回
+
+
+async def test_run_forever_reraises_reconnect_fatal():
+    """重连致命错误应在 run_forever 主上下文重新抛出。"""
+    cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
+                          username="u", password="p")
+    async def fake_start():
+        cons._connected = True
+    cons.start = fake_start  # type: ignore
+    cons._reconnect_fatal = AuthenticationError("认证失败", reason="invalid_password")
+    async def stopper():
+        await asyncio.sleep(0.05)
+        cons._stop.set()
+    asyncio.create_task(stopper())
+    with pytest.raises(AuthenticationError):
+        await cons.run_forever()
+
+
 async def test_publish_rejects_non_whitelist_type():
     """ProducerClient.publish 直调非白名单类型 → encode 抛 TypeError 冒到调用者。
 

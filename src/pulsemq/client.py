@@ -571,6 +571,35 @@ class Client:
                 logger.debug("心跳发送失败", exc_info=True)
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
 
+    # ----------------------------------------------------------- run_forever
+
+    async def _wait_stop_and_raise_fatal(self) -> None:
+        """等待 _stop 被设置；退出时若有重连致命错误则重新抛出。
+
+        ``_reconnect_loop`` 是后台任务，直接 raise 会被 asyncio GC 吞掉，因此
+        它把致命错误（如认证失败）存到 ``self._reconnect_fatal`` 并 set ``_stop``。
+        本方法在主任务上下文检查并重抛，使 CLI 经 ``exit_code_for`` 拿到 exit 3。
+        """
+        try:
+            await self._stop.wait()
+        finally:
+            fatal = self._reconnect_fatal
+            if fatal is not None:
+                self._reconnect_fatal = None
+                raise fatal
+
+    async def run_forever(self) -> None:
+        """连接 + 注册，运行直到 stop() 或重连致命错误。
+
+        替代手写 asyncio.sleep 的维持模式。重连遇到致命错误（如认证失败）时，
+        在主任务上下文重新抛出，使 CLI 经 exit_code_for 拿到 exit 3。
+        """
+        await self.start()
+        try:
+            await self._wait_stop_and_raise_fatal()
+        finally:
+            await self.stop()
+
     # ------------------------------------------------------------------- stop
 
     async def stop(self) -> None:
@@ -681,21 +710,17 @@ class ProducerClient(Client):
     async def run_forever(self) -> None:
         """连接 + 认证 + 注册，启动所有 producer 调度，运行直到 stop()。
 
-        若后台重连遇到致命错误（如重连认证失败），``_reconnect_loop`` 会把
-        异常存到 ``self._reconnect_fatal`` 并 set ``_stop``；此处 ``_stop.wait``
-        返回后，在主任务上下文重新抛出，使 CLI 经 ``exit_code_for`` 拿到 exit 3。
+        ProducerClient 在基类 ``run_forever`` 框架内插入 ``ProducerManager``
+        的 ``start_all/stop_all``：致命错误重抛交给基类
+        ``_wait_stop_and_raise_fatal`` 统一处理（A1+A2）。
         """
         await self.start()
         try:
             await self._producer_mgr.start_all(self._on_produce)
-            await self._stop.wait()  # stop() 或重连致命错误都会 set _stop
+            await self._wait_stop_and_raise_fatal()
         finally:
             await self._producer_mgr.stop_all()
-            fatal = self._reconnect_fatal
-            if fatal is not None:
-                # 在主任务上下文重新抛出 → CLI 走 exit_code_for → exit 3。
-                self._reconnect_fatal = None
-                raise fatal
+            await self.stop()
 
     async def subscribe(self, topic_pattern: str, callback: Callable,
                         *, header_only: bool = False) -> None:  # type: ignore[override]
