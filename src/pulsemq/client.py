@@ -635,7 +635,6 @@ class ProducerClient(Client):
         topic: str,
         *,
         interval: float = 5.0,
-        cache_size: int = 100_000,
         serializer: str = "msgpack",
         compression: str = "none",
     ) -> Callable:
@@ -646,10 +645,8 @@ class ProducerClient(Client):
                 fn,
                 name=topic,
                 interval=interval,
-                cache_size=cache_size,
                 serializer=serializer,
                 compression=compression,
-                inject_sender=False,
             )
             return fn
 
@@ -659,7 +656,6 @@ class ProducerClient(Client):
         self,
         topic: str,
         *,
-        cache_size: int = 100_000,
         serializer: str = "msgpack",
         compression: str = "none",
     ) -> Callable:
@@ -669,10 +665,8 @@ class ProducerClient(Client):
             self._producer_mgr.register_burst(
                 fn,
                 name=topic,
-                cache_size=cache_size,
                 serializer=serializer,
                 compression=compression,
-                inject_sender=False,
             )
             return fn
 
@@ -693,7 +687,7 @@ class ProducerClient(Client):
         """
         await self.start()
         try:
-            await self._producer_mgr.start_all(self._on_produce, sender_factory=None)
+            await self._producer_mgr.start_all(self._on_produce)
             await self._stop.wait()  # stop() 或重连致命错误都会 set _stop
         finally:
             await self._producer_mgr.stop_all()
