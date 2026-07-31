@@ -4,7 +4,7 @@
 - 顶部：导航栏 + 连接状态 + 版本
 - 指标卡片区：4 个带渐变发光的统计卡片（中文标签 + emoji 图标）
 - 图表区：ECharts 多 topic 流量曲线（记录数 msg/s → 记录数/s）
-  - 分钟粒度，1H / 6H 切换
+  - 分钟粒度，1H / 8H 切换
   - 实时更新当前分钟数据点，30s 自动刷新历史
   - 最多 5 topic 叠加，LRU 淘汰
 - 底部：topic 卡片网格
@@ -352,7 +352,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
       </div>
       <div class="chart-controls">
         <button class="time-btn active" onclick="setTimeRange(60, this)">1 小时</button>
-        <button class="time-btn" onclick="setTimeRange(360, this)">6 小时</button>
+        <button class="time-btn" onclick="setTimeRange(480, this)">8 小时</button>
         <span class="chart-hint" id="chart-hint">点击下方主题叠加曲线</span>
       </div>
     </div>
@@ -363,10 +363,28 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
     <div class="chart-header">
       <div class="chart-title">
         <div class="dot-indicator"></div>
-        <span>端到端延迟分位（毫秒）<span class="chart-hint" style="margin-left:6px">P50 / P95 / P99 实时</span></span>
+        <span>延迟对比（毫秒）<span class="chart-hint" style="margin-left:6px">半程 / 全程 P50 实时</span></span>
       </div>
     </div>
     <div id="latency-chart" style="width:100%;height:320px"></div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>端到端延迟列表<span class="chart-hint" style="margin-left:6px">各 topic 半程/全程分位</span></span>
+      </div>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px;color:#eef2fa">
+      <thead><tr style="color:#8a9ab3;border-bottom:1px solid var(--border)">
+        <th style="text-align:left;padding:8px">Topic</th>
+        <th colspan="3" style="text-align:center;padding:8px">半程 (producer→server)</th>
+        <th colspan="3" style="text-align:center;padding:8px">全程 (producer→consumer)</th>
+        <th style="text-align:center;padding:8px">采样数</th>
+      </tr></thead>
+      <tbody id="latency-list-body"></tbody>
+    </table>
   </div>
 
   <div class="chart-section">
@@ -431,7 +449,8 @@ let state = {
   onlineProducers: 0,
   onlineConsumers: 0,
   totalSubs: 0,
-  latency: { p50: 0, p95: 0, p99: 0 },
+  latencyHalf: {},  // 按 topic 的半程延迟
+  latencyE2e: {},   // 按 topic 的全程延迟
   events: [],
 };
 
@@ -458,13 +477,8 @@ function connectSSE() {
       state.onlineProducers = d.online_producers != null ? d.online_producers : state.onlineProducers;
       state.onlineConsumers = d.online_consumers != null ? d.online_consumers : state.onlineConsumers;
       state.totalSubs = d.total_subscriptions != null ? d.total_subscriptions : state.totalSubs;
-      if (d.latency_p50_ms != null || d.latency_p95_ms != null || d.latency_p99_ms != null) {
-        state.latency = {
-          p50: d.latency_p50_ms != null ? d.latency_p50_ms : state.latency.p50,
-          p95: d.latency_p95_ms != null ? d.latency_p95_ms : state.latency.p95,
-          p99: d.latency_p99_ms != null ? d.latency_p99_ms : state.latency.p99,
-        };
-      }
+      if (d.latency_half != null) state.latencyHalf = d.latency_half;
+      if (d.latency_e2e != null) state.latencyE2e = d.latency_e2e;
       // SSE 事件流（全量替换，无重复）
       if (Array.isArray(d.sse_events)) {
         state.events = d.sse_events.map(e => ({
@@ -706,12 +720,10 @@ function renderLatency() {
     latencyChart = echarts.init($('latency-chart'), null, { renderer: 'canvas' });
     window.addEventListener('resize', () => latencyChart && latencyChart.resize());
   }
-  const data = [
-    { name: 'P50', value: +(state.latency.p50 || 0).toFixed(2) },
-    { name: 'P95', value: +(state.latency.p95 || 0).toFixed(2) },
-    { name: 'P99', value: +(state.latency.p99 || 0).toFixed(2) },
-  ];
-  const colors = ['#34d399', '#fbbf24', '#fb7185'];
+  // 按 topic 展示半程/全程 P50 对比
+  const allTopics = [...new Set([...Object.keys(state.latencyHalf), ...Object.keys(state.latencyE2e)])];
+  const halfP50 = allTopics.map(t => +(state.latencyHalf[t]?.p50_ms || 0));
+  const e2eP50 = allTopics.map(t => +(state.latencyE2e[t]?.p50_ms || 0));
   latencyChart.setOption({
     backgroundColor: 'transparent',
     animation: true, animationDuration: 300,
@@ -722,12 +734,13 @@ function renderLatency() {
       textStyle: { color: '#eef2fa', fontSize: 12 },
       valueFormatter: v => v != null ? v.toFixed(2) + ' ms' : '-',
     },
-    grid: { left: 56, right: 24, top: 28, bottom: 36 },
+    legend: { data: ['半程 P50', '全程 P50'], textStyle: { color: '#8a9ab3' }, top: 4 },
+    grid: { left: 56, right: 24, top: 36, bottom: 36 },
     xAxis: {
-      type: 'category', data: data.map(d => d.name),
+      type: 'category', data: allTopics,
       axisLine: { lineStyle: { color: '#1e3054' } },
       axisTick: { show: false },
-      axisLabel: { color: '#8a9ab3', fontSize: 12 },
+      axisLabel: { color: '#8a9ab3', fontSize: 11, rotate: allTopics.length > 5 ? 30 : 0 },
     },
     yAxis: {
       type: 'value', name: 'ms',
@@ -737,16 +750,28 @@ function renderLatency() {
       axisLabel: { color: '#8a9ab3', fontSize: 11 },
       splitLine: { lineStyle: { color: 'rgba(30,48,84,0.6)', type: 'dashed' } },
     },
-    series: [{
-      type: 'bar', data: data.map((d, i) => ({ value: d.value, itemStyle: { color: colors[i] } })),
-      barWidth: '38%',
-      itemStyle: { borderRadius: [6, 6, 0, 0] },
-      label: {
-        show: true, position: 'top', color: '#eef2fa', fontSize: 12,
-        formatter: p => p.value.toFixed(2) + ' ms',
-      },
-    }],
+    series: [
+      { name: '半程 P50', type: 'bar', data: halfP50, itemStyle: { color: '#34d399', borderRadius: [4,4,0,0] } },
+      { name: '全程 P50', type: 'bar', data: e2eP50, itemStyle: { color: '#60a5fa', borderRadius: [4,4,0,0] } },
+    ],
   }, true);
+  renderLatencyList();
+}
+
+function renderLatencyList() {
+  /* 底部端到端延迟列表：各 topic 的 half/e2e P50/P95/P99 + 采样数 */
+  const topics = [...new Set([...Object.keys(state.latencyHalf), ...Object.keys(state.latencyE2e)])];
+  const fmt = v => (v || 0).toFixed(2);
+  const rows = topics.map(t => {
+    const h = state.latencyHalf[t] || {};
+    const e = state.latencyE2e[t] || {};
+    return `<tr><td>${t}</td>
+      <td>${fmt(h.p50_ms)}</td><td>${fmt(h.p95_ms)}</td><td>${fmt(h.p99_ms)}</td>
+      <td>${fmt(e.p50_ms)}</td><td>${fmt(e.p95_ms)}</td><td>${fmt(e.p99_ms)}</td>
+      <td>${h.count||0}/${e.count||0}</td></tr>`;
+  }).join('');
+  const el = $('latency-list-body');
+  if (el) el.innerHTML = rows || '<tr><td colspan="8" style="text-align:center;color:#8a9ab3">暂无延迟数据</td></tr>';
 }
 
 function pushEvent(e) {
