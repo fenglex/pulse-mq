@@ -43,6 +43,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from pulsemq.control import ControlCmd
+from pulsemq.routing import SubscriptionTable
 from pulsemq.errors import (AuthenticationError, ClientStartupError,
                             ConnectionError)
 from pulsemq.logging_setup import log_event, logger
@@ -121,6 +122,7 @@ class Client:
         self._registered = False
         # pattern -> callback（同步或异步均可）
         self._subscriptions: dict[str, Callable] = {}
+        self._sub_table = SubscriptionTable()  # 前缀索引匹配（D3）
         # pattern -> header_only 标记：True 表示回调只接收 FrameHeader，跳过完整 decode
         self._sub_header_only: dict[str, bool] = {}
         self._recv_task: asyncio.Task | None = None
@@ -533,6 +535,7 @@ class Client:
         """
         self._subscriptions[topic_pattern] = callback
         self._sub_header_only[topic_pattern] = header_only
+        self._sub_table.subscribe(topic_pattern.encode("utf-8"), topic_pattern)
         # 仅在已连接时立即发送；未连接时缓存，start() 末尾会 flush（A3）
         if self._connected:
             await self._send_subscribe(topic_pattern)
@@ -581,9 +584,10 @@ class Client:
                 except Exception:
                     logger.debug("延迟回传发送失败", exc_info=True)
             # 快速过滤：先用 header 的 topic 匹配订阅
-            matched = [(cb, self._sub_header_only.get(p, False))
-                       for p, cb in list(self._subscriptions.items())
-                       if _matches(p, hdr.topic)]
+            matched = [(self._subscriptions.get(pid),
+                        self._sub_header_only.get(pid, False))
+                       for pid in (p.decode("utf-8") for p in self._sub_table.match(hdr.topic))
+                       if pid in self._subscriptions]
             if not matched:
                 continue
             # 有非 header_only 回调时才做完整 decode
