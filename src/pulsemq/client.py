@@ -443,12 +443,31 @@ class Client:
 
     # -------------------------------------------------------------- register
 
+    async def _recv_control_reply(self, expected_id: str, timeout: float) -> dict:
+        """循环 recv 控制面回复直到 request_id 匹配；丢弃不匹配的帧（C3）。
+
+        兼容旧 server（reply 无 request_id）：退化为直接返回。
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            _, reply = await asyncio.wait_for(
+                self._transport.recv("control"), timeout=remaining
+            )
+            msg = frames.decode_control(reply)
+            rid = msg.payload.get("request_id")
+            if rid == expected_id or rid is None:
+                return msg.payload
+
     async def _register(self) -> None:
         """在控制面发送 REGISTER 并等待回复。
 
         - 超时 → ``ClientStartupError(reason="REGISTER_REJECTED")``。
         - result != "OK" → ``ClientStartupError(reason=result)``。
         """
+        req_id = uuid.uuid4().hex
         req = frames.encode_control(
             ControlCmd.REGISTER,
             {
@@ -457,13 +476,12 @@ class Client:
                 "endpoint": self._data_endpoint,
                 "roles": list(self._roles),
                 "topics": list(self._subscriptions),
+                "request_id": req_id,
             },
         )
         await self._transport.send(b"", req, role="control")
         try:
-            _, reply = await asyncio.wait_for(
-                self._transport.recv("control"), timeout=self._register_reply_timeout
-            )
+            payload = await self._recv_control_reply(req_id, self._register_reply_timeout)
         except asyncio.TimeoutError as e:
             raise ClientStartupError(
                 "REGISTER 超时无回复",
@@ -471,8 +489,7 @@ class Client:
                 address=self._control_endpoint,
                 username=self._username,
             ) from e
-        msg = frames.decode_control(reply)
-        result = msg.payload.get("result", "")
+        result = payload.get("result", "")
         if result != "OK":
             raise ClientStartupError(
                 f"REGISTER 被拒: {result}",
@@ -486,19 +503,15 @@ class Client:
     # ------------------------------------------------------------- subscribe
 
     async def _send_subscribe(self, pattern: str) -> None:
-        """发送 SUBSCRIBE 控制帧；回复 fire-and-forget（不阻塞，容错超时）。"""
+        """发送 SUBSCRIBE 控制帧；按 request_id 匹配回复（C3），容错超时。"""
+        req_id = uuid.uuid4().hex
         req = frames.encode_control(
             ControlCmd.SUBSCRIBE,
-            {"client_id": self._client_id, "topic": pattern},
+            {"client_id": self._client_id, "topic": pattern, "request_id": req_id},
         )
         await self._transport.send(b"", req, role="control")
-        # 排空服务端的 SUBSCRIBE ack，避免它在控制面 socket 堆积串扰。
-        # 已知限制：若此刻刚好有一帧心跳 ack 抢先到达，本 recv 会把它当成
-        # SUBSCRIBE ack 消费掉；Spec 1 单客户端 e2e 不影响正确性。
         try:
-            await asyncio.wait_for(
-                self._transport.recv("control"), timeout=0.5
-            )
+            await self._recv_control_reply(req_id, 0.5)
         except asyncio.TimeoutError:
             pass
         except Exception:

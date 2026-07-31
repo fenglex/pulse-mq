@@ -378,6 +378,7 @@ class Server:
         client_id 是 REGISTER/SUBSCRIBE payload 里的 app 字符串，与 ident 不是同一个东西。
         """
         cid = cmd_msg.payload.get("client_id", "")
+        req_id = cmd_msg.payload.get("request_id")
 
         if cmd_msg.cmd == ControlCmd.REGISTER:
             topics = list(cmd_msg.payload.get("topics", []))
@@ -399,7 +400,7 @@ class Server:
                 self._connections.on_connect(
                     cid, info.username, info.endpoint, _role_of(info.roles)
                 )
-            reply = frames.encode_control(cmd_msg.cmd, {"result": result})
+            reply = frames.encode_control(cmd_msg.cmd, {"result": result, "request_id": req_id})
             await self._transport.send(ident, reply, role="control")
             log_event(
                 "INFO", "CLIENT",
@@ -410,7 +411,7 @@ class Server:
             self._registry.heartbeat(cid)
             await self._transport.send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
                 role="control",
             )
 
@@ -423,7 +424,7 @@ class Server:
             self._connections.on_subscribe(cid, self._username_of(cid), pattern)
             await self._transport.send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
                 role="control",
             )
 
@@ -434,7 +435,7 @@ class Server:
             self._connections.on_unsubscribe(cid, self._username_of(cid), pattern)
             await self._transport.send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
                 role="control",
             )
 
@@ -450,7 +451,7 @@ class Server:
             try:
                 await self._transport.send(
                     ident,
-                    frames.encode_control(cmd_msg.cmd, {"result": "OK"}),
+                    frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
                     role="control",
                 )
             except Exception:
