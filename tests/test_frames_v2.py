@@ -37,17 +37,20 @@ def test_encode_decode_roundtrip_dict():
     assert msg.record_count == 1
 
 
-def test_encode_auto_infers_record_count_from_list():
-    """list 类型应自动推断 record_count = len(list)，而非恒为 1。
+def test_encode_infers_record_count_from_dataframe():
+    """DataFrame 行数应自动推断为 record_count，而非恒为 1。
 
-    回归 Bug：record_count 默认 1，且 ``_infer_record_count`` 虽在 docstring
-    中提及但从未实现。导致发送 100 条记录的 list 和发送 1 条 dict 的
+    回归 Bug：record_count 默认 1，导致发送 50 行 DataFrame 与 1 条 dict 的
     record_count 相同，Web UI 消息量显示与实际不符。
+    （原用 list 直发测试；list 现已禁止直发，改用白名单类型 DataFrame。
+    DataFrame 走 msgpack 时内部经 ``to_dict("records")`` 转为 list[dict]，
+    仍走同一条 ``_infer_record_count`` 推断路径，测试意图等价。）
     """
-    data = [{"i": i} for i in range(50)]
-    raw = encode("batch.topic", data, serializer="msgpack")
+    import pandas as pd
+    df = pd.DataFrame([{"i": i} for i in range(50)])
+    raw = encode("batch.topic", df, serializer="msgpack")
     msg = decode(raw)
-    assert msg.record_count == 50, f"list 长度=50，record_count 应为 50，实际={msg.record_count}"
+    assert msg.record_count == 50, f"DataFrame 行数=50，record_count 应为 50，实际={msg.record_count}"
 
 
 def test_encode_does_not_infer_for_scalar():
@@ -58,8 +61,9 @@ def test_encode_does_not_infer_for_scalar():
 
 def test_encode_explicit_record_count_overrides_inference():
     """显式传 record_count 应覆盖自动推断。"""
-    data = [{"i": i} for i in range(10)]
-    raw = encode("t", data, serializer="msgpack", record_count=3)
+    import pandas as pd
+    df = pd.DataFrame([{"i": i} for i in range(10)])
+    raw = encode("t", df, serializer="msgpack", record_count=3)
     assert decode(raw).record_count == 3
 
 
@@ -106,3 +110,29 @@ def test_record_count_field():
     raw = encode("t", {"x": 1}, record_count=42)
     msg = decode(raw)
     assert msg.record_count == 42
+
+
+@pytest.mark.parametrize("bad", [
+    [{"i": 1}],   # list（即便 list[dict] 也禁止直发）
+    42,           # int
+    3.14,         # float
+    None,         # None
+    {1, 2},       # set
+])
+def test_encode_rejects_non_whitelist_type(bad):
+    """非白名单类型应在 encode 时被拒绝。
+
+    白名单仅允许 DataFrame/dict/str/bytes（PubData 语义）。list/int/None 等
+    此前会被打成 data_type=UNKNOWN 静默发送，现强制 raise，避免类型不明数据
+    流入管道后订阅端无法还原。显式传 data_type 的路径（如 encode_control）
+    不经过自动推断分支，不受影响。
+    """
+    with pytest.raises(TypeError):
+        encode("t", bad)
+
+
+def test_encode_accepts_whitelist_types():
+    """4 种白名单类型应正常编码，不触发 UNKNOWN 校验。"""
+    import pandas as pd
+    for data in [pd.DataFrame({"a": [1]}), {"k": 1}, "hello", b"bytes"]:
+        encode("t", data)  # 不 raise 即通过

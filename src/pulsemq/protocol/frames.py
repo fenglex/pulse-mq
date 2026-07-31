@@ -196,6 +196,13 @@ def encode(
     # ---- 1. 推断 data_type ----
     if data_type is None:
         data_type = _infer_data_type(data)
+        # 自动推断得到 UNKNOWN：非白名单类型（list/int/None/set 等），拒绝。
+        # 显式传 data_type（如 encode_control 传 UNKNOWN）不经过此分支，不受影响。
+        if data_type == DataType.UNKNOWN:
+            raise TypeError(
+                f"发送数据必须是 DataFrame/dict/bytes/str 之一，"
+                f"收到 {type(data).__name__}"
+            )
 
     # ---- 2. 校验 + 选择默认序列化器 ----
     if data_type in _SERIALIZER_RULES:

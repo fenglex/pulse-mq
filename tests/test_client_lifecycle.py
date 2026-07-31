@@ -128,3 +128,27 @@ async def test_consumer_rejects_publish():
     )
     with pytest.raises(NotImplementedError):
         await c.publish("t", {"a": 1})
+
+
+async def test_publish_rejects_non_whitelist_type():
+    """ProducerClient.publish 直调非白名单类型 → encode 抛 TypeError 冒到调用者。
+
+    publish 内部第一步即 encode，异常在 send 之前抛出，不会产生半发送；
+    校验失败后连接仍可用，后续发 dict 应正常。
+    """
+    srv, dp, cp = await _start_server({"p": "p"})
+    try:
+        prod = ProducerClient(
+            data_endpoint=f"tcp://127.0.0.1:{dp}",
+            control_endpoint=f"tcp://127.0.0.1:{cp}",
+            username="p",
+            password="p",
+        )
+        await prod.start()
+        with pytest.raises(TypeError):
+            await prod.publish("t", [1, 2, 3])
+        # 校验失败后连接仍可用：发 dict 应正常返回
+        await prod.publish("t", {"ok": True})
+        await prod.stop()
+    finally:
+        await srv.stop()

@@ -2,7 +2,7 @@
 
 集中定义数据白名单类型与 producer 回调签名别名，
 供 ProducerManager / PulsePublisher / PublisherSender 复用，
-与运行时 _infer_record_count / _validate_serializer 的白名单语义一一对应。
+与运行时 frames.encode 的类型校验语义一一对应。
 """
 
 from __future__ import annotations
