@@ -51,9 +51,9 @@ def test_load_history_works_across_threads(tmp_path):
     db = f"sqlite://{tmp_path / 'cross.sqlite'}"
     storage = StatsStorage(db)
     storage.connect()
-    # 主线程写入一条
-    storage.save_minute("cross.topic",
-                        MinuteSlot(timestamp=1000, msg_count=3, record_count=3, bytes_total=30))
+    # 主线程写入一条（通过批量接口）
+    storage.save_minutes_batch({"cross.topic":
+                               MinuteSlot(timestamp=1000, msg_count=3, record_count=3, bytes_total=30)})
     # 主线程能读到
     assert any(h["timestamp"] == 1000 for h in storage.load_history("cross.topic", 0))
 

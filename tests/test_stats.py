@@ -56,7 +56,7 @@ class TestStatsStorage:
         storage.connect()
 
         slot = MinuteSlot(timestamp=100, msg_count=10, record_count=50, bytes_total=1024)
-        storage.save_minute("test_topic", slot)
+        storage.save_minutes_batch({"test_topic": slot})
 
         history = storage.load_history("test_topic", since_ts=0)
         assert len(history) == 1
@@ -88,11 +88,11 @@ class TestStatsStorage:
 
         # 插入旧数据
         old_ts = int(time.time()) - 8 * 86400
-        storage.save_minute("old_topic", MinuteSlot(timestamp=old_ts, msg_count=1))
+        storage.save_minutes_batch({"old_topic": MinuteSlot(timestamp=old_ts, msg_count=1)})
 
         # 插入新数据
         new_ts = int(time.time())
-        storage.save_minute("new_topic", MinuteSlot(timestamp=new_ts, msg_count=2))
+        storage.save_minutes_batch({"new_topic": MinuteSlot(timestamp=new_ts, msg_count=2)})
 
         deleted = storage.cleanup(retention_days=7)
         assert deleted >= 1

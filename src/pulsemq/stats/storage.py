@@ -63,22 +63,6 @@ class StatsStorage:
                 self._conn.close()
                 self._conn = None
 
-    def save_minute(self, topic: str, slot: MinuteSlot) -> None:
-        """同步写入一条分钟记录。"""
-        if self._conn is None:
-            return
-        try:
-            with self._lock:
-                self._conn.execute(
-                    """INSERT OR REPLACE INTO minute_stats
-                       (topic, timestamp, msg_count, record_count, bytes_total)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (topic, slot.timestamp, slot.msg_count, slot.record_count, slot.bytes_total),
-                )
-                self._conn.commit()
-        except Exception:
-            logger.debug("save_minute 失败", exc_info=True)
-
     def save_minutes_batch(self, data: dict[str, MinuteSlot]) -> None:
         """批量写入多条分钟记录。"""
         if self._conn is None or not data:
