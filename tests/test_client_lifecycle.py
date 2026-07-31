@@ -171,6 +171,13 @@ async def test_subscribe_before_start_is_cached():
     assert "market.*" in cons._subscriptions
 
 
+async def test_install_signal_handlers_no_raise():
+    """_install_signal_handlers 在 Windows 静默跳过，不抛异常（A4）。"""
+    cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
+                          username="u", password="p")
+    cons._install_signal_handlers()  # Windows 下应静默跳过
+
+
 async def test_publish_rejects_non_whitelist_type():
     """ProducerClient.publish 直调非白名单类型 → encode 抛 TypeError 冒到调用者。
 

@@ -589,6 +589,19 @@ class Client:
                 self._reconnect_fatal = None
                 raise fatal
 
+    def _install_signal_handlers(self) -> None:
+        """注册 SIGINT/SIGTERM -> _stop.set，Windows 静默跳过（A4）。"""
+        import signal
+        loop = asyncio.get_running_loop()
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is None:
+                continue  # Windows 无 SIGTERM
+            try:
+                loop.add_signal_handler(sig, self._stop.set)
+            except (NotImplementedError, RuntimeError):
+                break  # Windows 不支持 add_signal_handler
+
     async def run_forever(self) -> None:
         """连接 + 注册，运行直到 stop() 或重连致命错误。
 
@@ -596,6 +609,7 @@ class Client:
         在主任务上下文重新抛出，使 CLI 经 exit_code_for 拿到 exit 3。
         """
         await self.start()
+        self._install_signal_handlers()
         try:
             await self._wait_stop_and_raise_fatal()
         finally:
@@ -716,6 +730,7 @@ class ProducerClient(Client):
         ``_wait_stop_and_raise_fatal`` 统一处理（A1+A2）。
         """
         await self.start()
+        self._install_signal_handlers()
         try:
             await self._producer_mgr.start_all(self._on_produce)
             await self._wait_stop_and_raise_fatal()
