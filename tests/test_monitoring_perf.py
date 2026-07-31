@@ -37,9 +37,10 @@ async def test_latency_recorded_on_data_plane():
         for _ in range(20):
             await prod.publish("t.x", {"k": 1})
         await asyncio.sleep(0.5)
-        p = srv._latency.percentiles()
-        assert p["p50_ms"] >= 0.0  # 延迟被采
-        assert srv._latency._total > 0  # 采样次数 > 0
+        snap = srv._lat_half.snapshot()
+        assert "t.x" in snap  # topic 被记录
+        assert snap["t.x"]["count"] > 0  # 采样次数 > 0
+        assert snap["t.x"]["p50_ms"] >= 0.0  # 延迟被采
         await cons.stop()
         await prod.stop()
     finally:
