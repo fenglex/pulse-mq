@@ -79,7 +79,7 @@ async def run_bench(duration: float, records_per_frame: int,
                 serializer=serializer, compression=compression,
                 record_count=rc, data_type=dtype,
             )
-            await prod._transport.send(b"", frame, role="consumer")
+            await prod._transport.send(b"", frame, role="data")
 
     t0 = time.monotonic()
     prod_task = asyncio.create_task(produce())

@@ -185,7 +185,7 @@ async def run_e2e(duration: float, index: int | None = None) -> list[dict]:
                     continue
                 frame = frames.encode("bench.topic", payload, serializer=ser,
                                       compression=comp, data_type=dtype, record_count=rc)
-                await prod._transport.send(b"", frame, role="consumer")
+                await prod._transport.send(b"", frame, role="data")
                 sent += 1
                 # 每帧让出 event loop，让 server _data_loop 和 consumer _recv_loop
                 # 有机会在本帧到达后立即处理，降低端到端延迟（行情场景关键优化）

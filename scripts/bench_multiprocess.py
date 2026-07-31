@@ -192,7 +192,7 @@ async def role_producer(data_type: str, serializer: str, compression: str,
             data_type=dtype,
             record_count=rc,
         )
-        await prod._transport.send(b"", frame, role="consumer")
+        await prod._transport.send(b"", frame, role="data")
         if i % 100 == 0:
             await asyncio.sleep(0)  # 让出事件循环给 ZMQ IO
     t_end = time.monotonic()
