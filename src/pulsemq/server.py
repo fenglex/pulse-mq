@@ -30,7 +30,7 @@ from pulsemq.protocol.msg_type import DataType
 from pulsemq.routing import SubscriptionTable
 from pulsemq.security import CredentialStore
 from pulsemq.stats.connections import ConnectionStats, _role_of
-from pulsemq.stats.latency import LatencyStats
+from pulsemq.stats.latency import LatencyStatsRegistry
 from pulsemq.stats.storage import AsyncArchiveWriter, StatsStorage
 from pulsemq.stats.traffic import TrafficStats
 from pulsemq.transport.router import Transport
@@ -110,7 +110,10 @@ class Server:
         # 显式 latency_sample_rate 覆盖 config；None 时回退到 config。
         rate = (latency_sample_rate if latency_sample_rate is not None
                 else self._cfg.latency_sample_rate)
-        self._latency = LatencyStats(sample_rate=rate)
+        self._lat_half = LatencyStatsRegistry(
+            sample_rate=rate, retention_minutes=self._cfg.stats_retention_minutes)
+        self._lat_e2e = LatencyStatsRegistry(
+            sample_rate=rate, retention_minutes=self._cfg.stats_retention_minutes)
         self._connections = ConnectionStats(
             registry_snapshot_fn=self._registry.snapshot,
             ring_size=self._cfg.event_ring_size,
@@ -159,7 +162,7 @@ class Server:
             start_time=self._start_time,
             token_auth=self._token_auth,
             connection_stats=self._connections,
-            latency_stats=self._latency,
+            latency_stats=self._lat_half,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
@@ -320,8 +323,8 @@ class Server:
         # 与 _on_data_message 一致的轻量统计（仅头部解码）。
         hdr = frames.decode_header(frame)
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
-        if self._latency.should_sample():
-            self._latency.record(time.time_ns() - hdr.timestamp_ns)
+        if self._lat_half.should_sample():
+            self._lat_half.record(hdr.topic, time.time_ns() - hdr.timestamp_ns)
         for target in self._routing.match(spec.name):
             try:
                 self._transport.send_sync_data(target, frame)
@@ -340,8 +343,8 @@ class Server:
             logger.debug("数据面帧头部解码失败，丢弃")
             return
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
-        if self._latency.should_sample():
-            self._latency.record(time.time_ns() - hdr.timestamp_ns)
+        if self._lat_half.should_sample():
+            self._lat_half.record(hdr.topic, time.time_ns() - hdr.timestamp_ns)
         for target in self._routing.match(hdr.topic):
             try:
                 self._transport.send_sync_direct(target, frame_bytes)
@@ -490,6 +493,9 @@ class Server:
                 if archived:
                     # Spec 3：异步归档，不阻塞数据接收循环。
                     await self._archive_writer.enqueue(archived)
+                # 延迟统计分钟滚动（半程 + 全程）
+                self._lat_half.roll_minute()
+                self._lat_e2e.roll_minute()
             except asyncio.CancelledError:
                 break
             except Exception:

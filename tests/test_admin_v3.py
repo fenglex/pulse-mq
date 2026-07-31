@@ -84,7 +84,7 @@ async def test_admin_server_routes_directly():
         # realtime：含 latency_p50_ms + online_users
         rt = await _get(port, "/api/v1/stats/realtime", token="T")
         assert "200" in rt
-        assert "latency_p50_ms" in rt
+        assert "latency_half" in rt
         assert "online_users" in rt
     finally:
         await adm.stop()
@@ -206,7 +206,7 @@ async def test_realtime_has_latency_and_counters():
     try:
         await asyncio.sleep(0.3)
         resp = await _get(ap, "/api/v1/stats/realtime", token="T")
-        assert "latency_p50_ms" in resp and "online_users" in resp
+        assert "latency_half" in resp and "online_users" in resp
     finally:
         await srv.stop()
 

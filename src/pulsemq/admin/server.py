@@ -340,10 +340,9 @@ class AdminServer:
             snap["topics"] = self._traffic.all_topics_snapshot()
         if self._snapshot_fn is not None:
             snap.update(self._snapshot_fn())
-        # Spec 3 监控扩展：延迟分位（统一加 latency_ 前缀，与 API 契约一致）
+        # 延迟快照（按 topic，LatencyStatsRegistry.snapshot()）
         if self._latency is not None:
-            for _k, _v in self._latency.percentiles().items():
-                snap[f"latency_{_k}"] = round(float(_v), 3)
+            snap["latency_half"] = self._latency.snapshot()
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())
