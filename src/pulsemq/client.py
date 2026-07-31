@@ -86,12 +86,27 @@ class Client:
         username: str = "",
         password: str = "",
         client_id: str | None = None,
+        *,
+        heartbeat_interval: float = _HEARTBEAT_INTERVAL,
+        reconnect_initial_delay: float = _RECONNECT_INITIAL_DELAY,
+        reconnect_max_delay: float = _RECONNECT_MAX_DELAY,
+        reconnect_backoff_multiplier: float = _RECONNECT_BACKOFF_MULTIPLIER,
+        reconnect_monitor_timeout: float = _RECONNECT_MONITOR_TIMEOUT,
+        startup_timeout: float = _STARTUP_MONITOR_TIMEOUT,
+        register_reply_timeout: float = _REGISTER_REPLY_TIMEOUT,
     ) -> None:
         self._data_endpoint = data_endpoint
         self._control_endpoint = control_endpoint
         self._username = username
         self._password = password
         self._client_id = client_id or uuid.uuid4().hex
+        self._heartbeat_interval = heartbeat_interval
+        self._reconnect_initial_delay = reconnect_initial_delay
+        self._reconnect_max_delay = reconnect_max_delay
+        self._reconnect_backoff_multiplier = reconnect_backoff_multiplier
+        self._reconnect_monitor_timeout = reconnect_monitor_timeout
+        self._startup_timeout = startup_timeout
+        self._register_reply_timeout = register_reply_timeout
         self._transport = Transport()
         self._connected = False
         self._authenticated = False
@@ -145,7 +160,7 @@ class Client:
         kind: str | None
         try:
             kind = await asyncio.wait_for(
-                self._startup_event, timeout=_STARTUP_MONITOR_TIMEOUT
+                self._startup_event, timeout=self._startup_timeout
             )
         except asyncio.TimeoutError:
             kind = None
@@ -276,7 +291,7 @@ class Client:
         loop = asyncio.get_running_loop()
         creds = (self._username, self._password) if self._username else None
         ident = self._client_id.encode("utf-8")
-        delay = _RECONNECT_INITIAL_DELAY
+        delay = self._reconnect_initial_delay
 
         # 清理旧 transport 与后台任务（保留 _subscriptions 作为恢复源）。
         await self._cancel_bg_tasks()
@@ -309,8 +324,8 @@ class Client:
                     await self._safe_close(in_flight)
                     in_flight = None
                     await self._backoff_sleep(delay)
-                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
-                                _RECONNECT_MAX_DELAY)
+                    delay = min(delay * self._reconnect_backoff_multiplier,
+                                self._reconnect_max_delay)
                     continue
 
                 # 等待认证裁定。
@@ -318,7 +333,7 @@ class Client:
                 try:
                     kind = await asyncio.wait_for(
                         self._startup_event,
-                        timeout=_RECONNECT_MONITOR_TIMEOUT,
+                        timeout=self._reconnect_monitor_timeout,
                     )
                 except asyncio.TimeoutError:
                     kind = None
@@ -343,8 +358,8 @@ class Client:
                     await self._safe_close(in_flight)
                     in_flight = None
                     await self._backoff_sleep(delay)
-                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
-                                _RECONNECT_MAX_DELAY)
+                    delay = min(delay * self._reconnect_backoff_multiplier,
+                                self._reconnect_max_delay)
                     continue
 
                 # 认证通过：把 new_transport 提交给 self._transport，使 _register
@@ -376,8 +391,8 @@ class Client:
                     self._transport = Transport()  # 占位，避免 stop/close 拿到坏的
                     in_flight = None
                     await self._backoff_sleep(delay)
-                    delay = min(delay * _RECONNECT_BACKOFF_MULTIPLIER,
-                                _RECONNECT_MAX_DELAY)
+                    delay = min(delay * self._reconnect_backoff_multiplier,
+                                self._reconnect_max_delay)
                     continue
 
                 # 成功：重启后台循环，恢复运行期 monitor，清掉之前的致命错误。
@@ -443,7 +458,7 @@ class Client:
         await self._transport.send(b"", req, role="control")
         try:
             _, reply = await asyncio.wait_for(
-                self._transport.recv("control"), timeout=_REGISTER_REPLY_TIMEOUT
+                self._transport.recv("control"), timeout=self._register_reply_timeout
             )
         except asyncio.TimeoutError as e:
             raise ClientStartupError(
@@ -570,7 +585,7 @@ class Client:
                 await self._transport.send(b"", hb, role="control")
             except Exception:
                 logger.debug("心跳发送失败", exc_info=True)
-            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+            await asyncio.sleep(self._heartbeat_interval)
 
     # ----------------------------------------------------------- run_forever
 

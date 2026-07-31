@@ -178,6 +178,15 @@ async def test_install_signal_handlers_no_raise():
     cons._install_signal_handlers()  # Windows 下应静默跳过
 
 
+def test_client_accepts_reconnect_params():
+    """Client.__init__ 接受重连/心跳/超时参数（B2）。"""
+    cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
+                          username="u", password="p",
+                          heartbeat_interval=2.5, reconnect_max_delay=60.0)
+    assert cons._heartbeat_interval == 2.5
+    assert cons._reconnect_max_delay == 60.0
+
+
 async def test_publish_rejects_non_whitelist_type():
     """ProducerClient.publish 直调非白名单类型 → encode 抛 TypeError 冒到调用者。
 
