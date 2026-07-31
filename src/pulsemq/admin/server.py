@@ -19,7 +19,6 @@ from loguru import logger
 from pulsemq._version import __version__ as _PKG_VERSION
 from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.web_ui import INDEX_HTML
-from pulsemq.cache.topic_buffer import TopicBufferRegistry
 from pulsemq.stats.storage import StatsStorage
 from pulsemq.stats.traffic import TrafficStats
 
@@ -62,7 +61,6 @@ class AdminServer:
         self,
         bind: str = "0.0.0.0:9090",
         traffic_stats: TrafficStats | None = None,
-        topic_buffers: TopicBufferRegistry | None = None,
         stats_storage: StatsStorage | None = None,
         snapshot_fn: Callable[[], dict] | None = None,
         start_time: float | None = None,
@@ -76,7 +74,6 @@ class AdminServer:
         self._host = host
         self._port = int(port)
         self._traffic = traffic_stats
-        self._buffers = topic_buffers
         self._storage = stats_storage
         self._snapshot_fn = snapshot_fn
         self._start_time = start_time or time.time()
@@ -341,8 +338,6 @@ class AdminServer:
         snap: dict[str, Any] = {}
         if self._traffic is not None:
             snap["topics"] = self._traffic.all_topics_snapshot()
-        if self._buffers is not None:
-            snap["cache_sizes"] = self._buffers.snapshot()
         if self._snapshot_fn is not None:
             snap.update(self._snapshot_fn())
         # Spec 3 监控扩展：延迟分位（统一加 latency_ 前缀，与 API 契约一致）
@@ -401,7 +396,6 @@ class AdminServer:
         if self._traffic is None:
             return {"topic_count": 0, "topics": []}
         all_data = self._traffic.all_topics_snapshot()
-        cache_sizes = self._buffers.snapshot() if self._buffers else {}
         topics = []
         for topic, data in all_data.items():
             topics.append({
@@ -410,7 +404,6 @@ class AdminServer:
                 "msg_count_current": data["msg_count_current"],
                 "record_count_current": data["record_count_current"],
                 "bytes_total_current": data["bytes_total_current"],
-                "cache": cache_sizes.get(topic, {"current": 0, "max": 0}),
             })
         return {"topic_count": len(topics), "topics": topics}
 

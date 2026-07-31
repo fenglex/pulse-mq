@@ -6,8 +6,6 @@
   Transport.send 调 send_multipart([identity_bytes, frame])，必须传 bytes。
 - Server 持有 client_id→ident 映射，用于心跳超时清理 routing（client_id 与
   ROUTER identity 不是同一个东西）。
-- 不维护 topic 缓存（Spec 1 §9.2 admin 服务沿用现有 AdminServer；topic_buffers
-  传 None，AdminServer 已对 None 做了容忍）。
 """
 from __future__ import annotations
 
@@ -153,7 +151,6 @@ class Server:
         self._admin = AdminServer(
             bind=self._admin_endpoint,
             traffic_stats=self._stats,
-            topic_buffers=None,  # Spec 1 不维护 topic 缓存
             stats_storage=self._storage,
             snapshot_fn=lambda: {
                 "online_clients": self._registry.snapshot(),

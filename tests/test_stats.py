@@ -1,4 +1,4 @@
-"""流量统计与缓存单元测试。"""
+"""流量统计单元测试。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import time
 
 from pulsemq.stats.traffic import TrafficStats, MinuteSlot
 from pulsemq.stats.storage import StatsStorage
-from pulsemq.cache.topic_buffer import TopicBuffer, TopicBufferRegistry
 
 
 class TestTrafficStats:
@@ -101,66 +100,3 @@ class TestStatsStorage:
 
         storage.close()
 
-
-class TestTopicBuffer:
-    def test_append_and_size(self) -> None:
-        buf = TopicBuffer("test", max_size=5)
-        for i in range(10):
-            buf.append(i, f"frame_{i}".encode())
-        # deque(maxlen=5) 只保留最后 5 条
-        assert buf.size == 5
-
-    def test_snapshot_since(self) -> None:
-        buf = TopicBuffer("test", max_size=100)
-        for i in range(10):
-            buf.append(i * 100, f"f{i}".encode())
-        result = buf.snapshot(since_ns=500)
-        assert all(m.timestamp_ns > 500 for m in result)
-
-    def test_snapshot_limit(self) -> None:
-        buf = TopicBuffer("test", max_size=100)
-        for i in range(50):
-            buf.append(i, f"f{i}".encode())
-        result = buf.snapshot(since_ns=0, limit=10)
-        assert len(result) == 10
-
-
-class TestTopicBufferRegistry:
-    def test_get_or_create(self) -> None:
-        reg = TopicBufferRegistry()
-        buf1 = reg.get_or_create("topic_a", 1000)
-        buf2 = reg.get_or_create("topic_a", 2000)  # 已存在，忽略 max_size
-        assert buf1 is buf2
-        assert buf1.size == 0
-
-    def test_snapshot(self) -> None:
-        reg = TopicBufferRegistry()
-        reg.get_or_create("a", 10).append(1, b"f")
-        reg.get_or_create("b", 10).append(1, b"f")
-        snap = reg.snapshot()
-        # snapshot 现在返回 {topic: {current, max}}
-        assert snap == {
-            "a": {"current": 1, "max": 10},
-            "b": {"current": 1, "max": 10},
-        }
-
-    def test_evict_by_record_count(self) -> None:
-        """缓存按累计记录数淘汰，而非帧数。
-
-        DataFrame 一批 N 条占 N 的配额：append 两帧（各 60 条记录），
-        上限 100，则第一帧被淘汰，只留第二帧。
-        """
-        buf = TopicBuffer("t", max_size=100)
-        buf.append(1, b"f1", record_count=60)
-        buf.append(2, b"f2", record_count=60)
-        # 60+60=120 > 100，淘汰第一帧（60 条），剩第二帧（60 条）
-        assert buf.size == 1                      # 只剩 1 帧
-        assert buf.total_records == 60            # 累计 60 条记录
-        assert buf.max_records == 100
-
-    def test_single_frame_exceeds_limit_kept(self) -> None:
-        """单帧就超限时仍保留该帧（避免缓存为空）。"""
-        buf = TopicBuffer("t", max_size=10)
-        buf.append(1, b"big", record_count=1000)
-        assert buf.size == 1
-        assert buf.total_records == 1000

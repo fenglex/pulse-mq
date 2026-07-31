@@ -201,7 +201,6 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 .topic-card .info span{display:flex;align-items:center;gap:4px}
 .topic-card .rate{color:var(--accent-green);font-weight:600}
 .topic-card .rec{color:var(--accent-amber)}
-.topic-card .cache{color:var(--text-muted)}
 .empty{text-align:center;padding:48px;color:var(--text-muted);font-size:13px}
 
 /* ===== 事件流 ===== */
@@ -424,7 +423,6 @@ const MAX_SELECTED = 5;
 
 let state = {
   topics: {},
-  cache_sizes: {},
   history_cache: {},
   selected: [],
   uptime: 0,
@@ -450,7 +448,6 @@ function connectSSE() {
     try {
       const d = JSON.parse(ev.data);
       state.topics = d.topics || {};
-      state.cache_sizes = d.cache_sizes || {};
       if (d.start_time && d.server_time) {
         state.uptime = d.server_time - d.start_time;
       } else if (d.uptime_seconds != null) {
@@ -571,7 +568,6 @@ function render() {
       <div class="name"><span class="dot" style="background:${color};color:${color}"></span>${esc(name)}</div>
       <div class="info">
         <span class="rate">⚡ ${(t.record_rate_1min||0).toFixed(1)} 条/秒</span>
-        <span class="cache">💾 缓存 ${formatCache(state.cache_sizes[name])}</span>
       </div>
     </div>`;
   }).join('');
@@ -693,17 +689,6 @@ function formatBytesRate(bps) {
   if (bps < 1048576) return (bps/1024).toFixed(1) + ' KB/s';
   if (bps < 1073741824) return (bps/1048576).toFixed(1) + ' MB/s';
   return (bps/1073741824).toFixed(2) + ' GB/s';
-}
-
-function formatCache(c) {
-  // c: {current, max} 或旧版数字
-  if (c == null) return '0';
-  if (typeof c === 'number') return c.toLocaleString();
-  const cur = c.current || 0, max = c.max || 0;
-  if (max <= 0) return cur.toLocaleString();
-  const pct = cur / max;
-  const suffix = pct >= 0.99 ? '（满）' : (pct >= 0.9 ? '（接近满）' : '');
-  return cur.toLocaleString() + ' / ' + max.toLocaleString() + suffix;
 }
 
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
