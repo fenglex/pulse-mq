@@ -118,7 +118,13 @@ async def test_run_forever_reraises_reconnect_auth_failure():
 
     # run_forever 内部会 start()，所以这里不再预启动。
     rf_task = asyncio.create_task(producer.run_forever())
-    await asyncio.sleep(0.5)  # 让 start() + producer 调度起来进入主循环
+    # 等 start() 完成（批量跑中固定 0.5s 可能不够，REGISTER 未完成就停 server
+    # 会导致 ClientStartupError 而非期望的 AuthenticationError，用轮询确认 connected）
+    for _ in range(30):
+        if producer._connected:
+            break
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(0.3)  # producer 调度稳定后进入主循环
     try:
         # 断开 server → producer 检测 disconnected → _reconnect_loop。
         await srv.stop()
