@@ -138,7 +138,7 @@ class Client:
         self._startup_event = asyncio.get_running_loop().create_future()
         self._transport.set_monitor_callback(self._on_startup_monitor)
         await self._transport.connect(
-            self._data_endpoint, "consumer", credentials=creds,
+            self._data_endpoint, "data", credentials=creds,
             monitor=True, identity=ident,
         )
 
@@ -302,7 +302,7 @@ class Client:
                 new_transport.set_monitor_callback(self._on_reconnect_monitor)
                 try:
                     await new_transport.connect(
-                        self._data_endpoint, "consumer",
+                        self._data_endpoint, "data",
                         credentials=creds, monitor=True, identity=ident,
                     )
                 except Exception:
@@ -509,7 +509,7 @@ class Client:
                       data_type: int | None = None) -> None:
         frame = frames.encode(topic, data, serializer=serializer,
                               compression=compression, data_type=data_type)
-        await self._transport.send(b"", frame, role="consumer")
+        await self._transport.send(b"", frame, role="data")
 
     # -------------------------------------------------------------- recv loop
 
@@ -521,7 +521,7 @@ class Client:
         """
         while not self._stop.is_set():
             try:
-                _, frame_bytes = await self._transport.recv("consumer")
+                _, frame_bytes = await self._transport.recv("data")
             except asyncio.CancelledError:
                 break
             except Exception:
