@@ -149,8 +149,8 @@ async def main():
     def on_msg(msg):
         print(msg.topic, msg.payload, msg.timestamp_ns)
 
-    await cons.subscribe("market.*", on_msg)
-    await asyncio.sleep(3600)  # 持续接收
+    await cons.subscribe("market.*", on_msg)  # 可在 start 前预注册（A3）
+    await cons.run_forever()  # 运行直到 Ctrl+C，重连致命错误自动抛出
 
 asyncio.run(main())
 ```
@@ -274,8 +274,8 @@ asyncio.run(main())
 
 - 4 个指标卡片：活跃主题、消息量/秒、流量/秒、运行时间
 - 4 个客户端卡片：在线用户、生产者数、消费者数、订阅数
-- ECharts 流量趋势折线图（分钟级，1H/6H 切换，最多 5 topic 叠加）
-- 延迟 P50/P95/P99 柱状图
+- ECharts 流量趋势折线图（分钟级，1H/8H 切换，最多 5 topic 叠加）
+- 延迟对比图（按 topic 半程/全程 P50）+ 底部端到端延迟列表（P50/P95/P99）
 - 实时事件流（认证/连接/断线）
 - 在线 Client 详情弹窗
 
@@ -321,7 +321,7 @@ topic(N) ts(8 BE ns) record_count(4 BE) payload(变长) [CRC32?(4)]
 ```
 
 - `magic` = `"PM"`
-- `msg_type` = DATA(0x01) / CONTROL(0x02) / HEARTBEAT(0x03) / ADMIN(0x04)
+- `msg_type` = DATA(0x01) / CONTROL(0x02)
 - `flags` = 编码序列化器(3bit) + 压缩算法(2bit) + CRC(1bit)
 - `data_type` = UNKNOWN(0x00) / DICT(0x01) / DATAFRAME(0x02) / STR(0x03) / BYTES(0x04)
 - `record_count` 上限 **1,000,000**
@@ -459,8 +459,14 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 | `PULSEMQ_ADMIN_BIND` | 管理 HTTP 绑定地址 | `0.0.0.0:9090` |
 | `PULSEMQ_CREDENTIALS_FILE` | 凭据 TOML 路径 | `./data/pulsemq_users.toml` |
 | `PULSEMQ_ADMIN_TOKEN` | 监控接口 token（覆盖随机生成） | 自动生成 |
-| `PULSEMQ_SNDHWM` | ZMQ 发送高水位（帧数） | `1000` |
-| `PULSEMQ_RCVHWM` | ZMQ 接收高水位（帧数） | `1000` |
+| `PULSEMQ_SNDHWM` | ZMQ 发送高水位（帧数） | `10000` |
+| `PULSEMQ_RCVHWM` | ZMQ 接收高水位（帧数） | `10000` |
+| `PULSEMQ_HEARTBEAT_TIMEOUT` | 心跳超时（秒） | `6.0` |
+| `PULSEMQ_LATENCY_SAMPLE_RATE` | 延迟采样率（0-1） | `0.01` |
+| `PULSEMQ_RETENTION_DAYS` | SQLite 统计保留天数 | `7` |
+| `PULSEMQ_BCRYPT_COST` | bcrypt 代价因子 | `12` |
+| `PULSEMQ_SSE_INTERVAL` | SSE 推送间隔（秒） | `1.0` |
+| `PULSEMQ_STATS_RETENTION_MINUTES` | 内存统计窗口（分钟） | `480` |
 
 ### 配置文件（TOML）
 
@@ -470,7 +476,17 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 
 ## 更新日志
 
-### v7.2.3 (current)
+### v8.0.0 (current)
+
+- **延迟监控** - 按 topic 的半程(producer->server)+全程(producer->consumer)延迟，分钟窗口+8h 历史，consumer 采样回传，Web UI 对比图+底部列表
+- **客户端生命周期** - `Client.run_forever()` 上提到基类（消费者不再需要 asyncio.sleep），修复重连致命错误静默吞没；subscribe 支持 start 前预注册；SIGINT/SIGTERM 优雅退出
+- **性能优化** - `SubscriptionTable` COW 无锁读；客户端订阅匹配改前缀索引；序列化器 import 提模块级
+- **控制面** - reply 关联 request_id，解决多订阅 ack 串扰
+- **配置** - ClientConfig 接入 Client；HWM 默认 10000；ServerConfig 常用字段支持环境变量覆盖
+- **清理** - 删除 cache/、inject_sender、MsgType.HEARTBEAT/ADMIN、ControlCmd.KICK、save_minute 等死代码
+- **Web UI** - 延迟对比图+底部列表；流量趋势图 6H->8H
+
+### v7.2.3
 
 - **修复 AdminServer 关闭时 RuntimeWarning** - 线程 loop 关闭前取消未完成任务
 - **修复 Ctrl+C 优雅关闭超时** - `run_server` 等待 `server.stop()` 完成，10s 超时强制退出
