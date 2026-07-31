@@ -162,6 +162,15 @@ async def test_run_forever_reraises_reconnect_fatal():
         await cons.run_forever()
 
 
+async def test_subscribe_before_start_is_cached():
+    """start 前调用 subscribe 应缓存，不抛异常（A3）。"""
+    cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
+                          username="u", password="p")
+    # 未 start，transport 未就绪
+    await cons.subscribe("market.*", lambda m: None)
+    assert "market.*" in cons._subscriptions
+
+
 async def test_publish_rejects_non_whitelist_type():
     """ProducerClient.publish 直调非白名单类型 → encode 抛 TypeError 冒到调用者。
 

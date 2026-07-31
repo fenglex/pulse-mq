@@ -485,7 +485,6 @@ class Client:
         except Exception:
             logger.debug("SUBSCRIBE 排空 ack 失败", exc_info=True)
 
-    @require_connected
     async def subscribe(self, topic_pattern: str, callback: Callable,
                         *, header_only: bool = False) -> None:
         """订阅 topic 模式。
@@ -498,7 +497,9 @@ class Client:
         """
         self._subscriptions[topic_pattern] = callback
         self._sub_header_only[topic_pattern] = header_only
-        await self._send_subscribe(topic_pattern)
+        # 仅在已连接时立即发送；未连接时缓存，start() 末尾会 flush（A3）
+        if self._connected:
+            await self._send_subscribe(topic_pattern)
 
     # ---------------------------------------------------------------- publish
 
