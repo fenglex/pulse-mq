@@ -11,7 +11,6 @@ class ControlCmd:
     SUBSCRIBE = "SUBSCRIBE"
     UNSUBSCRIBE = "UNSUBSCRIBE"
     DISCONNECT = "DISCONNECT"
-    KICK = "KICK"
 
 
 @dataclass

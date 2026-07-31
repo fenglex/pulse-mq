@@ -1,11 +1,9 @@
-"""帧类型。Spec 1：DATA/CONTROL/HEARTBEAT/ADMIN。"""
+"""帧类型。Spec 1：DATA/CONTROL。"""
 
 
 class MsgType:
     DATA = 0x01
     CONTROL = 0x02
-    HEARTBEAT = 0x03
-    ADMIN = 0x04
 
 
 class DataType:

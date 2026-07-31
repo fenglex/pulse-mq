@@ -15,8 +15,6 @@ class TestMsgType:
         from pulsemq.protocol.msg_type import MsgType
         assert MsgType.DATA == 0x01
         assert MsgType.CONTROL == 0x02
-        assert MsgType.HEARTBEAT == 0x03
-        assert MsgType.ADMIN == 0x04
 
 
 class TestDataType:
