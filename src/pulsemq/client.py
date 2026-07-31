@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import random
+import time
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -96,6 +98,7 @@ class Client:
         register_reply_timeout: float = _REGISTER_REPLY_TIMEOUT,
         sndhwm: int = 10000,
         rcvhwm: int = 10000,
+        latency_sample_rate: float = 0.01,
     ) -> None:
         self._data_endpoint = data_endpoint
         self._control_endpoint = control_endpoint
@@ -111,6 +114,7 @@ class Client:
         self._register_reply_timeout = register_reply_timeout
         self._sndhwm = sndhwm
         self._rcvhwm = rcvhwm
+        self._latency_sample_rate = latency_sample_rate
         self._transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)
         self._connected = False
         self._authenticated = False
@@ -565,6 +569,17 @@ class Client:
             except Exception:
                 logger.debug("client 帧头部解码失败，丢弃")
                 continue
+            # 端到端延迟采样回传（4.4）
+            if self._latency_sample_rate > 0 and random.random() < self._latency_sample_rate:
+                try:
+                    latency_ns = time.time_ns() - hdr.timestamp_ns
+                    rep = frames.encode_control(
+                        ControlCmd.LATENCY_REPORT,
+                        {"topic": hdr.topic, "latency_ns": latency_ns},
+                    )
+                    await self._transport.send(b"", rep, role="control")
+                except Exception:
+                    logger.debug("延迟回传发送失败", exc_info=True)
             # 快速过滤：先用 header 的 topic 匹配订阅
             matched = [(cb, self._sub_header_only.get(p, False))
                        for p, cb in list(self._subscriptions.items())
