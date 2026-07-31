@@ -181,7 +181,7 @@ class SyncDataThread:
                  auth: PlainAuthDict | None = None,
                  on_auth: AuthCallback | None = None,
                  loop: asyncio.AbstractEventLoop | None = None,
-                 sndhwm: int = 1000, rcvhwm: int = 1000) -> None:
+                 sndhwm: int = 10000, rcvhwm: int = 10000) -> None:
         self._ctx = ctx
         self._endpoint = endpoint
         self._auth = auth
@@ -274,7 +274,7 @@ class Transport:
     """数据面/控制面 ROUTER(serve) 或 DEALER(client)。"""
 
     def __init__(self, ctx: zmq.asyncio.Context | None = None,
-                 *, sndhwm: int = 1000, rcvhwm: int = 1000) -> None:
+                 *, sndhwm: int = 10000, rcvhwm: int = 10000) -> None:
         self._ctx = ctx or zmq.asyncio.Context.instance()
         self._sockets: dict[str, zmq.asyncio.Socket] = {}
         self._zaps: list[AsyncZAPHandler] = []

@@ -94,6 +94,8 @@ class Client:
         reconnect_monitor_timeout: float = _RECONNECT_MONITOR_TIMEOUT,
         startup_timeout: float = _STARTUP_MONITOR_TIMEOUT,
         register_reply_timeout: float = _REGISTER_REPLY_TIMEOUT,
+        sndhwm: int = 10000,
+        rcvhwm: int = 10000,
     ) -> None:
         self._data_endpoint = data_endpoint
         self._control_endpoint = control_endpoint
@@ -107,7 +109,9 @@ class Client:
         self._reconnect_monitor_timeout = reconnect_monitor_timeout
         self._startup_timeout = startup_timeout
         self._register_reply_timeout = register_reply_timeout
-        self._transport = Transport()
+        self._sndhwm = sndhwm
+        self._rcvhwm = rcvhwm
+        self._transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)
         self._connected = False
         self._authenticated = False
         self._registered = False
@@ -310,7 +314,7 @@ class Client:
         in_flight: Transport | None = None
         try:
             while not self._stop.is_set():
-                new_transport = Transport()
+                new_transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)
                 in_flight = new_transport
                 # 准备本次重连的认证裁定 future。
                 self._startup_event = loop.create_future()
@@ -388,7 +392,7 @@ class Client:
                                  exc_info=True)
                     # in_flight == self._transport == new_transport，关掉它。
                     await self._safe_close(in_flight)
-                    self._transport = Transport()  # 占位，避免 stop/close 拿到坏的
+                    self._transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)  # 占位，避免 stop/close 拿到坏的
                     in_flight = None
                     await self._backoff_sleep(delay)
                     delay = min(delay * self._reconnect_backoff_multiplier,

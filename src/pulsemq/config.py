@@ -35,8 +35,8 @@ class ServerConfig:
     admin_thread: bool = True
     ui_enabled: bool = True
     retention_days: int = 7
-    sndhwm: int = 1000   # ZMQ 发送高水位（帧数），大 payload 可调低控制内存
-    rcvhwm: int = 1000   # ZMQ 接收高水位（帧数）
+    sndhwm: int = 10000   # ZMQ 发送高水位（帧数），大 payload 可调低控制内存
+    rcvhwm: int = 10000   # ZMQ 接收高水位（帧数）
 
     def __post_init__(self) -> None:
         """确保 data/ 目录存在，日志/SQLite/凭据/token 等运行时文件统一存放。"""
@@ -54,6 +54,8 @@ class ClientConfig:
     reconnect_initial_delay: float = 1.0
     reconnect_max_delay: float = 30.0
     reconnect_backoff_multiplier: float = 2.0
+    sndhwm: int = 10000
+    rcvhwm: int = 10000
 
 
 def _read_toml(path: str | None) -> dict:
