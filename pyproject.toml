@@ -1,6 +1,6 @@
 [project]
 name = "pulse-mq"
-version = "7.3.0"
+version = "7.4.0"
 description = "高性能 Client/Server 消息中间件 — ZeroMQ ROUTER/DEALER + bcrypt 认证 + 实时监控"
 readme = "README.md"
 license = "MIT"
