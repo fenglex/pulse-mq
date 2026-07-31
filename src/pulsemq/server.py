@@ -460,6 +460,12 @@ class Server:
             except Exception:
                 logger.debug("DISCONNECT 回执发送失败（peer 已离开），忽略")
 
+        elif cmd_msg.cmd == ControlCmd.LATENCY_REPORT:
+            # consumer 回传端到端延迟，fire-and-forget 无 ack
+            topic = cmd_msg.payload.get("topic", "")
+            latency_ns = int(cmd_msg.payload.get("latency_ns", 0))
+            if topic and latency_ns > 0:
+                self._lat_e2e.record(topic, latency_ns)
         else:
             logger.debug("未知控制命令: {}", cmd_msg.cmd)
 

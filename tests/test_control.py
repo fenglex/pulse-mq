@@ -88,3 +88,17 @@ def test_unsubscribe_updates_registry_topics():
     reg.register(info)
     reg.unsubscribe("c1", "market.*")
     assert reg.snapshot()["clients"][0]["topics"] == ["news"]
+
+
+async def test_latency_report_recorded():
+    """LATENCY_REPORT 命令记入 _lat_e2e registry。"""
+    from pulsemq.server import Server
+    srv = Server(credentials={"p": "p"}, admin_token="T", latency_sample_rate=1.0)
+    msg = ControlMessage(
+        cmd=ControlCmd.LATENCY_REPORT,
+        payload={"topic": "t.x", "latency_ns": 1_000_000},
+    )
+    await srv._dispatch_control(b"id1", msg)
+    snap = srv._lat_e2e.snapshot()
+    assert "t.x" in snap
+    assert snap["t.x"]["count"] == 1
