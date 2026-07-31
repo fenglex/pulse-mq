@@ -23,6 +23,19 @@ def test_client_config_defaults():
     assert cfg.client_id  # 自动生成非空
 
 
+def test_env_overrides(monkeypatch):
+    """ServerConfig 常用字段支持环境变量覆盖（C2）。"""
+    monkeypatch.setenv("PULSEMQ_HEARTBEAT_TIMEOUT", "10.0")
+    monkeypatch.setenv("PULSEMQ_LATENCY_SAMPLE_RATE", "0.05")
+    monkeypatch.setenv("PULSEMQ_RETENTION_DAYS", "14")
+    monkeypatch.setenv("PULSEMQ_BCRYPT_COST", "14")
+    cfg = load_server_config(None)
+    assert cfg.heartbeat_timeout == 10.0
+    assert cfg.latency_sample_rate == 0.05
+    assert cfg.retention_days == 14
+    assert cfg.bcrypt_cost == 14
+
+
 def test_load_server_config_from_toml(tmp_path):
     p = tmp_path / "s.toml"
     p.write_text(

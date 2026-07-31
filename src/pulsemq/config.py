@@ -125,6 +125,18 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         cfg.sndhwm = int(v)
     if (v := _env("PULSEMQ_RCVHWM")):
         cfg.rcvhwm = int(v)
+    if (v := _env("PULSEMQ_HEARTBEAT_TIMEOUT")):
+        cfg.heartbeat_timeout = float(v)
+    if (v := _env("PULSEMQ_LATENCY_SAMPLE_RATE")):
+        cfg.latency_sample_rate = float(v)
+    if (v := _env("PULSEMQ_RETENTION_DAYS")):
+        cfg.retention_days = int(v)
+    if (v := _env("PULSEMQ_BCRYPT_COST")):
+        cfg.bcrypt_cost = int(v)
+    if (v := _env("PULSEMQ_SSE_INTERVAL")):
+        cfg.sse_interval = float(v)
+    if (v := _env("PULSEMQ_STATS_RETENTION_MINUTES")):
+        cfg.stats_retention_minutes = int(v)
     return cfg
 
 
