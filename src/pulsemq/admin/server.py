@@ -68,6 +68,7 @@ class AdminServer:
         *,
         connection_stats=None,
         latency_stats=None,
+        latency_e2e_stats=None,
         admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
@@ -81,6 +82,7 @@ class AdminServer:
         # Spec 3 监控扩展：连接/延迟统计 + 独立线程模式
         self._connections = connection_stats
         self._latency = latency_stats
+        self._latency_e2e = latency_e2e_stats
         self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
@@ -317,6 +319,27 @@ class AdminServer:
                     await self._respond_json(writer, 200, self._topic_history(topic, minutes))
                     return
 
+        # /api/v1/latency/topics/{topic}/history?minutes=60&kind=half|e2e
+        lat_prefix = "/api/v1/latency/topics/"
+        if method == "GET" and path.startswith(lat_prefix):
+            rest = path[len(lat_prefix):]
+            if rest:
+                parts = rest.split("/", 1)
+                topic = parts[0]
+                if len(parts) == 2 and parts[1] == "history":
+                    minutes = 60
+                    try:
+                        minutes = int(query.get("minutes", ["60"])[0])
+                    except (ValueError, IndexError):
+                        pass
+                    kind = query.get("kind", ["half"])[0]
+                    reg = self._latency_e2e if kind == "e2e" else self._latency
+                    if reg is not None:
+                        await self._respond_json(writer, 200, reg.get_history(topic, minutes))
+                    else:
+                        await self._respond_json(writer, 200, [])
+                    return
+
         if method == "GET" and path == "/api/v1/system/status":
             await self._respond_json(writer, 200, self._system_status())
             return
@@ -343,6 +366,8 @@ class AdminServer:
         # 延迟快照（按 topic，LatencyStatsRegistry.snapshot()）
         if self._latency is not None:
             snap["latency_half"] = self._latency.snapshot()
+        if self._latency_e2e is not None:
+            snap["latency_e2e"] = self._latency_e2e.snapshot()
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())

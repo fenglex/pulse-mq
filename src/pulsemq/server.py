@@ -163,6 +163,7 @@ class Server:
             token_auth=self._token_auth,
             connection_stats=self._connections,
             latency_stats=self._lat_half,
+            latency_e2e_stats=self._lat_e2e,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
