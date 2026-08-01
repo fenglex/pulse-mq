@@ -26,6 +26,21 @@ except ImportError:
 MAGIC = b"PM"
 VERSION = 0x01
 
+# topic bytes → str 缓存：同一 topic 反复 decode_header 时避免重复 UTF-8 decode。
+# 有界缓存：超过上限后不再缓存新 topic（仍正确，只是退化为每次 decode）。
+_TOPIC_INTERN: dict[bytes, str] = {}
+_TOPIC_INTERN_MAX = 10000
+
+
+def _intern_topic(topic_bytes: bytes) -> str:
+    """缓存 topic bytes → str，消除每消息的 UTF-8 分配。"""
+    topic = _TOPIC_INTERN.get(topic_bytes)
+    if topic is None:
+        topic = topic_bytes.decode("utf-8")
+        if len(_TOPIC_INTERN) < _TOPIC_INTERN_MAX:
+            _TOPIC_INTERN[topic_bytes] = topic
+    return topic
+
 # 头定长部分（不含 topic 变长）：
 #   magic(2)+ver(1)+msg_type(1)+flags(1)+data_type(1)+topic_len(2) = 8B
 #   +ts(8)+rc(4) = 12B  → 共 20B
@@ -33,7 +48,7 @@ _HEAD_BEFORE_TOPIC = struct.Struct(">2sBBBBH")  # magic ver msg_type flags data_
 _HEAD_AFTER_TOPIC = struct.Struct(">qI")         # ts rc
 
 
-@dataclass
+@dataclass(slots=True)
 class PulseMessage:
     """解码后的完整消息（含 payload）。"""
 
@@ -48,7 +63,7 @@ class PulseMessage:
     msg_type: int = MsgType.DATA
 
 
-@dataclass
+@dataclass(slots=True)
 class FrameHeader:
     """仅帧头部字段，不解压/不反序列化 payload。供服务端路由使用。"""
     topic: str
@@ -302,7 +317,7 @@ def decode_header(frame: bytes) -> FrameHeader:
     if ver != VERSION:
         raise FrameError(f"版本不支持: {ver}")
     off = _HEAD_BEFORE_TOPIC.size
-    topic = frame[off:off + topic_len].decode("utf-8")
+    topic = _intern_topic(frame[off:off + topic_len])
     off += topic_len
     ts, record_count = _HEAD_AFTER_TOPIC.unpack_from(frame, off)
     off += _HEAD_AFTER_TOPIC.size

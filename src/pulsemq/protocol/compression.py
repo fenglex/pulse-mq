@@ -69,18 +69,34 @@ class Lz4Compressor(Compressor):
 
 
 class ZstdCompressor(Compressor):
-    """Zstandard 高压缩比。"""
+    """Zstandard 高压缩比。每线程独立 context（ZstdCompressor 非线程安全）。"""
 
     def __init__(self) -> None:
         import zstandard as zstd
+        import threading
 
         self._zstd = zstd
+        self._local = threading.local()
+
+    def _cctx(self):
+        cctx = getattr(self._local, "cctx", None)
+        if cctx is None:
+            cctx = self._zstd.ZstdCompressor()
+            self._local.cctx = cctx
+        return cctx
+
+    def _dctx(self):
+        dctx = getattr(self._local, "dctx", None)
+        if dctx is None:
+            dctx = self._zstd.ZstdDecompressor()
+            self._local.dctx = dctx
+        return dctx
 
     def compress(self, data: bytes) -> bytes:
-        return self._zstd.compress(data)
+        return self._cctx().compress(data)
 
     def decompress(self, data: bytes) -> bytes:
-        return self._zstd.decompress(data)
+        return self._dctx().decompress(data)
 
 
 # ---------------------------------------------------------------------------

@@ -38,8 +38,10 @@ import asyncio
 import functools
 import inspect
 import random
+import threading
 import time
 import uuid
+from collections import deque
 from typing import Any, Awaitable, Callable
 
 from pulsemq.control import ControlCmd
@@ -62,6 +64,74 @@ _RECONNECT_BACKOFF_MULTIPLIER = 2.0
 _RECONNECT_MAX_DELAY = 30.0
 # 重连时单次等待 monitor 认证裁定的超时秒数。
 _RECONNECT_MONITOR_TIMEOUT = 5.0
+
+
+class _DropQueue:
+    """有界队列：满时丢弃最老消息，按 topic 统计丢弃量。线程安全。
+
+    recv 线程（asyncio 事件循环）调 put()，worker 线程调 get()。
+    deque(maxlen=N) 满时 append 自动丢弃最左（最老）项；put 在丢弃前 peek
+    最老项的 topic 做计数。
+    """
+
+    def __init__(self, maxlen: int) -> None:
+        self._queue: deque = deque(maxlen=maxlen)
+        self._maxlen = maxlen
+        self._cond = threading.Condition()
+        self._drop_counts: dict[str, int] = {}
+        self._closed = False
+
+    def put(self, item: tuple) -> bool:
+        """入队。满时丢弃最老消息并按 topic 计数。返回 False 表示已关闭。"""
+        with self._cond:
+            if self._closed:
+                return False
+            if len(self._queue) >= self._maxlen:
+                oldest = self._queue[0]
+                # item = (frame_bytes, hdr, matched)；hdr 在 index 1
+                topic = oldest[1].topic
+                self._drop_counts[topic] = self._drop_counts.get(topic, 0) + 1
+            self._queue.append(item)
+            self._cond.notify()
+            return True
+
+    def get(self, timeout: float = 1.0):
+        """出队。超时或已关闭返回 None。"""
+        with self._cond:
+            while not self._queue and not self._closed:
+                if not self._cond.wait(timeout=timeout):
+                    return None  # 超时
+            if not self._queue:
+                return None
+            return self._queue.popleft()
+
+    def get_batch(self, timeout: float = 1.0, max_items: int = 64) -> list:
+        """批量出队（最多 max_items）。一次锁获取取多条，减少锁竞争。"""
+        with self._cond:
+            while not self._queue and not self._closed:
+                if not self._cond.wait(timeout=timeout):
+                    return []
+            items = []
+            while self._queue and len(items) < max_items:
+                items.append(self._queue.popleft())
+            return items
+
+    def drain_drops(self) -> dict[str, int]:
+        """取走并清零丢弃计数（供心跳上报）。"""
+        with self._cond:
+            counts = dict(self._drop_counts)
+            self._drop_counts.clear()
+            return counts
+
+    def remaining(self) -> int:
+        """剩余可用容量（供心跳上报 credit）。"""
+        with self._cond:
+            return self._maxlen - len(self._queue)
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
 
 
 def require_connected(func):
@@ -100,6 +170,7 @@ class Client:
         sndhwm: int = 10000,
         rcvhwm: int = 10000,
         latency_sample_rate: float = 0.01,
+        decode_queue_size: int = 0,
     ) -> None:
         self._data_endpoint = data_endpoint
         self._control_endpoint = control_endpoint
@@ -116,6 +187,11 @@ class Client:
         self._sndhwm = sndhwm
         self._rcvhwm = rcvhwm
         self._latency_sample_rate = latency_sample_rate
+        self._decode_queue_size = decode_queue_size
+        # 两线程模型：recv 线程入队 → worker 线程解码。decode_queue_size<=0 时禁用。
+        self._decode_queue: _DropQueue | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)
         self._connected = False
         self._authenticated = False
@@ -216,6 +292,16 @@ class Client:
         # ---- 恢复既有订阅（重连场景；首次启动时为空）----
         for pattern in list(self._subscriptions):
             await self._send_subscribe(pattern)
+
+        # ---- 两线程模型：创建解码队列 + worker 线程 ----
+        self._loop = asyncio.get_running_loop()
+        if self._decode_queue_size > 0:
+            self._decode_queue = _DropQueue(self._decode_queue_size)
+            self._worker_thread = threading.Thread(
+                target=self._decode_worker_loop, daemon=True,
+                name="pulsemq-decode",
+            )
+            self._worker_thread.start()
 
         # ---- 启动后台循环 ----
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -556,8 +642,8 @@ class Client:
     async def _recv_loop(self) -> None:
         """消费数据面帧，按 topic 前缀匹配分发给订阅回调。
 
-        先 decode_header 用 topic 快速过滤，不匹配的帧跳过完整 decode。
-        header_only 回调只接收 FrameHeader，跳过完整 decode 以降低延迟。
+        两线程模式：recv 线程仅做 header 解码 + 延迟采样 + 路由匹配 + 入队，
+        完整 decode + callback 由 worker 线程处理，不阻塞下一次 recv。
         """
         while not self._stop.is_set():
             try:
@@ -572,7 +658,7 @@ class Client:
             except Exception:
                 logger.debug("client 帧头部解码失败，丢弃")
                 continue
-            # 端到端延迟采样回传（4.4）
+            # 端到端延迟采样回传（recv 线程内尽早测量，保证准确）
             if self._latency_sample_rate > 0 and random.random() < self._latency_sample_rate:
                 try:
                     latency_ns = time.time_ns() - hdr.timestamp_ns
@@ -590,34 +676,83 @@ class Client:
                        if pid in self._subscriptions]
             if not matched:
                 continue
-            # 有非 header_only 回调时才做完整 decode
-            need_decode = any(not ho for _, ho in matched)
-            msg = None
-            if need_decode:
-                try:
-                    msg = frames.decode(frame_bytes)
-                except Exception:
-                    logger.debug("client 帧解码失败，丢弃")
-                    continue
-            for cb, ho in matched:
-                try:
-                    target = hdr if ho else msg
-                    if inspect.iscoroutinefunction(cb):
-                        await cb(target)
-                    else:
-                        cb(target)
-                except Exception:
-                    logger.exception("订阅回调异常")
+            if self._decode_queue is not None:
+                # 两线程模式：入队，worker 线程负责 decode + callback
+                self._decode_queue.put((frame_bytes, hdr, matched))
+            else:
+                await self._inline_decode_and_dispatch(frame_bytes, hdr, matched)
+
+    async def _inline_decode_and_dispatch(self, frame_bytes: bytes, hdr, matched) -> None:
+        """内联解码 + 回调分发（兼容模式 / decode_queue_size<=0 时使用）。"""
+        need_decode = any(not ho for _, ho in matched)
+        msg = None
+        if need_decode:
+            try:
+                msg = frames.decode(frame_bytes)
+            except Exception:
+                logger.debug("client 帧解码失败，丢弃")
+                return
+        for cb, ho in matched:
+            try:
+                target = hdr if ho else msg
+                if inspect.iscoroutinefunction(cb):
+                    await cb(target)
+                else:
+                    cb(target)
+            except Exception:
+                logger.exception("订阅回调异常")
+
+    def _decode_worker_loop(self) -> None:
+        """worker 线程：批量出队 → 完整 decode → 回调分发。
+
+        批量出队（get_batch）一次锁获取取多条，减少与 recv 线程的锁竞争。
+        同步回调在 worker 线程直接调用（零调度开销）；异步回调通过
+        run_coroutine_threadsafe 调度回事件循环。
+        """
+        assert self._decode_queue is not None
+        while not self._stop.is_set():
+            batch = self._decode_queue.get_batch(timeout=1.0)
+            if not batch:
+                continue
+            for frame_bytes, hdr, matched in batch:
+                need_decode = any(not ho for _, ho in matched)
+                msg = None
+                if need_decode:
+                    try:
+                        msg = frames.decode(frame_bytes)
+                    except Exception:
+                        logger.debug("worker 帧解码失败，丢弃")
+                        continue
+                for cb, ho in matched:
+                    if cb is None:
+                        continue
+                    try:
+                        target = hdr if ho else msg
+                        if inspect.iscoroutinefunction(cb):
+                            if self._loop and not self._loop.is_closed():
+                                asyncio.run_coroutine_threadsafe(cb(target), self._loop)
+                        else:
+                            cb(target)
+                    except Exception:
+                        logger.exception("订阅回调异常")
 
     # -------------------------------------------------------- heartbeat loop
 
     async def _heartbeat_loop(self) -> None:
-        """周期发送 HEARTBEAT 控制帧；ack fire-and-forget。"""
+        """周期发送 HEARTBEAT 控制帧；ack fire-and-forget。
+
+        两线程模式下，心跳同时携带自上次心跳以来的 per-topic 丢弃量，
+        供服务端 DropStats 聚合监控。drain_drops 取走并清零计数。
+        """
         while not self._stop.is_set():
             try:
-                hb = frames.encode_control(
-                    ControlCmd.HEARTBEAT, {"client_id": self._client_id}
-                )
+                payload: dict = {"client_id": self._client_id}
+                if self._decode_queue is not None:
+                    drops = self._decode_queue.drain_drops()
+                    if drops:
+                        payload["drops"] = drops
+                    payload["credit"] = self._decode_queue.remaining()
+                hb = frames.encode_control(ControlCmd.HEARTBEAT, payload)
                 await self._transport.send(b"", hb, role="control")
             except Exception:
                 logger.debug("心跳发送失败", exc_info=True)
@@ -685,6 +820,12 @@ class Client:
         self._recv_task = None
         self._hb_task = None
         self._reconnecting = False
+        # 关闭解码队列 + join worker 线程
+        if self._decode_queue is not None:
+            self._decode_queue.close()
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=5)
+            self._worker_thread = None
         if self._registered:
             try:
                 disc = frames.encode_control(

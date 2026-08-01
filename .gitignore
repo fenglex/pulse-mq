@@ -36,4 +36,4 @@ bench_stats.sqlite
 build/
 src/pulsemq/serialization/_df_msgpack.*
 .superpowers/
-.idea
+.ideabench_*.md

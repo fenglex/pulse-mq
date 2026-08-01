@@ -69,6 +69,7 @@ class AdminServer:
         connection_stats=None,
         latency_stats=None,
         latency_e2e_stats=None,
+        drop_stats=None,
         admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
@@ -83,6 +84,7 @@ class AdminServer:
         self._connections = connection_stats
         self._latency = latency_stats
         self._latency_e2e = latency_e2e_stats
+        self._drop_stats = drop_stats
         self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
@@ -368,6 +370,9 @@ class AdminServer:
             snap["latency_half"] = self._latency.snapshot()
         if self._latency_e2e is not None:
             snap["latency_e2e"] = self._latency_e2e.snapshot()
+        # 消费端丢弃统计（来自心跳聚合）
+        if self._drop_stats is not None:
+            snap["drops"] = self._drop_stats.snapshot()
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())

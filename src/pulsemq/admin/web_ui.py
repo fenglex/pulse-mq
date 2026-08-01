@@ -138,6 +138,9 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
 }
 .card .sub{font-size:13px;color:var(--text-secondary);margin-top:6px}
+.sparkline{width:100%;height:32px;margin-top:8px;display:block}
+.sparkline polyline{fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.sparkline .spark-fill{opacity:.18}
 
 /* ===== 图表区 ===== */
 .chart-section{
@@ -201,6 +204,8 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 .topic-card .info span{display:flex;align-items:center;gap:4px}
 .topic-card .rate{color:var(--accent-green);font-weight:600}
 .topic-card .rec{color:var(--accent-amber)}
+.topic-card .drop{color:var(--accent-rose);font-weight:600}
+.topic-card .drop-zero{color:var(--text-muted);font-weight:400}
 .empty{text-align:center;padding:48px;color:var(--text-muted);font-size:13px}
 
 /* ===== 事件流 ===== */
@@ -289,6 +294,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
         <div class="icon">⚡</div>
       </div>
       <div class="value" id="v-msgs">0.0</div>
+      <svg class="sparkline" id="spark-msgs"></svg>
       <div class="sub" id="v-msgs-sub">近60秒估算 · 本分钟实测 0 条</div>
     </div>
     <div class="card green" title="近 60 秒平均值（估算）：当前分钟实测 + 上一分钟按比例外推。统计的是压缩后的实际传输字节数（不含帧头开销）。">
@@ -297,6 +303,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
         <div class="icon">🌐</div>
       </div>
       <div class="value" id="v-bytes">0 B/s</div>
+      <svg class="sparkline" id="spark-bytes"></svg>
       <div class="sub">近60秒估算（压缩后）</div>
     </div>
     <div class="card purple">
@@ -367,6 +374,20 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
       </div>
     </div>
     <div id="latency-chart" style="width:100%;height:320px"></div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>延迟趋势<span class="chart-hint" style="margin-left:6px" id="lat-trend-hint">选择下方主题查看 P50/P95/P99 走势</span></span>
+      </div>
+      <div class="chart-controls">
+        <button class="time-btn active" onclick="setLatKind('half', this)">半程</button>
+        <button class="time-btn" onclick="setLatKind('e2e', this)">全程</button>
+      </div>
+    </div>
+    <div id="latency-trend-chart" style="width:100%;height:300px"></div>
   </div>
 
   <div class="chart-section">
@@ -452,10 +473,16 @@ let state = {
   latencyHalf: {},  // 按 topic 的半程延迟
   latencyE2e: {},   // 按 topic 的全程延迟
   events: [],
+  drops: {},        // 按 topic 的消费端丢弃统计
+  msgSpark: [],     // 近 60 次 SSE 的消息量/秒（sparkline 用）
+  bytesSpark: [],   // 近 60 次 SSE 的流量/秒（sparkline 用）
+  latKind: 'half',  // 延迟趋势：half / e2e
+  latHistoryCache: {},  // {topic: {half: [...], e2e: [...]}}
 };
 
 let chart = null;
 let latencyChart = null;
+let latTrendChart = null;
 let firstSelectDone = false;
 const MAX_EVENTS = 50;
 
@@ -479,6 +506,7 @@ function connectSSE() {
       state.totalSubs = d.total_subscriptions != null ? d.total_subscriptions : state.totalSubs;
       if (d.latency_half != null) state.latencyHalf = d.latency_half;
       if (d.latency_e2e != null) state.latencyE2e = d.latency_e2e;
+      if (d.drops != null) state.drops = d.drops;
       // SSE 事件流（全量替换，无重复）
       if (Array.isArray(d.sse_events)) {
         state.events = d.sse_events.map(e => ({
@@ -491,11 +519,13 @@ function connectSSE() {
       renderOverview();
       renderLatency();
       renderEvents();
+      renderSparklines();
       if (!firstSelectDone && Object.keys(d.topics || {}).length > 0) {
         firstSelectDone = true;
         const firstName = Object.keys(d.topics)[0];
         state.selected.push(firstName);
         loadHistory(firstName).then(() => { render(); renderChart(); });
+        loadLatencyHistory(firstName).then(() => renderLatencyTrend());
       }
     } catch(e) { console.error('SSE 解析失败', e); }
   };
@@ -510,10 +540,13 @@ function connectSSE() {
 /* ---- 时间范围 ---- */
 function setTimeRange(minutes, btn) {
   state.timeRange = minutes;
-  document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+  const section = btn.closest('.chart-section');
+  if (section) section.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
   state.history_cache = {};
+  state.latHistoryCache = {};
   loadSelectedHistories().then(() => { render(); renderChart(); });
+  loadSelectedLatencyHistories().then(() => renderLatencyTrend());
 }
 
 /* ---- 主题选择 ---- */
@@ -525,9 +558,11 @@ async function toggleTopic(name) {
     if (state.selected.length >= MAX_SELECTED) state.selected.shift();
     state.selected.push(name);
     await loadHistory(name);
+    await loadLatencyHistory(name);
   }
   render();
   renderChart();
+  renderLatencyTrend();
 }
 
 /* ---- 数据加载 ---- */
@@ -577,11 +612,16 @@ function render() {
     const isSel = selIdx >= 0;
     const color = isSel ? COLORS[selIdx % COLORS.length] : 'transparent';
     const topBar = isSel ? `background:${COLORS[selIdx % COLORS.length]}` : '';
+    const dr = state.drops[name];
+    const dropHtml = dr && (dr.drops_current > 0 || dr.drops_1h_total > 0)
+      ? `<span class="drop">丢弃 ${dr.drops_current}/min · 1h ${dr.drops_1h_total}</span>`
+      : '';
     return `<div class="topic-card ${isSel?'selected':''}" onclick="toggleTopic('${esc(name)}')">
       ${isSel ? `<div style="position:absolute;top:0;left:0;right:0;height:2px;border-radius:12px 12px 0 0;${topBar}"></div>` : ''}
       <div class="name"><span class="dot" style="background:${color};color:${color}"></span>${esc(name)}</div>
       <div class="info">
         <span class="rate">⚡ ${(t.record_rate_1min||0).toFixed(1)} 条/秒</span>
+        ${dropHtml}
       </div>
     </div>`;
   }).join('');
@@ -805,6 +845,135 @@ function renderEvents() {
   }).join('');
 }
 
+/* ---- 延迟趋势（复用 history API，展示 P50/P95/P99 时间序列） ---- */
+function setLatKind(kind, btn) {
+  state.latKind = kind;
+  const section = btn.closest('.chart-section');
+  if (section) section.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  state.latHistoryCache = {};
+  loadSelectedLatencyHistories().then(() => renderLatencyTrend());
+}
+
+async function loadLatencyHistory(topic) {
+  if (!state.latHistoryCache[topic]) state.latHistoryCache[topic] = {};
+  const kind = state.latKind;
+  if (state.latHistoryCache[topic][kind]) return;
+  try {
+    const r = await fetch(_withToken('/api/v1/latency/topics/' + encodeURIComponent(topic) + '/history?minutes=' + state.timeRange + '&kind=' + kind), {headers: _authHeaders()});
+    const d = await r.json();
+    state.latHistoryCache[topic][kind] = Array.isArray(d) ? d : (d.history || []);
+  } catch(e) {
+    state.latHistoryCache[topic][kind] = [];
+  }
+}
+
+async function loadSelectedLatencyHistories() {
+  await Promise.all(state.selected.map(n => loadLatencyHistory(n)));
+}
+
+function renderLatencyTrend() {
+  const hint = $('lat-trend-hint');
+  if (state.selected.length === 0) {
+    if (hint) hint.textContent = '选择下方主题查看 P50/P95/P99 走势';
+    if (latTrendChart) latTrendChart.clear();
+    return;
+  }
+  const topic = state.selected[0];
+  const kind = state.latKind;
+  const kindLabel = kind === 'e2e' ? '全程' : '半程';
+  if (hint) hint.textContent = topic + ' · ' + kindLabel + ' · P50/P95/P99';
+
+  if (!latTrendChart) {
+    latTrendChart = echarts.init($('latency-trend-chart'), null, {renderer: 'canvas'});
+    window.addEventListener('resize', () => latTrendChart && latTrendChart.resize());
+  }
+
+  const cached = (state.latHistoryCache[topic] && state.latHistoryCache[topic][kind]) || [];
+  const data = cached.map(h => [h.timestamp * 1000, h.p50_ms, h.p95_ms, h.p99_ms]);
+  // 追加当前实时快照作为最新点
+  const liveLat = kind === 'e2e' ? state.latencyE2e[topic] : state.latencyHalf[topic];
+  if (liveLat) {
+    const nowMs = Math.floor(Date.now() / 60000) * 60000;
+    data.push([nowMs, liveLat.p50_ms || 0, liveLat.p95_ms || 0, liveLat.p99_ms || 0]);
+  }
+
+  const seriesNames = ['P50', 'P95', 'P99'];
+  const seriesColors = ['#34d399', '#fbbf24', '#fb7185'];
+  const series = seriesNames.map((name, i) => ({
+    name, type: 'line',
+    data: data.map(d => [d[0], d[i + 1]]),
+    smooth: true, showSymbol: false,
+    lineStyle: {width: 2.5, color: seriesColors[i]},
+    itemStyle: {color: seriesColors[i]},
+  }));
+
+  latTrendChart.setOption({
+    backgroundColor: 'transparent',
+    animation: true, animationDuration: 300,
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(10,19,38,0.95)',
+      borderColor: '#1e3054',
+      textStyle: {color: '#eef2fa', fontSize: 12},
+      valueFormatter: v => v != null ? v.toFixed(2) + ' ms' : '-',
+    },
+    legend: {data: seriesNames, textStyle: {color: '#8a9ab3'}, top: 4},
+    grid: {left: 56, right: 24, top: 36, bottom: 36},
+    xAxis: {
+      type: 'time',
+      axisLine: {lineStyle: {color: '#1e3054'}},
+      axisLabel: {color: '#8a9ab3', fontSize: 11, formatter: '{HH}:{mm}'},
+      splitLine: {show: false},
+    },
+    yAxis: {
+      type: 'value', name: 'ms',
+      nameTextStyle: {color: '#8a9ab3', fontSize: 11},
+      axisLine: {show: false},
+      axisTick: {show: false},
+      axisLabel: {color: '#8a9ab3', fontSize: 11},
+      splitLine: {lineStyle: {color: 'rgba(30,48,84,0.6)', type: 'dashed'}},
+    },
+    series,
+  }, true);
+}
+
+/* ---- Sparkline（msg/s + bytes/s 近 60 次采样迷你趋势线） ---- */
+function renderSparklines() {
+  let totalMsg = 0, totalBytes = 0;
+  for (const [, t] of Object.entries(state.topics)) {
+    totalMsg += t.record_rate_1min || 0;
+    totalBytes += t.bytes_rate_1min || 0;
+  }
+  state.msgSpark.push(totalMsg);
+  state.bytesSpark.push(totalBytes);
+  if (state.msgSpark.length > 60) state.msgSpark.shift();
+  if (state.bytesSpark.length > 60) state.bytesSpark.shift();
+  drawSparkline('spark-msgs', state.msgSpark, '#fbbf24');
+  drawSparkline('spark-bytes', state.bytesSpark, '#34d399');
+}
+
+function drawSparkline(elId, data, color) {
+  const el = $(elId);
+  if (!el || data.length < 2) return;
+  const w = 100, h = 32;
+  el.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+  el.setAttribute('preserveAspectRatio', 'none');
+  const max = Math.max(...data, 0.001);
+  const min = Math.min(...data, 0);
+  const range = max - min || 1;
+  const step = w / (data.length - 1);
+  const pts = data.map((v, i) => {
+    const x = i * step;
+    const y = h - ((v - min) / range) * (h - 4) - 2;
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  const areaPts = pts.join(' ') + ' ' + w.toFixed(1) + ',' + h + ' 0,' + h;
+  el.innerHTML =
+    '<polyline class="spark-fill" points="' + areaPts + '" fill="' + color + '" stroke="none"/>' +
+    '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + color + '"/>';
+}
+
 async function openClientModal() {
   const modal = $('client-modal');
   const body = $('client-modal-body');
@@ -855,7 +1024,9 @@ function closeClientModal() { $('client-modal').classList.remove('show'); }
 setInterval(() => {
   if (state.selected.length > 0) {
     state.history_cache = {};
+    state.latHistoryCache = {};
     loadSelectedHistories().then(() => renderChart());
+    loadSelectedLatencyHistories().then(() => renderLatencyTrend());
   }
 }, 30000);
 

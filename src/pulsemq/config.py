@@ -56,6 +56,7 @@ class ClientConfig:
     reconnect_backoff_multiplier: float = 2.0
     sndhwm: int = 10000
     rcvhwm: int = 10000
+    decode_queue_size: int = 0  # 消费端解码队列长度（0=单线程，>0=启用worker线程+丢弃队列）
 
 
 def _read_toml(path: str | None) -> dict:

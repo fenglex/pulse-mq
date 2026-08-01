@@ -227,11 +227,12 @@ class SyncDataThread:
         while self._running:
             events = dict(poller.poll(timeout=100))  # 100ms 超时以便检查 _running
             if self._socket in events:
-                try:
-                    parts = self._socket.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    pass
-                else:
+                # 批量 drain：一次 poll 唤醒后连续取完所有可用消息，摊薄 poll 开销
+                while True:
+                    try:
+                        parts = self._socket.recv_multipart(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
                     if len(parts) >= 2:
                         try:
                             self._on_message(parts[0], parts[-1])
@@ -252,6 +253,41 @@ class SyncDataThread:
     def send(self, ident: bytes, frame_bytes: bytes) -> None:
         """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
         self._socket.send_multipart([ident, frame_bytes])
+
+    def broadcast(self, targets, frame_bytes: bytes,
+                  credits: dict | None = None) -> int:
+        """广播同一帧给多个 target。返回丢弃数（发送失败或信用耗尽）。
+
+        - DONTWAIT：订阅者队列满时立即跳过，防 head-of-line blocking。
+        - credits：消费者心跳报告的剩余容量；为 0 时跳过（信用流控）。
+        - 大 payload（≥1KB）零拷贝，小 payload 直接 send。
+        """
+        if not self._socket or not targets:
+            return 0
+        drops = 0
+        sock = self._socket
+        if len(frame_bytes) >= 1024:
+            frame = zmq.Frame(frame_bytes)
+            for target in targets:
+                if credits is not None and credits.get(target, -1) == 0:
+                    drops += 1
+                    continue
+                try:
+                    sock.send_multipart([target, frame],
+                                        flags=zmq.DONTWAIT, copy=False)
+                except Exception:
+                    drops += 1
+        else:
+            for target in targets:
+                if credits is not None and credits.get(target, -1) == 0:
+                    drops += 1
+                    continue
+                try:
+                    sock.send_multipart([target, frame_bytes],
+                                        flags=zmq.DONTWAIT)
+                except Exception:
+                    drops += 1
+        return drops
 
     def send_from_main(self, ident: bytes, frame_bytes: bytes) -> None:
         """主线程调用：通过 PUSH -> PULL 投递到数据面线程。"""
@@ -315,6 +351,13 @@ class Transport:
         """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
         if self._sync_data:
             self._sync_data.send(ident, frame_bytes)
+
+    def broadcast_sync(self, targets, frame_bytes: bytes,
+                       credits: dict | None = None) -> int:
+        """数据面线程内调用：广播同一帧给多个订阅者。返回丢弃数。"""
+        if self._sync_data:
+            return self._sync_data.broadcast(targets, frame_bytes, credits)
+        return 0
 
     def send_sync_data(self, ident: bytes, frame_bytes: bytes) -> None:
         """主线程调用（内置 producer）：通过 PUSH -> PULL 投递到数据面线程。"""

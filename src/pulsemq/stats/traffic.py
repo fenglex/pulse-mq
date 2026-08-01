@@ -38,7 +38,26 @@ class TrafficStats:
         self._lock = threading.RLock()
 
     def record(self, topic: str, record_count: int, payload_size: int) -> None:
-        """记录一条消息（线程安全）。"""
+        """记录一条消息。
+
+        性能优化：数据面线程是 _current 的唯一写者，常规路径（topic 已存在、
+        未跨分钟）不加锁。仅在新 topic 首次出现或分钟切换时加锁——这两种情况
+        极低频（每分钟最多触发一次）。roll_minute/snapshot 的读路径仍用锁保护。
+        """
+        cur = self._current.get(topic)
+        if cur is not None:
+            # 快路径：topic 已存在，直接累加（无锁，单写者安全）
+            cur.msg_count += 1
+            cur.record_count += record_count
+            cur.bytes_total += payload_size
+            # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
+            if (cur.msg_count & 0x3FF) == 0:
+                now = self._minute_now()
+                if now != self._current_minute:
+                    with self._lock:
+                        self.roll_minute()
+            return
+        # 慢路径：新 topic 或分钟切换，需加锁
         with self._lock:
             cur = self._current.get(topic)
             if cur is None:
@@ -50,11 +69,6 @@ class TrafficStats:
             cur.msg_count += 1
             cur.record_count += record_count
             cur.bytes_total += payload_size
-            # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
-            if (cur.msg_count & 0x3FF) == 0:
-                now = self._minute_now()
-                if now != self._current_minute:
-                    self.roll_minute()
 
     def roll_minute(self) -> dict[str, MinuteSlot]:
         """整分钟时调用：归档当前累积器 → 滚动窗口淘汰过期数据。

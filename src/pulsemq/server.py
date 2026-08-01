@@ -30,6 +30,7 @@ from pulsemq.protocol.msg_type import DataType
 from pulsemq.routing import SubscriptionTable
 from pulsemq.security import CredentialStore
 from pulsemq.stats.connections import ConnectionStats, _role_of
+from pulsemq.stats.drops import DropStats
 from pulsemq.stats.latency import LatencyStatsRegistry
 from pulsemq.stats.storage import AsyncArchiveWriter, StatsStorage
 from pulsemq.stats.traffic import TrafficStats
@@ -118,6 +119,10 @@ class Server:
             registry_snapshot_fn=self._registry.snapshot,
             ring_size=self._cfg.event_ring_size,
         )
+        self._drop_stats = DropStats(retention_minutes=60)
+        # 消费者信用（心跳报告的剩余 decode queue 容量），用于数据面流控。
+        # key = ROUTER bytes identity，value = 剩余容量。0 = 队列满，跳过发送。
+        self._credits: dict[bytes, int] = {}
         self._archive_writer = AsyncArchiveWriter(
             self._storage, batch_size=self._cfg.stats_archive_batch_size
         )
@@ -164,6 +169,7 @@ class Server:
             connection_stats=self._connections,
             latency_stats=self._lat_half,
             latency_e2e_stats=self._lat_e2e,
+            drop_stats=self._drop_stats,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
@@ -346,11 +352,12 @@ class Server:
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
         if self._lat_half.should_sample():
             self._lat_half.record(hdr.topic, time.time_ns() - hdr.timestamp_ns)
-        for target in self._routing.match(hdr.topic):
-            try:
-                self._transport.send_sync_direct(target, frame_bytes)
-            except Exception:
-                pass
+        matched = self._routing.match(hdr.topic)
+        if matched:
+            dropped = self._transport.broadcast_sync(
+                matched, frame_bytes, self._credits)
+            if dropped:
+                self._drop_stats.record(hdr.topic, dropped)
 
     async def _control_loop(self) -> None:
         while self._running:
@@ -413,6 +420,15 @@ class Server:
 
         elif cmd_msg.cmd == ControlCmd.HEARTBEAT:
             self._registry.heartbeat(cid)
+            # 消费端丢弃指标（心跳携带，向后兼容：老客户端无 drops 字段）
+            drops = cmd_msg.payload.get("drops")
+            if drops:
+                for drop_topic, drop_count in drops.items():
+                    self._drop_stats.record(drop_topic, int(drop_count))
+            # 消费者信用（剩余 decode queue 容量），用于数据面流控
+            credit = cmd_msg.payload.get("credit")
+            if credit is not None:
+                self._credits[ident] = int(credit)
             await self._transport.send(
                 ident,
                 frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
@@ -446,6 +462,7 @@ class Server:
         elif cmd_msg.cmd == ControlCmd.DISCONNECT:
             self._routing.remove(ident)
             self._ident_by_client_id.pop(cid, None)
+            self._credits.pop(ident, None)
             self._registry.unregister(cid)
             # 断开事件（Spec 3）：DISCONNECT → on_disconnect
             self._connections.on_disconnect(cid, "disconnect")
@@ -481,6 +498,7 @@ class Server:
                     ident = self._ident_by_client_id.pop(c.client_id, None)
                     if ident is not None:
                         self._routing.remove(ident)
+                        self._credits.pop(ident, None)
                     # 断开事件（Spec 3）：心跳超时下线 → on_disconnect
                     self._connections.on_disconnect(c.client_id, "heartbeat_timeout")
                     log_event(
@@ -503,6 +521,8 @@ class Server:
                 # 延迟统计分钟滚动（半程 + 全程）
                 self._lat_half.roll_minute()
                 self._lat_e2e.roll_minute()
+                # 消费端丢弃统计分钟滚动
+                self._drop_stats.roll_minute()
             except asyncio.CancelledError:
                 break
             except Exception:

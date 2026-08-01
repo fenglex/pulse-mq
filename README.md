@@ -5,7 +5,9 @@
 - **Client/Server 架构** — 服务端（ROUTER）集中路由 + 控制面；客户端（DEALER）发布/订阅
 - **PLAIN + bcrypt 认证** — ZAP 认证链：bcrypt 哈希凭据存储，admin token 保护监控接口
 - **类型保真** — DataFrame / dict / str / bytes 端到端保真（`_restore_type` 自动还原）
-- **完整监控** — Web UI（ECharts）+ REST API + SSE 实时推送，延迟分位、事件流、在线客户端
+- **高性能转发** — 路由结果缓存（12x）、topic interning、无锁统计、零拷贝广播、DONTWAIT 防阻塞
+- **流控与丢弃监控** — 信用窗口流控 + DONTWAIT 非阻塞发送 + per-topic 丢弃统计（消费端 + 服务端）
+- **完整监控** — Web UI（ECharts）+ REST API + SSE 实时推送，延迟趋势曲线、sparkline、丢弃指标
 - **运行期重连** — 断线自动指数退避重连（1s → 2s → 4s ... → 30s 封顶）
 
 ---
@@ -155,24 +157,58 @@ async def main():
 asyncio.run(main())
 ```
 
+### header_only 模式（跳过完整解码）
+
+仅需 topic / record_count / timestamp 时，跳过反序列化以降低延迟：
+
+```python
+await cons.subscribe("market.*", on_header, header_only=True)
+# on_header 收到 FrameHeader 而非 PulseMessage
+```
+
+### 消费端解码队列（opt-in 两线程）
+
+默认单线程（最高吞吐）。对于慢回调场景，启用 worker 线程 + 有界丢弃队列：
+
+```python
+cons = ConsumerClient(
+    "tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556",
+    username="sub", password="p",
+    decode_queue_size=10000,  # 0=单线程（默认），>0=启用 worker 线程 + 丢弃队列
+)
+```
+
+启用后：
+- **recv 线程**仅做 header 解码 + 入队，不阻塞
+- **worker 线程**批量出队 → 完整 decode → 回调
+- 队列满时**丢弃最老消息**，按 topic 统计丢弃量
+- 丢弃量 + 剩余容量通过心跳上报服务端，在 Web UI 可见
+
+> **何时启用**：回调处理耗时 > 1ms（DB 写入、HTTP 调用、复杂计算）时建议启用。快回调（计数、转发）保持默认（单线程）以获得最高吞吐。
+
 ---
 
 ## 架构
 
 ```
-                      ┌──────────────────┐
-                      │    Server        │
-                      │  ┌─ 数据面 ─────┐│──── DEALER → 消费者
-                      │  │ ROUTER :5555 ││
-                      │  └──────────────┘│
-                      │  ┌─ 控制面 ─────┐│
-                      │  │ ROUTER :5556 ││←── DEALER  ← 生产者
-                      │  └──────────────┘│
-                      │  ┌─ Admin ──────┐│
-                      │  │ HTTP :9090   ││─── REST / SSE / Web UI
-                      │  └──────────────┘│
-                      │  ZAP (bcrypt)    │
-                      └──────────────────┘
+                      ┌──────────────────────────────┐
+                      │           Server              │
+                      │  ┌─ 数据面（独立线程）───────┐│──── DONTWAIT ──→ 消费者 DEALER
+   生产者 DEALER ────→│  │ ROUTER :5555              ││     ↑ 信用流控
+                      │  │ 批量 drain → 路由缓存匹配  ││     ↑ 满队列跳过+丢弃计数
+                      │  │ → 零拷贝广播              ││
+                      │  └───────────────────────────┘│
+                      │  ┌─ 控制面（asyncio）───────┐│
+                      │  │ ROUTER :5556              ││←── DEALER ← 生产者/消费者
+                      │  │ REGISTER/HEARTBEAT/       ││
+                      │  │ SUBSCRIBE/DISCONNECT      ││
+                      │  │ +drops +credit 心跳扩展   ││
+                      │  └───────────────────────────┘│
+                      │  ┌─ Admin（独立线程）────────┐│
+                      │  │ HTTP :9090                ││─── REST / SSE / Web UI
+                      │  └───────────────────────────┘│
+                      │  ZAP PLAIN (bcrypt)           │
+                      └──────────────────────────────┘
 ```
 
 | 端口 | 协议 | 用途 |
@@ -184,9 +220,11 @@ asyncio.run(main())
 ### 数据流
 
 ```
-生产者 DEALER ──encode→  ROUTER  decode_header  match topic ──→ 消费者 DEALER
-                              ↓
-                         TrafficStats.record  LatencyStats.sample
+生产者 DEALER ──encode→  ROUTER  decode_header  match topic ──DONTWAIT──→ 消费者 DEALER
+                              ↓                                        ↓
+                         TrafficStats.record                    frames.decode
+                         LatencyStats.sample                     → callback
+                         (无锁，topic intern)
 ```
 
 服务端**不解压/不反序列化** payload（`decode_header` 仅提取头部），转发后由消费者完整 `decode` 还原。
@@ -196,10 +234,22 @@ asyncio.run(main())
 | 命令 | 方向 | 作用 |
 |------|------|------|
 | `REGISTER` | Client → Server | 注册上线（含用户名、角色、订阅列表） |
-| `HEARTBEAT` | Client → Server | 保活（每秒 1 次，6 秒超时自动下线） |
+| `HEARTBEAT` | Client → Server | 保活 + 消费端丢弃量 + 剩余信用（每秒 1 次，6 秒超时自动下线） |
 | `SUBSCRIBE` | Client → Server | 订阅 topic 模式 |
 | `UNSUBSCRIBE` | Client → Server | 取消订阅 |
 | `DISCONNECT` | Client → Server | 优雅下线 |
+
+### 流控与丢弃追踪
+
+三层背压机制，互不阻塞：
+
+| 层级 | 机制 | 行为 |
+|------|------|------|
+| **服务端→消费者** | DONTWAIT 非阻塞发送 | 消费者 HWM 满 → 跳过发送 → DropStats 按 topic 计数 |
+| **服务端→消费者** | 信用窗口（心跳报告剩余容量） | 消费者 decode queue 满 → 信用=0 → 服务端跳过 |
+| **消费端（opt-in）** | 有界丢弃队列 | worker 线程处理慢 → 队列满 → 丢弃最老消息 → 按 topic 计数 |
+
+所有丢弃量统一汇聚到服务端 `DropStats`，在 Web UI 按 topic 展示（当前分钟 / 上一分钟 / 1 小时累计）。
 
 ---
 
@@ -234,7 +284,7 @@ asyncio.run(main())
 | `none` | 小消息，极速 |
 | `snappy` | 速度优先 |
 | `lz4` | 批数据，平衡 |
-| `zstd` | 压缩比优先（带宽受限） |
+| `zstd` | 压缩比优先（带宽受限），context 复用提速 |
 | `auto` | 自适应：<256B 用 none，>=256B 用 lz4 |
 
 小消息场景压缩是**负收益**（计算开销 > 传输节省）；批量 DataFrame 场景 `lz4`/`zstd` 有明显效果。
@@ -272,17 +322,19 @@ asyncio.run(main())
 
 浏览器打开 `http://localhost:9090/?token=<admin_token>` 查看实时面板：
 
-- 4 个指标卡片：活跃主题、消息量/秒、流量/秒、运行时间
+- 4 个指标卡片（含 sparkline 迷你趋势线）：活跃主题、消息量/秒、流量/秒、运行时间
 - 4 个客户端卡片：在线用户、生产者数、消费者数、订阅数
 - ECharts 流量趋势折线图（分钟级，1H/8H 切换，最多 5 topic 叠加）
-- 延迟对比图（按 topic 半程/全程 P50）+ 底部端到端延迟列表（P50/P95/P99）
+- **延迟趋势曲线**（P50/P95/P99 时间序列，半程/全程切换）
+- 延迟对比柱状图（按 topic 半程/全程 P50）+ 底部端到端延迟列表（P50/P95/P99）
 - 实时事件流（认证/连接/断线）
+- **topic 卡片丢弃指示**（红色高亮，显示当前分钟 + 1 小时累计丢弃量）
 - 在线 Client 详情弹窗
 
 ### REST API
 
 ```bash
-# 实时指标
+# 实时指标（含 drops / latency / topics）
 curl 'http://localhost:9090/api/v1/stats/realtime?token=<token>'
 
 # 主题列表
@@ -290,6 +342,9 @@ curl 'http://localhost:9090/api/v1/topics?token=<token>'
 
 # 主题分钟级历史
 curl 'http://localhost:9090/api/v1/topics/market.tick/history?minutes=60&token=<token>'
+
+# 延迟历史（半程/全程 P50/P95/P99 时间序列）
+curl 'http://localhost:9090/api/v1/latency/topics/market.tick/history?minutes=60&kind=half&token=<token>'
 
 # 在线客户端明细
 curl 'http://localhost:9090/api/v1/clients?token=<token>'
@@ -307,7 +362,7 @@ curl http://localhost:9090/healthz
 curl -N 'http://localhost:9090/api/v1/stats/stream?token=<token>'
 ```
 
-每 1 秒推送一帧 JSON，包含 topics / latency / online_users / sse_events 等。
+每 1 秒推送一帧 JSON，包含 topics / latency_half / latency_e2e / drops / online_users / sse_events 等。
 
 ---
 
@@ -395,56 +450,42 @@ stderr 同步输出（容器/交互可见）。
 
 ---
 
-## 性能基准
+## 性能优化（v9.0.0）
 
-### 运行基准
+### 服务端热路径优化
 
-仓库自带多套基准脚本：
+| 优化项 | 效果 |
+|--------|------|
+| 路由 match() 结果缓存 | 同一 topic 跳过 split/join 分配，**12x 提速**（0.79µs → 0.07µs/call） |
+| topic 字节→str interning | 消除每消息 UTF-8 decode 分配 |
+| TrafficStats 无锁 record | 数据面单写者，常规路径不加锁（仅新 topic/分钟切换加锁） |
+| 延迟采样计数器替代 RNG | 消除每消息 random.random() 调用 |
+| 零拷贝广播 broadcast() | 大 payload(≥1KB) 用 zmq.Frame + copy=False，避免 N 次内存拷贝 |
+| DONTWAIT 非阻塞发送 | 慢消费者不阻塞数据面线程（防 head-of-line blocking） |
+| 批量 drain | 一次 poll 唤醒后连续取完所有消息，摊薄 poll 开销 |
+| FrameHeader slots | 消除 __dict__ 分配 |
+| Zstd 压缩 context 复用 | 每线程独立 context，避免重复初始化（dict/zstd 吞吐 +44%） |
+
+### 流控与丢弃监控
+
+- **信用流控**：消费者心跳报告剩余 decode queue 容量，服务端据此跳过即将被丢弃的发送
+- **DONTWAIT**：订阅者 HWM 满时立即跳过，按 topic 计入 DropStats
+- **DropStats**：分钟桶 + 1 小时窗口，提供 drops_current / drops_last_min / drops_1h_total
+
+### 性能基准
+
+仓库自带跨机器基准脚本：
 
 ```bash
-# 1. 单进程快速基准（Server + Producer + Consumer 同进程）
+# 跨机器基准（Server 在远程，Producer/Consumer 在本地）
+python scripts/bench_dist.py --remote <host> --ssh root@<host>
+
+# 单进程快速基准
 python scripts/bench_simple.py --duration 5
-python scripts/bench_simple.py --duration 5 --records-per-frame 1000 --serializer pyarrow --compression lz4
-# 可选参数：--serializer {msgpack,json,pyarrow,str,bytes}
-#           --compression {none,snappy,lz4,zstd}
 
-# 2. 全面基准（协议层微基准 + 端到端矩阵 + 扇出，单进程）
-python scripts/bench_full.py                  # 跑全部，结果写 bench_results.md
-python scripts/bench_full.py --duration 10    # 端到端/扇出每场景秒数
-
-# 3. 多进程基准（生产端/服务端/消费端独立进程，28 组合全覆盖）
-python scripts/bench_multiprocess.py          # 跑全部 28 组合
-python scripts/bench_multiprocess.py --count 3000     # 每组合发送帧数
-python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
+# 多进程基准（28 组合全覆盖）
+python scripts/bench_multiprocess.py
 ```
-
-脚本输出帧/记录吞吐量与 p50/p90/p99/max 帧延迟。
-
-### 参考数据
-
-下列数值来自多进程基准脚本（`bench_multiprocess.py`）在 Linux 上的一次运行，**仅作量级参考**，实际表现因机器、负载、序列化/压缩组合而异：
-
-- 环境：Linux 6.12 (RHEL 10), Python 3.13.14, pulsemq v7.2.5
-- 每组合 3000 帧，生产端/服务端/消费端独立进程，localhost
-
-**吞吐量与延迟（精选组合）**
-
-| 数据类型 | 序列化器 | 压缩 | 发送 f/s | 接收 f/s | p50 ms | p99 ms |
-|---|---|---|---|---|---|---|
-| dict | msgpack | none | 136,752 | 50,715 | 20.7 | 37.5 |
-| dict | msgpack | snappy | 64,815 | 42,737 | 6.9 | 24.2 |
-| dict | json | lz4 | 112,277 | 47,400 | 21.1 | 36.9 |
-| dataframe | msgpack | none | 3,224 | 3,244 | **0.42** | 1.67 |
-| dataframe | json | lz4 | 3,141 | 3,155 | 0.43 | 1.26 |
-| dataframe | pyarrow | zstd | 4,220 | 3,364 | 94.7 | 184.8 |
-| str | str | none | 130,794 | 51,779 | 19.3 | 35.3 |
-| bytes | bytes | lz4 | 116,976 | 49,634 | 18.8 | 35.2 |
-| bytes | bytes | zstd | 72,411 | 43,648 | **14.9** | 27.8 |
-
-> **dataframe + msgpack/json** 延迟最低（p50 < 0.5ms），encode 限速无积压。
-> **小消息（dict/str/bytes）** 吞吐最高（>100K f/s），但 burst 发送导致队列积压，p50 较高。
-> **pyarrow** encode 快但 consumer 端 `to_pandas()` 转换是延迟瓶颈（p50 > 90ms）。
-> **zstd** 对大 payload 压缩收益明显，对 <200B 小消息通常为负收益。
 
 ---
 
@@ -472,64 +513,51 @@ python scripts/bench_multiprocess.py --data-type dict  # 只测指定类型
 
 更多参数（`stats_db`、`heartbeat_timeout`、`latency_sample_rate`、`stats_retention_minutes`、`bcrypt_cost`、`admin_token_file`、`sse_interval`、`event_ring_size` 等）需通过 TOML 配置文件设置。在 `Server(config=...)` 中传入自定义 `ServerConfig` 即可生效。完整字段见 [`ServerConfig`](src/pulsemq/config.py)。
 
+### 消费端配置
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `decode_queue_size` | 解码队列长度（0=单线程，>0=worker线程+丢弃队列） | `0` |
+| `latency_sample_rate` | 端到端延迟采样回传率 | `0.01` |
+| `sndhwm` / `rcvhwm` | ZMQ 高水位 | `10000` |
+
 ---
 
 ## 更新日志
 
-### v8.0.0 (current)
+### v9.0.0
+
+- **性能优化** — 路由 match() 结果缓存（12x）；topic interning；TrafficStats 无锁 record；计数器采样替代 RNG；FrameHeader slots；Zstd context 复用（+44%）；批量 drain
+- **零拷贝广播** — 大 payload(≥1KB) zmq.Frame + copy=False；小 payload 直接 send
+- **DONTWAIT 防阻塞** — 慢消费者 HWM 满时跳过发送，防 head-of-line blocking
+- **信用流控** — 消费者心跳报告剩余 decode queue 容量，服务端据此跳过
+- **丢弃监控** — DropStats 分钟桶+1h 窗口；消费端 _DropQueue（opt-in）丢弃最老消息+per-topic 计数；服务端 DONTWAIT 丢弃计数；Web UI topic 卡片丢弃指示
+- **消费端两线程（opt-in）** — `decode_queue_size>0` 启用 recv→queue→worker 模式；默认单线程（最高吞吐）
+- **监控增强** — 延迟趋势曲线（P50/P95/P99 时间序列，半程/全程切换）；msg/s + bytes/s sparkline
+- **Bug 修复** — ZstdCompressor 线程安全（thread-local context）；topic intern 缓存有界（max 10000）
+
+### v8.0.0
 
 - **延迟监控** - 按 topic 的半程(producer->server)+全程(producer->consumer)延迟，分钟窗口+8h 历史，consumer 采样回传，Web UI 对比图+底部列表
-- **客户端生命周期** - `Client.run_forever()` 上提到基类（消费者不再需要 asyncio.sleep），修复重连致命错误静默吞没；subscribe 支持 start 前预注册；SIGINT/SIGTERM 优雅退出
+- **客户端生命周期** - `Client.run_forever()` 上提到基类；subscribe 支持 start 前预注册；SIGINT/SIGTERM 优雅退出
 - **性能优化** - `SubscriptionTable` COW 无锁读；客户端订阅匹配改前缀索引；序列化器 import 提模块级
 - **控制面** - reply 关联 request_id，解决多订阅 ack 串扰
 - **配置** - ClientConfig 接入 Client；HWM 默认 10000；ServerConfig 常用字段支持环境变量覆盖
 - **清理** - 删除 cache/、inject_sender、MsgType.HEARTBEAT/ADMIN、ControlCmd.KICK、save_minute 等死代码
 - **Web UI** - 延迟对比图+底部列表；流量趋势图 6H->8H
 
-### v7.2.3
-
-- **修复 AdminServer 关闭时 RuntimeWarning** - 线程 loop 关闭前取消未完成任务
-- **修复 Ctrl+C 优雅关闭超时** - `run_server` 等待 `server.stop()` 完成，10s 超时强制退出
-- **requires-python 恢复 >=3.13**
-
-### v7.2.2
-
-- **降低 requires-python 到 3.11**（后续恢复 3.13）
-- **修复 Linux Ctrl+C 无法终止** - `lifecycle.py` 等待 stop task 完成
-
-### v7.2.1
-
-- **修正 README 文档与代码不一致**（7 处）
-
-### v7.2.0
+### v7.2.x
 
 - **同步数据面线程** - SyncDataThread 独立线程 + 独立 ctx，端到端 p50 < 1ms
 - **压缩算法自适应** - `compression="auto"` 根据 payload 大小自动选择 none/lz4
 - **Consumer decode_header 快速过滤** - 跳过不匹配 topic 的完整 decode
-- **ZMQ HWM 可配置化** - `sndhwm`/`rcvhwm` 配置项 + `PULSEMQ_SNDHWM`/`PULSEMQ_RCVHWM` 环境变量
-- **多进程基准测试脚本** - `scripts/bench_multiprocess.py`，三进程独立运行，28 组合全覆盖
-
-### v7.1.0
-
-- **encode 自动推断** - serializer/data_type 自动推断，DataFrame 兼容 msgpack/json + STR/BYTES 支持
-
-### v7.0.x
-
-- **record_count 自动推断** - list/DataFrame 行数自动推断
+- **ZMQ HWM 可配置化** - `sndhwm`/`rcvhwm` 配置项 + 环境变量
+- **encode 自动推断** - serializer/data_type 自动推断
+- **多进程基准测试脚本** - 28 组合全覆盖
 
 ### v2
 
 完整重构：PUB/SUB → Client/Server (ROUTER/DEALER)
-
-- **架构变更**：单 PUB socket → 双 ROUTER（数据面 + 控制面）+ HTTP admin
-- **认证升级**：api_key 明文 → bcrypt CredentialStore + ZAP PLAIN + 用户 CLI
-- **类型保真**：`_restore_type` 确保 DataFrame/dict str/bytes 端到端还原
-- **监控增强**：延迟 P50/P95/P99、在线客户端、事件流、SSE 实时推送、独立 Admin 线程
-- **性能优化**：`decode_header` 服务端零反序列化路由、`TrafficStats` 单 `dict.get`
-- **自动重连**：运行期指数退避重连（1s→2s→4s→...→30s）
-- **日志系统**：loguru 统一，每日滚动写入 `logs/`，30 天保留
-- **安全性**：密码 bcrypt 哈希、admin token 随机生成（0600）、凭据文件原子写入
-- **批次处理**：DataFrame 批量 1000 行/帧，pyarrow 直序列化（见上文「性能基准」）
 
 ---
 

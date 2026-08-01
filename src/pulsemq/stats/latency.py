@@ -106,13 +106,22 @@ class LatencyStatsRegistry:
         self._current: dict[str, LatencyStats] = {}
         self._history: dict[str, deque[MinuteLatency]] = {}
         self._lock = threading.Lock()
+        # 计数器采样：每 ~1/rate 条消息采样一条，替代 random.random()。
+        # 热路径（数据面每条消息调用）消除 RNG 开销；确定性采样方差更低。
+        self._sample_threshold: int = max(1, round(1.0 / self._rate)) if self._rate > 0 else 1
+        self._sample_counter: int = 0
 
     def should_sample(self) -> bool:
         if self._rate >= 1.0:
             return True
         if self._rate <= 0.0:
             return False
-        return random.random() < self._rate
+        # 递减计数器：每 threshold 条采样 1 条，O(1) 无 RNG 开销。
+        self._sample_counter += 1
+        if self._sample_counter >= self._sample_threshold:
+            self._sample_counter = 0
+            return True
+        return False
 
     def record(self, topic: str, latency_ns: int) -> None:
         with self._lock:

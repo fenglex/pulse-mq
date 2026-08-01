@@ -28,16 +28,34 @@ class SubscriptionTable:
     def __init__(self) -> None:
         self._read_index = _Index(exact={}, wild={}, by_identity={})
         self._write_lock = threading.Lock()
+        # match 结果缓存：{topic: (version, frozenset[bytes])}。
+        # 写操作（subscribe/unsubscribe/remove）递增 _version 并清空缓存；
+        # match() 命中时校验 version 一致才返回，避免写后读到陈旧结果。
+        # 读路径（数据面）无锁：GIL 保证 dict.get / int 读原子，version
+        # 与 _read_index 在 _write_lock 内一起更新，读侧最差多算一次（无错误结果）。
+        self._version: int = 0
+        self._match_cache: dict[str, tuple[int, frozenset[bytes]]] = {}
 
     def match(self, topic: str) -> set[bytes]:
-        """前缀匹配 -> identity 集合。无锁读（COW）。"""
-        idx = self._read_index  # 原子读引用，无锁
+        """前缀匹配 -> identity 集合。无锁读（COW + 结果缓存）。
+
+        热路径优化：同一 topic 反复 match 时（典型发布场景），跳过 split/join
+        分配与多次 dict 查找，直接返回缓存的 frozenset。写操作通过 version
+        验证使缓存失效，确保写后不会返回陈旧结果。
+        """
+        ver = self._version  # 原子读
+        entry = self._match_cache.get(topic)
+        if entry is not None and entry[0] == ver:
+            return entry[1]  # 缓存命中
+        idx = self._read_index  # 原子读引用，与 ver 同版本
         matched: set[bytes] = set(idx.exact.get(topic, _EMPTY))
         matched |= idx.wild.get(topic, _EMPTY)
         parts = topic.split(".")
         for i in range(len(parts) - 1, 0, -1):
             matched |= idx.wild.get(".".join(parts[:i]), _EMPTY)
-        return matched
+        result = frozenset(matched)
+        self._match_cache[topic] = (ver, result)
+        return result
 
     def subscribe(self, identity: bytes, topic_pattern: str) -> None:
         with self._write_lock:
@@ -57,6 +75,7 @@ class SubscriptionTable:
                 s = set(exact.get(topic_pattern, _EMPTY)); s.add(identity)
                 exact[topic_pattern] = frozenset(s)
             self._read_index = _Index(exact, wild, by_id)
+            self._invalidate_cache()
 
     def unsubscribe(self, identity: bytes, topic_pattern: str) -> None:
         with self._write_lock:
@@ -83,6 +102,7 @@ class SubscriptionTable:
                 else:
                     exact.pop(topic_pattern, None)
             self._read_index = _Index(exact, wild, by_id)
+            self._invalidate_cache()
 
     def remove(self, identity: bytes) -> None:
         with self._write_lock:
@@ -105,6 +125,12 @@ class SubscriptionTable:
                     else:
                         exact.pop(pattern, None)
             self._read_index = _Index(exact, wild, by_id)
+            self._invalidate_cache()
+
+    def _invalidate_cache(self) -> None:
+        """写后使 match 缓存失效（在 _write_lock 内调用）。"""
+        self._version += 1
+        self._match_cache.clear()
 
     def subscribers_of(self, identity: bytes) -> set[str]:
         """查某 identity 的订阅模式集合。"""
