@@ -666,7 +666,7 @@ wheels = [
 
 [[package]]
 name = "pulse-mq"
-version = "9.0.1"
+version = "9.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "bcrypt" },
