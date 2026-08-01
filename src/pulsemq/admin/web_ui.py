@@ -57,21 +57,21 @@ header{
   background:linear-gradient(135deg, rgba(10,19,38,0.92), rgba(13,26,48,0.92));
   backdrop-filter:blur(14px);
   -webkit-backdrop-filter:blur(14px);
-  padding:14px 28px;
+  padding:10px 20px;
   border-bottom:1px solid var(--border);
   display:flex;justify-content:space-between;align-items:center;
   position:sticky;top:0;z-index:100;
   box-shadow:0 4px 24px rgba(0,0,0,0.25);
 }
-.logo{display:flex;align-items:center;gap:12px}
+.logo{display:flex;align-items:center;gap:10px}
 .logo-icon{
-  width:36px;height:36px;border-radius:10px;
+  width:30px;height:30px;border-radius:8px;
   background:linear-gradient(135deg,var(--accent-blue),var(--accent-cyan));
   display:flex;align-items:center;justify-content:center;
-  font-weight:800;font-size:18px;color:#fff;
+  font-weight:800;font-size:15px;color:#fff;
   box-shadow:0 0 18px var(--glow-blue);
 }
-.logo-text{font-size:19px;font-weight:700;color:var(--text-primary);letter-spacing:-0.3px}
+.logo-text{font-size:17px;font-weight:700;color:var(--text-primary);letter-spacing:-0.3px}
 .logo-text span{color:var(--accent-cyan);font-weight:400;font-size:13px;margin-left:8px}
 .header-right{display:flex;align-items:center;gap:14px}
 #conn-status{
@@ -89,10 +89,10 @@ header{
 }
 
 /* ===== 主内容 ===== */
-main{padding:24px 28px;max-width:1440px;margin:0 auto}
+main{padding:14px 20px;max-width:1440px;margin:0 auto}
 
 /* ===== 卡片网格 ===== */
-.card-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px}
+.card-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
 @media(max-width:900px){.card-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:500px){.card-grid{grid-template-columns:1fr}}
 
@@ -102,7 +102,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   backdrop-filter:blur(10px);
   -webkit-backdrop-filter:blur(10px);
   border:1px solid var(--border);
-  border-radius:14px;padding:22px;
+  border-radius:10px;padding:14px;
   transition:transform .25s, border-color .25s, box-shadow .25s;
 }
 .card:hover{
@@ -125,20 +125,20 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 .card.purple::before{background:linear-gradient(90deg,var(--accent-purple),#c4b5fd)}
 .card.purple::after{background:var(--accent-purple)}
 
-.card .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.card .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
 .card .label{
-  font-size:11px;color:var(--text-secondary);
+  font-size:10px;color:var(--text-secondary);
   text-transform:uppercase;letter-spacing:.1em;font-weight:600;
 }
-.card .icon{font-size:18px;line-height:1;opacity:.9}
+.card .icon{font-size:16px;line-height:1;opacity:.9}
 .card .value{
-  font-size:32px;font-weight:800;color:var(--text-primary);
+  font-size:26px;font-weight:800;color:var(--text-primary);
   letter-spacing:-0.5px;font-variant-numeric:tabular-nums;
   background:linear-gradient(135deg,#fff,#cfe0ff);
   -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
 }
-.card .sub{font-size:13px;color:var(--text-secondary);margin-top:6px}
-.sparkline{width:100%;height:32px;margin-top:8px;display:block}
+.card .sub{font-size:11px;color:var(--text-secondary);margin-top:3px}
+.sparkline{width:100%;height:22px;margin-top:4px;display:block}
 .sparkline polyline{fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .sparkline .spark-fill{opacity:.18}
 
@@ -148,12 +148,12 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   backdrop-filter:blur(10px);
   -webkit-backdrop-filter:blur(10px);
   border:1px solid var(--border);
-  border-radius:14px;padding:22px;margin-bottom:24px;
+  border-radius:10px;padding:14px;margin-bottom:14px;
   transition:border-color .2s;
 }
 .chart-section:hover{border-color:rgba(59,130,246,0.4)}
-.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px}
-.chart-title{font-size:14px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
+.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+.chart-title{font-size:13px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:8px}
 .chart-title .dot-indicator{
   width:7px;height:7px;border-radius:50%;background:var(--accent-green);
   box-shadow:0 0 8px var(--accent-green);animation:pulse 2s infinite;
@@ -171,16 +171,16 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
   color:#fff;border-color:transparent;box-shadow:0 0 14px var(--glow-blue);
 }
 .chart-hint{font-size:11px;color:var(--text-muted);margin-left:8px}
-#chart{width:100%;height:420px}
+#chart{width:100%;height:320px}
 
 /* ===== Topic 列表 ===== */
-.topic-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.topic-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
 .topic-card{
   position:relative;overflow:hidden;cursor:pointer;
   background:var(--bg-card);
   backdrop-filter:blur(8px);
   -webkit-backdrop-filter:blur(8px);
-  border:1px solid var(--border);border-radius:12px;padding:16px;
+  border:1px solid var(--border);border-radius:10px;padding:12px;
   transition:all .25s;
 }
 .topic-card:hover{
@@ -210,10 +210,16 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 
 /* ===== 事件流 ===== */
 #event-stream .ev-row{
-  padding:9px 14px;border-bottom:1px solid rgba(30,48,84,0.4);
+  padding:10px 16px;border-bottom:1px solid rgba(30,48,84,0.4);
   display:flex;justify-content:space-between;align-items:center;gap:10px;
   font-size:12px;color:var(--text-secondary);
 }
+/* ===== 延迟列表表格 ===== */
+.lat-table{width:100%;border-collapse:collapse;font-size:13px;color:#eef2fa}
+.lat-table th{padding:8px 10px;color:#8a9ab3;font-weight:600;border-bottom:1px solid var(--border)}
+.lat-table td{padding:7px 10px;border-bottom:1px solid rgba(30,48,84,0.4);text-align:center;font-variant-numeric:tabular-nums}
+.lat-table td:first-child{text-align:left}
+.lat-table tr:hover td{background:rgba(59,130,246,0.06)}
 #event-stream .ev-row:hover{background:rgba(59,130,246,0.06)}
 #event-stream .ev-type{
   font-weight:600;padding:2px 8px;border-radius:6px;font-size:11px;
@@ -353,6 +359,13 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
 
   <div class="chart-section">
     <div class="chart-header">
+      <div class="chart-title"><span>📋 主题列表</span></div>
+    </div>
+    <div class="topic-grid" id="topic-list"></div>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
       <div class="chart-title">
         <div class="dot-indicator"></div>
         <span>流量趋势（记录数 / 秒）<span class="chart-hint" style="margin-left:6px">分钟级精确值</span></span>
@@ -370,16 +383,6 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
     <div class="chart-header">
       <div class="chart-title">
         <div class="dot-indicator"></div>
-        <span>延迟对比（毫秒）<span class="chart-hint" style="margin-left:6px">半程 / 全程 P50 实时</span></span>
-      </div>
-    </div>
-    <div id="latency-chart" style="width:100%;height:320px"></div>
-  </div>
-
-  <div class="chart-section">
-    <div class="chart-header">
-      <div class="chart-title">
-        <div class="dot-indicator"></div>
         <span>延迟趋势<span class="chart-hint" style="margin-left:6px" id="lat-trend-hint">选择下方主题查看 P50/P95/P99 走势</span></span>
       </div>
       <div class="chart-controls">
@@ -387,7 +390,7 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
         <button class="time-btn" onclick="setLatKind('e2e', this)">全程</button>
       </div>
     </div>
-    <div id="latency-trend-chart" style="width:100%;height:300px"></div>
+    <div id="latency-trend-chart" style="width:100%;height:240px"></div>
   </div>
 
   <div class="chart-section">
@@ -397,12 +400,12 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
         <span>端到端延迟列表<span class="chart-hint" style="margin-left:6px">各 topic 半程/全程分位</span></span>
       </div>
     </div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;color:#eef2fa">
-      <thead><tr style="color:#8a9ab3;border-bottom:1px solid var(--border)">
-        <th style="text-align:left;padding:8px">Topic</th>
-        <th colspan="3" style="text-align:center;padding:8px">半程 (producer→server)</th>
-        <th colspan="3" style="text-align:center;padding:8px">全程 (producer→consumer)</th>
-        <th style="text-align:center;padding:8px">采样数</th>
+    <table class="lat-table">
+      <thead><tr>
+        <th style="text-align:left">Topic</th>
+        <th colspan="3" style="text-align:center">半程 (producer→server)</th>
+        <th colspan="3" style="text-align:center">全程 (producer→consumer)</th>
+        <th style="text-align:center">采样数</th>
       </tr></thead>
       <tbody id="latency-list-body"></tbody>
     </table>
@@ -415,16 +418,9 @@ main{padding:24px 28px;max-width:1440px;margin:0 auto}
         <span>最近事件流<span class="chart-hint" style="margin-left:6px">最新在上 · 自动滚动</span></span>
       </div>
     </div>
-    <div id="event-stream" style="max-height:360px;overflow-y:auto;border-radius:10px;border:1px solid var(--border);background:rgba(10,19,38,0.4)">
+    <div id="event-stream" style="max-height:240px;overflow-y:auto;border-radius:10px;border:1px solid var(--border);background:rgba(10,19,38,0.4)">
       <div class="empty">等待事件…</div>
     </div>
-  </div>
-
-  <div class="chart-section">
-    <div class="chart-header">
-      <div class="chart-title"><span>📋 主题列表</span></div>
-    </div>
-    <div class="topic-grid" id="topic-list"></div>
   </div>
 </main>
 
@@ -481,7 +477,6 @@ let state = {
 };
 
 let chart = null;
-let latencyChart = null;
 let latTrendChart = null;
 let firstSelectDone = false;
 const MAX_EVENTS = 50;
@@ -517,7 +512,7 @@ function connectSSE() {
       }
       render();
       renderOverview();
-      renderLatency();
+      renderLatencyList();
       renderEvents();
       renderSparklines();
       if (!firstSelectDone && Object.keys(d.topics || {}).length > 0) {
@@ -755,49 +750,6 @@ function renderOverview() {
   $('v-total-subs').textContent = state.totalSubs.toLocaleString();
 }
 
-function renderLatency() {
-  if (!latencyChart) {
-    latencyChart = echarts.init($('latency-chart'), null, { renderer: 'canvas' });
-    window.addEventListener('resize', () => latencyChart && latencyChart.resize());
-  }
-  // 按 topic 展示半程/全程 P50 对比
-  const allTopics = [...new Set([...Object.keys(state.latencyHalf), ...Object.keys(state.latencyE2e)])];
-  const halfP50 = allTopics.map(t => +(state.latencyHalf[t]?.p50_ms || 0));
-  const e2eP50 = allTopics.map(t => +(state.latencyE2e[t]?.p50_ms || 0));
-  latencyChart.setOption({
-    backgroundColor: 'transparent',
-    animation: true, animationDuration: 300,
-    tooltip: {
-      trigger: 'axis',
-      backgroundColor: 'rgba(10,19,38,0.95)',
-      borderColor: '#1e3054',
-      textStyle: { color: '#eef2fa', fontSize: 12 },
-      valueFormatter: v => v != null ? v.toFixed(2) + ' ms' : '-',
-    },
-    legend: { data: ['半程 P50', '全程 P50'], textStyle: { color: '#8a9ab3' }, top: 4 },
-    grid: { left: 56, right: 24, top: 36, bottom: 36 },
-    xAxis: {
-      type: 'category', data: allTopics,
-      axisLine: { lineStyle: { color: '#1e3054' } },
-      axisTick: { show: false },
-      axisLabel: { color: '#8a9ab3', fontSize: 11, rotate: allTopics.length > 5 ? 30 : 0 },
-    },
-    yAxis: {
-      type: 'value', name: 'ms',
-      nameTextStyle: { color: '#8a9ab3', fontSize: 11 },
-      axisLine: { show: false },
-      axisTick: { show: false },
-      axisLabel: { color: '#8a9ab3', fontSize: 11 },
-      splitLine: { lineStyle: { color: 'rgba(30,48,84,0.6)', type: 'dashed' } },
-    },
-    series: [
-      { name: '半程 P50', type: 'bar', data: halfP50, itemStyle: { color: '#34d399', borderRadius: [4,4,0,0] } },
-      { name: '全程 P50', type: 'bar', data: e2eP50, itemStyle: { color: '#60a5fa', borderRadius: [4,4,0,0] } },
-    ],
-  }, true);
-  renderLatencyList();
-}
-
 function renderLatencyList() {
   /* 底部端到端延迟列表：各 topic 的 half/e2e P50/P95/P99 + 采样数 */
   const topics = [...new Set([...Object.keys(state.latencyHalf), ...Object.keys(state.latencyE2e)])];
@@ -922,6 +874,8 @@ function renderLatencyTrend() {
     grid: {left: 56, right: 24, top: 36, bottom: 36},
     xAxis: {
       type: 'time',
+      min: Date.now() - state.timeRange * 60 * 1000,
+      max: Date.now(),
       axisLine: {lineStyle: {color: '#1e3054'}},
       axisLabel: {color: '#8a9ab3', fontSize: 11, formatter: '{HH}:{mm}'},
       splitLine: {show: false},
