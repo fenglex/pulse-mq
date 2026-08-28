@@ -14,7 +14,7 @@
 
 ## 安装
 
-> Python >= 3.11（3.11 / 3.12 / 3.13 均可）
+> Python >= 3.13
 
 ```bash
 pip install pulse-mq
