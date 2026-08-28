@@ -33,6 +33,7 @@ from pulsemq.stats.connections import ConnectionStats, _role_of
 from pulsemq.stats.drops import DropStats
 from pulsemq.stats.latency import LatencyStatsRegistry
 from pulsemq.stats.storage import AsyncArchiveWriter, StatsStorage
+from pulsemq.stats.throughput import ClientProcStats
 from pulsemq.stats.traffic import TrafficStats
 from pulsemq.transport.router import Transport
 
@@ -120,6 +121,8 @@ class Server:
             ring_size=self._cfg.event_ring_size,
         )
         self._drop_stats = DropStats(retention_minutes=60)
+        # 每客户端处理速率/延迟（心跳 proc 字段上报），供监控展示。
+        self._proc_stats = ClientProcStats()
         # 消费者信用（心跳报告的剩余 decode queue 容量），用于数据面流控。
         # key = ROUTER bytes identity，value = 剩余容量。0 = 队列满，跳过发送。
         self._credits: dict[bytes, int] = {}
@@ -170,6 +173,7 @@ class Server:
             latency_stats=self._lat_half,
             latency_e2e_stats=self._lat_e2e,
             drop_stats=self._drop_stats,
+            proc_stats=self._proc_stats,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
@@ -429,6 +433,10 @@ class Server:
             credit = cmd_msg.payload.get("credit")
             if credit is not None:
                 self._credits[ident] = int(credit)
+            # 处理速率/延迟指标（心跳携带，向后兼容：老客户端无 proc 字段）
+            proc = cmd_msg.payload.get("proc")
+            if proc:
+                self._proc_stats.record(cid, self._username_of(cid), proc)
             await self._transport.send(
                 ident,
                 frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
@@ -463,6 +471,7 @@ class Server:
             self._routing.remove(ident)
             self._ident_by_client_id.pop(cid, None)
             self._credits.pop(ident, None)
+            self._proc_stats.remove(cid)
             self._registry.unregister(cid)
             # 断开事件（Spec 3）：DISCONNECT → on_disconnect
             self._connections.on_disconnect(cid, "disconnect")
@@ -499,12 +508,15 @@ class Server:
                     if ident is not None:
                         self._routing.remove(ident)
                         self._credits.pop(ident, None)
+                    self._proc_stats.remove(c.client_id)
                     # 断开事件（Spec 3）：心跳超时下线 → on_disconnect
                     self._connections.on_disconnect(c.client_id, "heartbeat_timeout")
                     log_event(
                         "WARNING", "CLIENT",
                         username=c.username, reason="heartbeat_timeout",
                     )
+                # 兜底清理：proc 条目超时未更新（异常断开路径）直接丢弃。
+                self._proc_stats.sweep_stale()
             except asyncio.CancelledError:
                 break
             except Exception:

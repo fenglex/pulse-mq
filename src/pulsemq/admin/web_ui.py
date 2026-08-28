@@ -948,7 +948,8 @@ async function openClientModal() {
     body.innerHTML = `<table class="client-table">
       <thead><tr>
         <th>Client ID</th><th>用户</th><th>角色</th>
-        <th>订阅数</th><th>连接时长</th><th>远端</th>
+        <th>订阅数</th><th>处理速率</th><th>延迟(收/理)</th>
+        <th>连接时长</th><th>远端</th>
       </tr></thead>
       <tbody>${clients.map(c => {
         const role = c.role || c.roles || '';
@@ -958,11 +959,25 @@ async function openClientModal() {
         else if (role === 'sub' || role === 'consumer') { roleCls = 'sub'; roleText = 'SUB'; }
         else if (!role) { roleCls = 'mixed'; roleText = '-'; }
         const up = c.connected_at ? Math.max(0, Math.floor(Date.now()/1000 - c.connected_at)) : (c.uptime_seconds || 0);
+        const p = c.processing || null;
+        const rate = p && p.rate_per_sec != null ? p.rate_per_sec : null;
+        const recvMs = p && p.recv_avg_ms != null ? p.recv_avg_ms : null;
+        const procMs = p && p.proc_avg_ms != null ? p.proc_avg_ms : null;
+        const rateText = rate != null ? esc(String(rate)) + ' msg/s' : '-';
+        const latText = (recvMs != null || procMs != null)
+          ? esc((recvMs != null ? recvMs : '-') + ' / ' + (procMs != null ? procMs : '-') + ' ms')
+          : '-';
+        const topicsTip = c.processing_topics
+          ? ' title="' + esc(Object.entries(c.processing_topics).map(([t, m]) =>
+              t + ': ' + (m.rate != null ? m.rate : '?') + ' msg/s').join('&#10;')) + '"'
+          : '';
         return `<tr>
           <td>${esc(c.client_id || c.id || '-')}</td>
           <td>${esc(c.user || c.username || '-')}</td>
           <td><span class="client-role ${roleCls}">${roleText}</span></td>
           <td>${esc((c.subscriptions != null ? c.subscriptions : (c.sub_count != null ? c.sub_count : '-')))}</td>
+          <td${topicsTip}>${rateText}</td>
+          <td${topicsTip}>${latText}</td>
           <td>${formatUptime(up)}</td>
           <td>${esc(c.remote || c.peer || '-')}</td>
         </tr>`;

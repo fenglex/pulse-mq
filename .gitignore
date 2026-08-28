@@ -29,7 +29,8 @@ data/
 bench_results.md
 bench_state.json
 bench_multiprocess_results.md
-bench_stats.sqlite
+bench_comprehensive_results.md
+bench_comp_stats.sqlite
 # C 扩展编译产物
 *.pyd
 *.so

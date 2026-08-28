@@ -70,6 +70,7 @@ class AdminServer:
         latency_stats=None,
         latency_e2e_stats=None,
         drop_stats=None,
+        proc_stats=None,
         admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
@@ -85,6 +86,7 @@ class AdminServer:
         self._latency = latency_stats
         self._latency_e2e = latency_e2e_stats
         self._drop_stats = drop_stats
+        self._proc_stats = proc_stats
         self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
@@ -373,6 +375,9 @@ class AdminServer:
         # 消费端丢弃统计（来自心跳聚合）
         if self._drop_stats is not None:
             snap["drops"] = self._drop_stats.snapshot()
+        # 每客户端上报的 per-topic 处理速率/延迟聚合（心跳 proc 字段）
+        if self._proc_stats is not None:
+            snap["processing_by_topic"] = self._proc_stats.topics()
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())
@@ -395,7 +400,7 @@ class AdminServer:
             return {"clients": []}
         clients = []
         for c in self._connections.online_clients():
-            clients.append({
+            entry = {
                 "client_id": c.client_id,
                 "username": c.username,
                 "role": c.role,
@@ -403,7 +408,19 @@ class AdminServer:
                 "topics": list(c.topics),
                 "connected_at_iso": _iso(c.connected_at),
                 "duration_seconds": round(c.duration_seconds, 1),
-            })
+                # Web UI 客户端表格实际读取的字段名（与上兼容并存）：
+                # connected_at（数值秒）、remote、subscriptions（订阅数）。
+                "connected_at": c.connected_at,
+                "remote": c.endpoint,
+                "subscriptions": len(c.topics),
+            }
+            # 处理速率/延迟（心跳 proc 上报；老客户端无数据则缺省）。
+            if self._proc_stats is not None:
+                proc = self._proc_stats.client_entry(c.client_id)
+                if proc is not None:
+                    entry["processing"] = self._proc_stats.summarize(proc)
+                    entry["processing_topics"] = proc["topics"]
+            clients.append(entry)
         return {"clients": clients}
 
     def _events_snapshot(self, limit: int) -> dict:

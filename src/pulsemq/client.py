@@ -134,6 +134,61 @@ class _DropQueue:
             self._cond.notify_all()
 
 
+class _ProcStats:
+    """自上次心跳以来的 per-topic 处理统计（线程安全），供心跳上报。
+
+    - ``record_recv``：接收延迟（recv 线程，帧到达时间 - 帧内时间戳）。
+    - ``record_proc``：处理耗时（decode + 回调执行；inline 模式在事件循环线程，
+      worker 模式在解码线程）。
+    - ``drain``：心跳线程取走并清零，折算为速率/均值后随 HEARTBEAT 上报。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count: dict[str, int] = {}    # 接收并匹配的消息条数
+        self._recv_ns: dict[str, int] = {}  # 接收延迟累计（ns）
+        self._proc_ns: dict[str, int] = {}  # 处理耗时累计（ns）
+        self._proc_n: dict[str, int] = {}   # 完成处理的消息条数
+        self._last_drain = time.time_ns()
+
+    def record_recv(self, topic: str, latency_ns: int) -> None:
+        with self._lock:
+            self._count[topic] = self._count.get(topic, 0) + 1
+            self._recv_ns[topic] = self._recv_ns.get(topic, 0) + latency_ns
+
+    def record_proc(self, topic: str, duration_ns: int) -> None:
+        with self._lock:
+            self._proc_n[topic] = self._proc_n.get(topic, 0) + 1
+            self._proc_ns[topic] = self._proc_ns.get(topic, 0) + duration_ns
+
+    def drain(self) -> dict[str, dict]:
+        """取走并清零，返回 {topic: {count, rate, recv_avg_ns, proc_avg_ns}}。
+
+        rate 按实际流逝时间（两次 drain 间隔）折算，比名义心跳间隔更准。
+        空窗口（无消息）返回空 dict，心跳里省略 proc 字段。
+        """
+        with self._lock:
+            now = time.time_ns()
+            elapsed = max(1e-9, (now - self._last_drain) / 1e9)
+            self._last_drain = now
+            count, recv_ns = self._count, self._recv_ns
+            proc_ns, proc_n = self._proc_ns, self._proc_n
+            self._count = {}
+            self._recv_ns = {}
+            self._proc_ns = {}
+            self._proc_n = {}
+        out: dict[str, dict] = {}
+        for topic, n in count.items():
+            entry: dict = {"count": n, "rate": round(n / elapsed, 2)}
+            if n > 0:
+                entry["recv_avg_ns"] = recv_ns.get(topic, 0) // n
+            pn = proc_n.get(topic, 0)
+            if pn > 0:
+                entry["proc_avg_ns"] = proc_ns.get(topic, 0) // pn
+            out[topic] = entry
+        return out
+
+
 def require_connected(func):
     """要求 _connected 且 _authenticated，否则抛 ConnectionError。"""
 
@@ -191,6 +246,8 @@ class Client:
         # 两线程模型：recv 线程入队 → worker 线程解码。decode_queue_size<=0 时禁用。
         self._decode_queue: _DropQueue | None = None
         self._worker_thread: threading.Thread | None = None
+        # per-topic 处理统计（接收延迟 + 处理耗时），随心跳上报服务端。
+        self._proc_stats = _ProcStats()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._transport = Transport(sndhwm=self._sndhwm, rcvhwm=self._rcvhwm)
         self._connected = False
@@ -676,6 +733,8 @@ class Client:
                        if pid in self._subscriptions]
             if not matched:
                 continue
+            # 处理统计：接收延迟（帧到达 - 帧内时间戳），仅统计匹配的消息。
+            self._proc_stats.record_recv(hdr.topic, time.time_ns() - hdr.timestamp_ns)
             if self._decode_queue is not None:
                 # 两线程模式：入队，worker 线程负责 decode + callback
                 self._decode_queue.put((frame_bytes, hdr, matched))
@@ -684,6 +743,7 @@ class Client:
 
     async def _inline_decode_and_dispatch(self, frame_bytes: bytes, hdr, matched) -> None:
         """内联解码 + 回调分发（兼容模式 / decode_queue_size<=0 时使用）。"""
+        t0 = time.perf_counter_ns()
         need_decode = any(not ho for _, ho in matched)
         msg = None
         if need_decode:
@@ -691,6 +751,7 @@ class Client:
                 msg = frames.decode(frame_bytes)
             except Exception:
                 logger.debug("client 帧解码失败，丢弃")
+                self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
                 return
         for cb, ho in matched:
             try:
@@ -701,6 +762,7 @@ class Client:
                     cb(target)
             except Exception:
                 logger.exception("订阅回调异常")
+        self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
 
     def _decode_worker_loop(self) -> None:
         """worker 线程：批量出队 → 完整 decode → 回调分发。
@@ -715,6 +777,7 @@ class Client:
             if not batch:
                 continue
             for frame_bytes, hdr, matched in batch:
+                t0 = time.perf_counter_ns()
                 need_decode = any(not ho for _, ho in matched)
                 msg = None
                 if need_decode:
@@ -722,6 +785,7 @@ class Client:
                         msg = frames.decode(frame_bytes)
                     except Exception:
                         logger.debug("worker 帧解码失败，丢弃")
+                        self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
                         continue
                 for cb, ho in matched:
                     if cb is None:
@@ -735,6 +799,7 @@ class Client:
                             cb(target)
                     except Exception:
                         logger.exception("订阅回调异常")
+                self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
 
     # -------------------------------------------------------- heartbeat loop
 
@@ -752,6 +817,10 @@ class Client:
                     if drops:
                         payload["drops"] = drops
                     payload["credit"] = self._decode_queue.remaining()
+                # 处理统计：per-topic 处理速率 + 接收/处理延迟均值（自上次心跳以来）
+                proc = self._proc_stats.drain()
+                if proc:
+                    payload["proc"] = proc
                 hb = frames.encode_control(ControlCmd.HEARTBEAT, payload)
                 await self._transport.send(b"", hb, role="control")
             except Exception:
