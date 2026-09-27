@@ -267,6 +267,55 @@ async def test_pool_consumer_async_callback(record_dir):
         await srv.stop()
 
 
+async def test_consumer_unsubscribe_stops_delivery(record_dir):
+    """动态退订：unsubscribe 后服务端停止路由、worker 停止分发。
+
+    三层验证：本地订阅表移除 → 服务端 UNSUBSCRIBE 生效（新帧不再送达）→
+    已收帧不受影响；重订阅同模式可恢复接收。
+    """
+    srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
+    try:
+        c = ConsumerClient(
+            f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
+            "c", "c",
+        )
+        p = ProducerClient(
+            f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
+            "p", "p",
+        )
+        await c.start()
+        await p.start()
+        await c.subscribe("unsub.test", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.6)
+        await p.publish("unsub.test", {"n": 1})
+        await mp_callbacks.wait_records(record_dir, 1,
+                                        pred=lambda r: r["topic"] == "unsub.test")
+
+        await c.unsubscribe("unsub.test")
+        assert "unsub.test" not in c._subscriptions
+        await asyncio.sleep(0.8)
+        n_before = len(mp_callbacks.read_records(record_dir))
+        await p.publish("unsub.test", {"n": 2})
+        await p.publish("unsub.other", {"n": 3})  # 无订阅者，静默
+        await asyncio.sleep(1.2)
+        assert len(mp_callbacks.read_records(record_dir)) == n_before, \
+            "退订后仍收到帧"
+
+        # 幂等：重复退订不报错
+        await c.unsubscribe("unsub.test")
+        # 重订阅恢复接收
+        await c.subscribe("unsub.test", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.6)
+        await p.publish("unsub.test", {"n": 4})
+        await mp_callbacks.wait_records(
+            record_dir, n_before + 1,
+            pred=lambda r: r["topic"] == "unsub.test")
+        await c.stop()
+        await p.stop()
+    finally:
+        await srv.stop()
+
+
 async def test_consumer_slow_callback_throttled_no_loss(record_dir):
     """慢回调：信用流控 + 服务端缓冲使消息不丢失（9.2.2 后语义）。
 

@@ -38,7 +38,7 @@ from pulsemq import Server
 最简单的方式是直接用 CLI（零配置，首次启动自动生成默认 `admin` 用户，密码输出到 stderr）：
 
 ```bash
-pulsemq          # 或： pulsemq-server
+pulsemq          # 或： pulsemq-server（--help / --version 可用；9.2.6 起解析参数）
 ```
 
 也可以在代码中启动（`start()` 是协程，需要 `asyncio.run` 包裹）：
@@ -170,10 +170,16 @@ async def main():
 asyncio.run(main())
 ```
 
-`subscribe` 支持 `header_only=True`——回调只接收 `FrameHeader`（topic / record_count / timestamp_ns），跳过完整反序列化，适合只需头部信息的低延迟场景：
+`subscribe` 支持 `header_only=True`——回调只接收 `FrameHeader`（topic / record_count / timestamp_ns / seq），跳过完整反序列化，适合只需头部信息的低延迟场景：
 
 ```python
 await cons.subscribe("market.*", on_header, header_only=True)
+```
+
+动态退订（9.2.6 起）——立即停止本地分发并向服务端发送 UNSUBSCRIBE，幂等：
+
+```python
+await cons.unsubscribe("market.*")
 ```
 
 `ProducerClient` / `ConsumerClient` 分别屏蔽订阅 / 发布能力；通用 `Client` 同时支持两者。
@@ -382,18 +388,20 @@ curl -N 'http://localhost:9090/api/v1/stats/stream?token=<token>'
 
 ## 协议帧格式
 
-**单 bytes 帧**（非 ZMQ 多帧，通过 DEALER/ROUTER 传输）：
+**单 bytes 帧**（非 ZMQ 多帧，通过 DEALER/ROUTER 传输；9.2.5 起 v3 唯一格式）：
 
 ```
-magic(2) ver(1) msg_type(1) flags(1) data_type(1) topic_len(2 BE)
-topic(N) ts(8 BE ns) record_count(4 BE) payload(变长) [CRC32?(4)]
+magic(2) ver(1) msg_type(1) flags(1) data_type(1) topic_len(1)
+seq(8 BE) ts(8 BE ns) record_count(4 BE) [ack_token(4)] topic(N) payload(变长) [CRC32?(4)]
 ```
 
-- `magic` = `"PM"`，`ver` = `0x01`
+- `magic` = `"PM"`，`ver` = `0x03`
 - `msg_type` = DATA(`0x01`) / CONTROL(`0x02`)
-- `flags` 位域：序列化器（bit 0-2）+ 压缩算法（bit 3-4）+ CRC（bit 7）+ reserved（bit 5-6）
+- `seq`（8B）恒在帧内：生产者占位 0，服务端按固定偏移 7 改写为 per-topic 单调序号
+- `ack_token`（4B，可选，flags bit 6）：确认发布回执编号
+- `flags` 位域：序列化器（bit 0-2）+ 压缩算法（bit 3-4）+ ack_token（bit 6）+ CRC（bit 7）+ reserved（bit 5）
 - `data_type` = UNKNOWN(`0x00`) / DICT(`0x01`) / DATAFRAME(`0x02`) / STR(`0x03`) / BYTES(`0x04`)
-- `record_count` 上限 **1,000,000**
+- `topic` 上限 **255 字节**（1B topic_len）；`record_count` 上限 **1,000,000**；单帧上限 256MB
 - CRC 可选（由 flags bit 7 指示，默认关闭）
 
 位级布局与 flags 编码细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#5-协议模块-protocol)。

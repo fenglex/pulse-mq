@@ -168,6 +168,9 @@ def _worker_main(worker_index: int, ring_name: str, ring_bytes: int,
             if op == "add":
                 sub_table.subscribe(pattern.encode("utf-8"), pattern)
                 cb_map[pattern] = (cb, ho)
+            elif op == "remove":
+                sub_table.unsubscribe(pattern.encode("utf-8"), pattern)
+                cb_map.pop(pattern, None)
 
     def _dispatch(cb, target) -> None:
         """执行单个回调：同步直接调用，异步在 worker 事件循环上串行执行。"""
@@ -345,6 +348,17 @@ class WorkerPool:
         for q in self._sub_qs:
             try:
                 q.put_nowait(("add", pattern, cb, header_only))
+            except Exception:
+                pass
+
+    def remove_subscription(self, pattern: str) -> None:
+        """向全部 worker 下发退订（unsubscribe 时）。幂等。"""
+        self.subs = [(p, cb, ho) for p, cb, ho in self.subs if p != pattern]
+        if self._sub_qs is None:
+            return
+        for q in self._sub_qs:
+            try:
+                q.put_nowait(("remove", pattern, None, None))
             except Exception:
                 pass
 

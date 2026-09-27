@@ -222,3 +222,24 @@ async def test_workers_roundrobin_and_field_key():
         os.environ.pop("PULSEMP_RECORD", None)
         await srv.stop()
 
+
+
+# ---------------- remove_subscription 单元测（9.2.6） ----------------
+
+def _noop_cb(msg):
+    pass
+
+
+def test_remove_subscription_syncs_subs_and_idempotent():
+    """remove_subscription 同步内部订阅表且幂等（未 start 时不触碰子进程队列）。"""
+    from pulsemq.worker_pool import WorkerPool
+
+    pool = WorkerPool(2, 64 * 1024,
+                      [("a.*", _noop_cb, False), ("b.*", _noop_cb, True)],
+                      "topic", None)
+    pool.remove_subscription("a.*")
+    assert [p for p, _, _ in pool.subs] == ["b.*"]
+    pool.remove_subscription("a.*")  # 幂等：重复退订无副作用
+    assert [p for p, _, _ in pool.subs] == ["b.*"]
+    pool.remove_subscription("不存在的")  # 空操作
+    assert [p for p, _, _ in pool.subs] == ["b.*"]

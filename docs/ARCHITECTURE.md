@@ -51,7 +51,7 @@ PulseMQ 是 Client/Server 模型的消息中间件，基于 ZeroMQ ROUTER/DEALER
 ### 核心设计原则
 
 - **数据面/控制面分离** — 两个独立 ROUTER socket：数据面专做高吞吐转发，控制面处理注册/心跳/订阅。互不阻塞。
-- **零反序列化路由** — 服务端转发时只调 `decode_header`（提取 topic/计数/时间戳），绝不解压或反序列化 payload。完整 `decode` 由消费者做。
+- **零反序列化路由** — 服务端转发时只调 `decode_header`（提取 topic/计数/时间戳/seq），绝不解压或反序列化 payload。完整 `decode` 由消费者做。
 - **路由键 = ROUTER bytes identity** — 不是 client_id 字符串。Transport 发送 `send_multipart([identity_bytes, frame])`。两层面 DEALER 共用同一 bytes identity，使控制面注册的 identity 可直接用于数据面转发。
 - **内存转发** — 消息不落盘；统计（分钟级流量）异步写入 SQLite，不阻塞转发路径。
 
@@ -70,9 +70,10 @@ PulseMQ 是 Client/Server 模型的消息中间件，基于 ZeroMQ ROUTER/DEALER
    │ encode() → 单 bytes 帧
    ▼
 数据面 ROUTER (同步线程)
-   │ decode_header()        仅提取头部，不解 payload
+   │ decode_header()        仅提取头部（topic/计数/时间戳/seq/ack_token），不解 payload
    ├─→ TrafficStats.record(topic, record_count, payload_size)
    ├─→ LatencyStats.sample  按 sample_rate 采样半程延迟
+   ├─→ rewrite_seq(frame, seq)  固定偏移改写 per-topic seq（CRC 帧重算）
    ├─→ SubscriptionTable.match(topic)  COW 无锁读 + 缓存
    └─→ Transport.broadcast_sync(matched, frame, credits)  DONTWAIT
               │ credit=0 跳过（信用流控）；发送失败计入 DropStats
@@ -493,7 +494,7 @@ start()
   ├─ 控制面 DEALER connect（复用认证态，不开 monitor）
   ├─ _register() → 发 REGISTER，按 request_id 匹配回复（超时 3s → exit 4）
   ├─ 恢复既有订阅（重连场景；首次为空）
-  ├─ （可选）创建 _DropQueue + decode worker 线程
+  ├─ 有订阅即创建多进程消费池（9.2.4 起唯一消费模式，懒建见 9.4）
   ├─ recv_loop + heartbeat_loop
   └─ 切换 monitor 回调到运行期（接管断线重连）
 ```
@@ -524,20 +525,23 @@ disconnected → _reconnecting=True → 创建重连任务
 
 Spec 规定重连 REGISTER 收到 `ALREADY_ONLINE` 应 exit 4。但服务端 stale 记录要等心跳超时扫描（`heartbeat_timeout=6s`）才释放。若一遇到 ALREADY_ONLINE 立即退出 4，网络闪断后的任何重连都会被旧条目击落，自动重连形同虚设。因此当前实现把 ALREADY_ONLINE 视为暂态失败，退避重试，待心跳扫描释放后自然成功。
 
-### 9.4 两线程消费模型 + `_DropQueue`
+### 9.4 多进程消费池（9.2.4 起唯一消费模式）
+
+两线程解码队列（`_DropQueue`）与事件循环内联分发已在 9.2.4 删除，当前唯一路径：
 
 ```
-recv_loop (asyncio):
-  recv → decode_header → 延迟采样回传 → 路由匹配
-    ├─ decode_queue 存在 → put(frame, hdr, matched) 入队
-    └─ 否则 → _inline_decode_and_dispatch（同步 decode + 回调）
+主进程 recv_loop (asyncio):
+  recv → decode_header（零 payload 解码）→ 缺口跟踪 → 延迟采样回传
+       → WorkerPool.route(topic, frame)：按 key 选环 → ShmRing.write
 
-worker 线程 (_decode_worker_loop):
-  get_batch(64) 批量出队 → 完整 decode → 回调分发
-    同步回调在 worker 直接调用；异步回调 run_coroutine_threadsafe 回事件循环
+worker 进程 ×N（spawn，独立 GIL）:
+  _worker_main: read_batch(64) 出环 → decode_header 匹配订阅 →
+  完整 decode → 回调分发（同步直调；异步回调在 worker 自有事件循环上串行）
 ```
 
-`_DropQueue`（`deque(maxlen=N)`）：满时丢弃最老消息，按 topic 计数。`drain_drops()` 取走并清零（供心跳上报），`remaining()` 报告剩余容量（供 credit 流控）。
+环满（worker 消费不过来）走 drop-new：主进程路由计数 `_route_drops`，
+随心跳上报服务端 DropStats；已观测的 seq 回退基线，缺口计数不漏报。
+credit = Σ 环空闲字节 ÷ 观测最大帧长（保守帧数上界）。
 
 ### 9.5 控制面回复匹配 `_recv_control_reply`
 
@@ -552,16 +556,17 @@ v9 引入的端到端流控与可观测性。
 ### 10.1 信用窗口流控
 
 ```
-消费端 _DropQueue.remaining() ──(心跳 credit 字段)──→ 服务端 _credits[ident]
-                                                          │
-数据面 broadcast_sync(matched, frame, credits):            │
-  for target in matched:                                   ▼
+消费端 WorkerPool.free_credit() ──(心跳 credit 字段)──→ 服务端 _credits[ident]
+        （Σ 环空闲字节 ÷ 观测最大帧长）                      │
+数据面 broadcast_sync(matched, frame, credits):              │
+  for target in matched:                                     ▼
     if credits.get(target, -1) == 0:   ← 信用耗尽，跳过
         drops += 1; continue
     sock.send_multipart([target, frame], DONTWAIT)
 ```
 
-消费端解码队列满时 `credit=0`，服务端跳过该订阅者的发送，避免向慢消费者堆积消息。
+消费端环满（worker 消费不过来）时 credit 趋近 0，服务端跳过该订阅者的直发，
+帧转入订阅者缓冲按窗口节奏发送，避免向慢消费者堆积消息。
 
 ### 10.2 DONTWAIT 非阻塞发送
 
@@ -569,12 +574,13 @@ v9 引入的端到端流控与可观测性。
 
 ### 10.3 丢弃统计 `DropStats`
 
-两个丢弃来源聚合到服务端 `DropStats`：
+三个丢弃来源聚合到服务端 `DropStats`：
 
 | 来源 | 触发 | 上报路径 |
 |------|------|---------|
 | 服务端 DONTWAIT 发送失败 / credit 耗尽 | `broadcast_sync` 返回丢弃数 | 直接 `drop_stats.record` |
-| 消费端 `_DropQueue` 满 | recv 丢弃最老消息 | 心跳 `drops` 字段（向后兼容老客户端） |
+| 服务端缓冲淘汰/过期（drop_old/conflate） | `BufferManager.on_drop` 回调 | 直接 `drop_stats.record`（evicted/expired 分计） |
+| 消费端 worker 环满（drop-new） | `WorkerPool.route` 写环失败，主进程按 topic 计数 | 心跳 `drops` 字段；被观测 seq 回退基线，缺口计数不漏报 |
 
 `DropStats`：分钟桶 + 1h 滚动窗口，提供三级粒度：`drops_current`（当前分钟）/ `drops_last_min`（上一完整分钟）/ `drops_1h_total`（近 1h 累计）。
 
@@ -596,9 +602,13 @@ v9 引入的端到端流控与可观测性。
 
 ZAP handler 兼容接口，委托 CredentialStore。`verify(username, password) → (ok, reason)`，reason 为 `user_not_found`/`invalid_password`/`user_disabled`。
 
+**双面强制覆盖**：控制面 ROUTER 用 `AsyncZAPHandler`（asyncio ctx），数据面 ROUTER 用 `SyncZAPHandler`（同步线程独立 ctx）——两个 zmq context 各自内建 `inproc://zeromq.zap.01` 端点，PLAIN 关闭时连接在握手期即被拒绝（实测 NULL 机制 → HANDSHAKE_FAILED_PROTOCOL、错密码 → HANDSHAKE_FAILED_AUTH）。ZAP 端点进程内唯一，故同进程只能启动一个 Server 实例（重复启动报明确的 PulseMQError）。
+
 ### 11.3 admin token（`admin/auth.py`）
 
 `TokenAuth`：除 `/healthz` 外所有 admin 路由需携带有效 token。token 经 `?token=` query 或 `Authorization: Bearer` header 携带，用 `hmac.compare_digest` 常量时间比较（防时序攻击）。空 token → 禁用（放行，向后兼容）。
+
+token 来源优先级（`Server._resolve_admin_token`）：显式参数 > config（含 `PULSEMQ_ADMIN_TOKEN` 环境变量）> 随机生成 32 字节 base64url（写 `admin_token_file`，POSIX 0600 + 权限位检查告警，Windows 提示目录 ACL 受控；明文仅 stderr 输出一次）。
 
 ---
 
@@ -734,7 +744,7 @@ v9 对服务端热路径的优化（`_on_data_message` 每条消息执行）：
 TOML + 环境变量，全默认值，零配置可启动。环境变量覆盖 TOML，显式构造参数覆盖一切。
 
 - `ServerConfig`（`config.py:17`）：data/control/admin endpoint、credentials_file、heartbeat_timeout、stats_db、stats_retention_minutes、bcrypt_cost、admin_token/file、sse_interval、latency_sample_rate、event_ring_size、stats_archive_batch_size、admin_thread、ui_enabled、retention_days、sndhwm/rcvhwm。
-- `ClientConfig`（`config.py:46`）：endpoint、username/password、client_id、heartbeat_interval、reconnect_*（initial/max/backoff）、sndhwm/rcvhwm、decode_queue_size。
+- `ClientConfig`（`config.py:46`）：endpoint、username/password、client_id（默认 uuid4）、heartbeat_interval、reconnect_*（initial/max/backoff）、sndhwm/rcvhwm。消费端池参数（workers/key/worker_ring_mb/worker_init）由 ConsumerClient 直接配置，不经 TOML。
 - `__post_init__`：确保 `data/` 目录存在。
 
 ### 16.2 异常与退出码 `errors.py`

@@ -47,3 +47,33 @@ def test_cli_passwd(tmp_path):
     s = CredentialStore(f, allow_auto_generated=False); s.load()
     assert s.verify("alice", "new").success is True
     assert s.verify("alice", "old").success is False
+
+
+def test_server_cli_help_exits_zero():
+    """pulsemq 入口解析参数：--help 立即退出 0，不再启动服务器（9.2.6 修复）。"""
+    import subprocess
+    import sys
+
+    r = subprocess.run([sys.executable, "-m", "pulsemq.cli.server", "--help"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0
+    assert "usage" in r.stdout.lower()
+
+
+def test_server_cli_version():
+    import subprocess
+    import sys
+
+    from pulsemq._version import __version__
+
+    r = subprocess.run([sys.executable, "-m", "pulsemq.cli.server", "--version"],
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and __version__ in (r.stdout + r.stderr)
+
+
+def test_server_cli_main_help_system_exit():
+    from pulsemq.cli.server import main as server_main
+
+    with pytest.raises(SystemExit) as ei:
+        server_main(["--help"])
+    assert ei.value.code == 0

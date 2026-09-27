@@ -651,6 +651,45 @@ class Client:
         except Exception:
             logger.debug("SUBSCRIBE 排空 ack 失败", exc_info=True)
 
+    async def _send_unsubscribe(self, pattern: str) -> None:
+        """发送 UNSUBSCRIBE 控制帧；按 request_id 匹配回复（C3），容错超时。"""
+        req_id = uuid.uuid4().hex
+        req = frames.encode_control(
+            ControlCmd.UNSUBSCRIBE,
+            {"client_id": self._client_id, "topic": pattern, "request_id": req_id},
+        )
+        try:
+            await asyncio.wait_for(
+                self._transport.send(b"", req, role="control"),
+                timeout=_CONTROL_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.debug("UNSUBSCRIBE 发送超时（控制面繁忙），跳过 ack 排空")
+        except Exception:
+            logger.debug("UNSUBSCRIBE 发送失败", exc_info=True)
+            return
+        try:
+            await asyncio.wait_for(
+                self._recv_control_reply(req_id, 0.5),
+                timeout=0.5 + _CONTROL_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass
+        except Exception:
+            logger.debug("UNSUBSCRIBE 排空 ack 失败", exc_info=True)
+
+    async def unsubscribe(self, topic_pattern: str) -> None:
+        """取消订阅（动态退订，幂等）。
+
+        立即停止本地分发（worker 池同步移除该模式），并向服务端发送
+        UNSUBSCRIBE（服务端停止路由）。未连接时仅移除本地订阅——下次
+        start() 不会自动恢复该订阅。退订不存在的模式为空操作。
+        """
+        self._subscriptions.pop(topic_pattern, None)
+        self._sub_header_only.pop(topic_pattern, None)
+        if self._pool is not None:
+            self._pool.remove_subscription(topic_pattern)
+        if self._connected:
+            await self._send_unsubscribe(topic_pattern)
+
     def _validate_worker_callback(self, cb, what: str = "回调") -> None:
         """多进程模式的回调约束：可跨进程按引用传递（pickle），同步或异步均可。
 

@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 import zmq
 import zmq.asyncio
 
+from pulsemq.errors import PulseMQError
 from pulsemq.logging_setup import logger
 
 AuthCallback = Callable[[str, str, bool, "str | None"], Awaitable[None]]
@@ -42,7 +43,12 @@ class AsyncZAPHandler:
 
     async def start(self) -> None:
         self._socket = self._ctx.socket(zmq.REP)
-        self._socket.bind("inproc://zeromq.zap.01")
+        try:
+            self._socket.bind("inproc://zeromq.zap.01")
+        except zmq.error.ZMQError as e:
+            raise PulseMQError(
+                "同进程只能运行一个 Server 实例：ZAP 端点 "
+                "inproc://zeromq.zap.01 已被占用（多实例请分进程部署）") from e
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:

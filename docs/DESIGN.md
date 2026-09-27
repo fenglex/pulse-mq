@@ -159,8 +159,13 @@ cmd 作为 topic，msgpack 载荷，无压缩。控制帧走**控制面 socket**
 - 客户端控制面发送同样带超时保护（`_CONTROL_SEND_TIMEOUT=2s`）。
 
 **生命周期**：connect（ZAP PLAIN 握手，monitor 裁定）→ REGISTER（注册/订阅/缓冲协商）→
-运行期（数据 + 1s 心跳 + 随时 SUBSCRIBE）→ DISCONNECT 或心跳超时（默认 6s，可配置）→
-服务端清扫（路由/credits/缓冲）。
+运行期（数据 + 1s 心跳 + 随时 SUBSCRIBE / UNSUBSCRIBE）→ DISCONNECT 或心跳超时
+（默认 6s，可配置）→ 服务端清扫（路由/credits/缓冲）。
+
+**部署约束（9.2.6 起显式化）**：同一进程只能启动一个 Server 实例——ZAP 认证
+端点 `inproc://zeromq.zap.01` 是 ZeroMQ 的进程级全局端点，第二个实例启动时
+会得到明确的 PulseMQError（而非隐晦的 ZMQError）。单机多实例分进程部署
+（测试实例 5557/5558/9091 与生产实例 5555/5556/9090 即此形态）。
 
 ---
 
@@ -181,13 +186,11 @@ cmd 作为 topic，msgpack 载荷，无压缩。控制帧走**控制面 socket**
     对端 EAGAIN → 本轮停，帧保留
 ```
 
-三种消费形态的 credit 来源与限流值：
+多进程消费池（唯一消费形态）的 credit 来源与限流值：
 
 | 形态 | credit 来源 | 供给节流上限 |
 |---|---|---|
-| 两线程（默认） | 解码队列剩余（≤4096） | ~4,096 帧/s |
-| 多进程池 | Σ 环空闲字节 ÷ 观测最大帧长（64MB 环 ≈ 65,536） | ~65k 帧/s |
-| 内联 | 不上报（−1） | 不限流 |
+| 多进程池（workers=N，9.2.4 起唯一模式） | Σ 环空闲字节 ÷ 观测最大帧长（64MB 环 ≈ 65,536） | ~65k 帧/s |
 
 已知边界：窗口 1s 粒度（快 worker 被钉在快照值、突发响应慢一拍）、按帧计数
 （池模式按最大帧长折算字节，混合帧长预算保守）、服务端出流硬上限 ~51k 帧/s
@@ -255,7 +258,8 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
   （9.2.4：异步回调在 worker 进程自有事件循环上执行，同一 worker 内串行）；
   lambda/闭包在订阅时即报错——worker 内不共享主进程内存，闭包捕获是拷贝。
   `worker_init(worker_index)` 每进程初始化一次。
-- **动态订阅**：start 后调用 subscribe 经每 worker 的 sub_q 下发；
+- **动态订阅/退订**：start 后调用 subscribe 经每 worker 的 sub_q 下发（9.2.6 起
+  `unsubscribe()` 同通道下发 remove，并向服务端发 UNSUBSCRIBE，幂等）；
   首次动态订阅会懒创建池（阻塞 ~0.3s 等 worker attach）。
 - **统计**：worker 每 1s 经 mp.Queue 上报 processed/rows/proc 耗时（9.2.4：
   空闲路径同样定期 flush，避免最后一批统计滞留）；SM 头部 diag 计数为主对账通道。
@@ -358,11 +362,11 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| 9.2.5 | 客户端接收循环批量化 | 单线程逐帧 await ~80µs/帧，供给封顶 12.4k 帧/s；批量 recv 预计 50k+ |
-| 9.2.5 | credit 粒度细化 | 1s 窗口 → 数据通道按需捎带 + 字节预算（混合帧长失真、突发响应慢一拍）|
-| 9.2.5 | worker 统计通路加固 | mp.Queue 在 Windows feeder 延迟不可靠；SM diag 为权威，Queue 通道需重做 |
-| 9.2.5 | 缓冲"条数"改记录数语义 | max_messages 按帧计数，批量负载下形同虚设（§5.2） |
-| 9.3.0 | **消费端拉模式（FETCH 协议）** | 删除 credit 机制整体（背压天然成立），供给上限 12.4k→50k+；API 不变 |
+| 9.2.7 | 客户端接收循环批量化 | 逐帧 await 的循环开销仍占主进程接收成本（实测 17.4k 帧/s 零丢失通过）；批量 recv 可再抬上限 |
+| 9.2.7 | credit 粒度细化 | 1s 窗口 → 数据通道按需捎带 + 字节预算（混合帧长失真、突发响应慢一拍）|
+| 9.2.7 | worker 统计通路加固 | mp.Queue 在 Windows feeder 延迟不可靠；SM diag 为权威，Queue 通道需重做 |
+| 9.2.7 | 缓冲"条数"改记录数语义 | max_messages 按帧计数，批量负载下形同虚设（§5.2） |
+| 9.3.0 | **消费端拉模式（FETCH 协议）** | 删除 credit 机制整体（背压天然成立），抬高供给上限；API 不变 |
 | 9.3.0 | 消费端丢弃策略统一参数化 | 池模式 drop-new 与行情语义相反（worker 停滞丢最新），需 Vyukov 序列号环改 drop-oldest |
 | 9.3.0 | 服务端数据面多线程/分片 | 单线程出流 ~51k 帧/s 上限（fetch 批量回发可先缓解） |
 | backlog | 通配符语义文档化 | `foo.*` 为层级前缀匹配（不匹配 `foo.c1` 类同级名），易误解 |
@@ -382,6 +386,7 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 | 9.2.3 | 多进程消费池（ShmRing + workers/key 参数 + 动态订阅 + worker_pool 开关）；环满缺口回退计数；帧级对账工具 |
 | 9.2.4 | **消费端架构收敛为唯一模式：多进程池**（删除两线程解码队列与内联分发，默认 workers=1 = 主进程+1 worker）；池下沉到基类（任意订阅走池，运行期懒建）；异步回调 worker 内事件循环支持；worker 空闲统计 flush 修复；回调订阅时校验 |
 | 9.2.5 | **v3 帧格式（唯一版本，无兼容层）**：扩展帧并入头部（seq 8B 恒在帧内，偏移 7），ack_id uuid → 4B ack_token 计数器（flags bit6），topic 上限 65535→255 字节（topic_len 2B→1B），头 20B→27B；删除 v1/v2 分流、proto 协商、ext 变换（stamp/strip）；新增 MAX_FRAME_BYTES(256MB) 编码防护 |
+| 9.2.6 | 客户端动态退订 `unsubscribe()`（本地订阅表 + worker 池 + 服务端 UNSUBSCRIBE 三层同步，幂等）；`pulsemq` CLI 接入 argparse（--help/--version 立即返回，不再启动服务器）；同进程双 Server 报错清晰化（ZAP inproc 端点独占约束文档化） |
 
 ---
 
@@ -396,11 +401,11 @@ src/pulsemq/
 ├── server.py        组装：控制循环/心跳扫描/数据面回调（seq 改写/ACK/广播）
 ├── buffering.py     SubscriberBuffer（drop_old/conflate）+ BufferManager（窗口守恒/GC 防护）
 ├── worker_pool.py   ShmRing（共享内存变长字节环）+ WorkerPool + worker 进程主循环
-├── client.py        Client/ProducerClient/ConsumerClient（唯一池消费、confirm、缺口）
+├── client.py        Client/ProducerClient/ConsumerClient（唯一池消费、confirm、缺口、动态退订）
 ├── control.py       控制命令集 + OnlineRegistry
 ├── config.py        ServerConfig/ClientConfig（TOML + 环境变量）
 ├── stats/           traffic/latency/drops/throughput/connections/storage
 ├── admin/           AdminServer（HTTP/SSE）+ web_ui.py（监控面板）
 └── security.py      CredentialStore（凭据文件/哈希）
-tests/               241 项（协议/生命周期/缓冲/池/压测辅助，mp 回调录制器）
+tests/               246 项（协议/生命周期/缓冲/池/CLI/压测辅助，mp 回调录制器）
 ```
