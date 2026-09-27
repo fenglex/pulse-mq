@@ -259,24 +259,27 @@ mon = sock.get_monitor_socket(
 
 ### 5.1 帧编解码 `protocol/frames.py`
 
-**单 bytes 帧**（非 ZMQ 多帧）。定长头 + 变长 topic + payload：
+**单 bytes 帧**（非 ZMQ 多帧，9.2.5 起 v3 唯一格式）。定长头 + 可选 ack_token + 变长 topic + payload：
 
 ```
 偏移  字段             长度    编码
 0     magic            2       b"PM"
-2     version          1       0x01
+2     version          1       0x03
 3     msg_type         1       DATA=0x01 / CONTROL=0x02
 4     flags            1       位域（见 5.6）
 5     data_type        1       UNKNOWN/DICT/DATAFRAME/STR/BYTES
-6     topic_len        2       大端 uint16
-8     topic            N       UTF-8
-8+N   timestamp_ns     8       大端 int64（纳秒）
-16+N  record_count     4       大端 uint32（上限 1,000,000）
-20+N  payload          变长     序列化+压缩后的 bytes
+6     topic_len        1       大端 uint8（≤255 字节）
+7     seq              8       大端 uint64（服务端 per-topic 序号，上行占位 0，
+                               服务端按固定偏移 7 改写）
+15    timestamp_ns     8       大端 int64（纳秒）
+23    record_count     4       大端 uint32（上限 1,000,000）
+27    [ack_token]      4?      大端 uint32（flags bit6 置位时存在，确认发布回执编号）
+27/31 topic            N       UTF-8
+...   payload          变长     序列化+压缩后的 bytes（帧边界 = ZMQ 消息边界）
       [CRC32]          4?      大端 uint32（flags CRC 位置 1 时追加）
 ```
 
-定长头用预编译 `struct.Struct`（`_HEAD_BEFORE_TOPIC` / `_HEAD_AFTER_TOPIC`）打包，热路径无格式串解析开销。
+定长头用预编译 `struct.Struct`（`_HEAD_V3`）打包，热路径无格式串解析开销。
 
 核心函数：
 
@@ -284,11 +287,13 @@ mon = sock.get_monitor_socket(
 |------|------|-------------------|
 | `encode(topic, data, ...)` | 编码为单 bytes 帧 | — |
 | `decode(frame)` → `PulseMessage` | 完整解码（含 payload 还原） | ✅ |
-| `decode_header(frame)` → `FrameHeader` | 仅提取头部 | ❌（服务端转发用） |
+| `decode_header(frame)` → `FrameHeader` | 仅提取头部（含 seq/ack_token） | ❌（服务端/主进程接收用） |
+| `rewrite_seq(frame, seq)` | 固定偏移改写 seq（服务端广播前调用，CRC 帧重算） | ❌ |
 | `encode_control(cmd, payload)` | 控制帧（cmd 作为 topic） | — |
 | `decode_control(frame)` → `ControlMessage` | 解码控制帧 | ✅ |
 
-`FrameHeader`（`@dataclass(slots=True)`）只含 `topic`/`record_count`/`timestamp_ns`/`msg_type`/`raw_payload`，供服务端路由使用。
+`FrameHeader`（`@dataclass(slots=True)`）含 `topic`/`record_count`/`timestamp_ns`/`msg_type`/`raw_payload`/`seq`/`ack_token`，供服务端路由与主进程接收循环使用。
+`encode()` 拒绝超过 `MAX_FRAME_BYTES`（256MB）的帧。
 
 ### 5.2 `encode` 自动推断
 
@@ -334,12 +339,14 @@ mon = sock.get_monitor_socket(
 
 ```
 bit 7    : CRC 标志（1=追加 CRC32）
-bit 6-5  : reserved
+bit 6    : ack_token（1=头部带 4B 确认发布回执编号）
+bit 5    : reserved
 bit 4-3  : 压缩算法（00=none, 01=snappy, 10=lz4, 11=zstd）
 bit 2-0  : 序列化器（000=msgpack, 001=bytes, 010=pyarrow, 100=str, 101=json）
 ```
 
-`encode_flags(ser, comp, crc)` 打包，`decode_flags(byte)` 拆包，`has_crc(byte)` 检测 bit 7。
+`encode_flags(ser, comp, crc=, ack_token=)` 打包，`decode_flags(byte)` 拆包，
+`has_crc(byte)` 检测 bit 7，`has_ack(byte)` 检测 bit 6。
 
 ---
 

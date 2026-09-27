@@ -1,96 +1,14 @@
-"""_DropQueue + DropStats 单元测试。"""
+"""DropStats 单元测试。
+
+9.2.4：消费端唯一模式为多进程池，原 _DropQueue（两线程解码队列）已删除；
+环满 drop-new 丢弃语义的单元覆盖见 test_worker_pool.py（ShmRing 满丢弃 +
+write_fail 计数）。
+"""
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
 
 from pulsemq.stats.drops import DropStats
-
-
-# ---------------------------------------------------------------------------
-# _DropQueue
-# ---------------------------------------------------------------------------
-
-def _item(topic: str):
-    """构造队列元素 (frame_bytes, hdr, matched)。"""
-    hdr = SimpleNamespace(topic=topic)
-    return (b"frame", hdr, [])
-
-
-def test_drop_queue_basic_put_get():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=10)
-    q.put(_item("a"))
-    item = q.get(timeout=1.0)
-    assert item is not None
-    assert item[1].topic == "a"
-
-
-def test_drop_queue_drops_oldest_when_full():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=3)
-    q.put(_item("t1"))
-    q.put(_item("t2"))
-    q.put(_item("t3"))
-    # 队列满，put 第 4 条应丢弃 t1
-    q.put(_item("t4"))
-    drops = q.drain_drops()
-    assert drops == {"t1": 1}
-    # 队列中应剩 t2, t3, t4
-    items = []
-    while True:
-        item = q.get(timeout=0.5)
-        if item is None:
-            break
-        items.append(item[1].topic)
-    assert items == ["t2", "t3", "t4"]
-
-
-def test_drop_queue_per_topic_count():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=2)
-    q.put(_item("hot"))
-    q.put(_item("hot"))
-    q.put(_item("hot"))  # 丢弃第 1 个 hot
-    q.put(_item("hot"))  # 丢弃第 2 个 hot
-    drops = q.drain_drops()
-    assert drops == {"hot": 2}
-
-
-def test_drop_queue_drain_resets():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=1)
-    q.put(_item("a"))
-    q.put(_item("b"))  # 丢弃 a
-    drops1 = q.drain_drops()
-    assert drops1 == {"a": 1}
-    drops2 = q.drain_drops()
-    assert drops2 == {}
-
-
-def test_drop_queue_close():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=5)
-    q.put(_item("a"))
-    q.close()
-    assert q.put(_item("b")) is False  # 关闭后 put 返回 False
-    # 已入队的项仍可取出（drain 语义）
-    item = q.get(timeout=0.5)
-    assert item is not None
-    assert item[1].topic == "a"
-    # 队列空后返回 None
-    assert q.get(timeout=0.5) is None
-
-
-def test_drop_queue_multi_topic_drops():
-    from pulsemq.client import _DropQueue
-    q = _DropQueue(maxlen=2)
-    q.put(_item("topic_a"))
-    q.put(_item("topic_b"))
-    q.put(_item("topic_a"))  # 丢弃 topic_a
-    q.put(_item("topic_b"))  # 丢弃 topic_b
-    drops = q.drain_drops()
-    assert drops == {"topic_a": 1, "topic_b": 1}
 
 
 # ---------------------------------------------------------------------------

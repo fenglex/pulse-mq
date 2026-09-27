@@ -415,6 +415,31 @@ main{padding:14px 20px;max-width:1440px;margin:0 auto}
     <div class="chart-header">
       <div class="chart-title">
         <div class="dot-indicator"></div>
+        <span>订阅者缓冲（9.2.1）<span class="chart-hint" style="margin-left:6px">慢消费者 drop_old/conflate 积压与缺口对账</span></span>
+      </div>
+    </div>
+    <div id="gap-summary" class="chart-hint" style="margin-bottom:8px">消费端缺口：无数据</div>
+    <table class="lat-table">
+      <thead><tr>
+        <th style="text-align:left">订阅者</th>
+        <th>策略</th>
+        <th>积压(帧)</th>
+        <th>积压字节</th>
+        <th>最老积压</th>
+        <th>上限</th>
+        <th>淘汰</th>
+        <th>过期</th>
+        <th>合并</th>
+        <th>已发</th>
+      </tr></thead>
+      <tbody id="buffer-list-body"><tr><td colspan="10" class="empty" style="text-align:center">无缓冲订阅者</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
         <span>最近事件流<span class="chart-hint" style="margin-left:6px">最新在上 · 自动滚动</span></span>
       </div>
     </div>
@@ -470,6 +495,8 @@ let state = {
   latencyE2e: {},   // 按 topic 的全程延迟
   events: [],
   drops: {},        // 按 topic 的消费端丢弃统计
+  buffers: {defaults:{}, subscribers:{}}, // 9.2.1 订阅者缓冲快照
+  gaps: {},         // 9.2.1 按 topic 的消费端缺口（v2 seq 检测）
   msgSpark: [],     // 近 60 次 SSE 的消息量/秒（sparkline 用）
   bytesSpark: [],   // 近 60 次 SSE 的流量/秒（sparkline 用）
   latKind: 'half',  // 延迟趋势：half / e2e
@@ -502,6 +529,8 @@ function connectSSE() {
       if (d.latency_half != null) state.latencyHalf = d.latency_half;
       if (d.latency_e2e != null) state.latencyE2e = d.latency_e2e;
       if (d.drops != null) state.drops = d.drops;
+      if (d.buffers != null) state.buffers = d.buffers;
+      if (d.gaps != null) state.gaps = d.gaps;
       // SSE 事件流（全量替换，无重复）
       if (Array.isArray(d.sse_events)) {
         state.events = d.sse_events.map(e => ({
@@ -511,6 +540,7 @@ function connectSSE() {
         }));
       }
       render();
+      renderBuffers();
       renderOverview();
       renderLatencyList();
       renderEvents();
@@ -619,6 +649,57 @@ function render() {
         ${dropHtml}
       </div>
     </div>`;
+  }).join('');
+}
+
+function formatBufAge(ms) {
+  if (!ms || ms <= 0) return '—';
+  if (ms < 1000) return Math.round(ms) + 'ms';
+  if (ms < 60000) return (ms/1000).toFixed(1) + 's';
+  return Math.round(ms/60000) + 'min';
+}
+function formatBufBytes(n) {
+  if (!n || n <= 0) return '—';
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n/1024).toFixed(1) + 'KB';
+  return (n/1048576).toFixed(1) + 'MB';
+}
+function renderBuffers() {
+  // 缺口汇总（9.2.1）
+  const gaps = state.gaps || {};
+  const gapKeys = Object.keys(gaps).filter(k => gaps[k] > 0);
+  $('gap-summary').textContent = gapKeys.length === 0
+    ? '消费端缺口：无缺失 ✓'
+    : '消费端缺口：' + gapKeys.map(k => `${esc(k)} 缺失 ${gaps[k].toLocaleString()} 帧`).join(' · ');
+  $('gap-summary').style.color = gapKeys.length === 0 ? 'var(--accent-green)' : 'var(--accent-rose)';
+
+  const subs = (state.buffers && state.buffers.subscribers) || {};
+  const keys = Object.keys(subs);
+  const body = $('buffer-list-body');
+  if (!body) return;
+  if (keys.length === 0) {
+    body.innerHTML = '<tr><td colspan="10" class="empty" style="text-align:center">无缓冲订阅者（直发路径）</td></tr>';
+    return;
+  }
+  body.innerHTML = keys.map(k => {
+    const b = subs[k];
+    const limit = b.max_age_s > 0
+      ? `${(b.max_messages/1000).toFixed(0)}k条/${(b.max_bytes/1048576).toFixed(0)}MB/${b.max_age_s}s`
+      : `${(b.max_messages/1000).toFixed(0)}k条/${(b.max_bytes/1048576).toFixed(0)}MB/不限`;
+    const hot = b.depth > 0 ? 'style="color:var(--accent-amber);font-weight:600"' : '';
+    const dropHot = (b.evicted + b.expired) > 0 ? 'style="color:var(--accent-rose);font-weight:600"' : '';
+    return `<tr>
+      <td style="text-align:left;font-family:monospace">${esc(k)}</td>
+      <td>${esc(b.policy)}</td>
+      <td ${hot}>${(b.depth||0).toLocaleString()}</td>
+      <td>${formatBufBytes(b.bytes)}</td>
+      <td>${formatBufAge(b.oldest_age_ms)}</td>
+      <td>${limit}</td>
+      <td ${dropHot}>${(b.evicted||0).toLocaleString()}</td>
+      <td ${dropHot}>${(b.expired||0).toLocaleString()}</td>
+      <td>${(b.conflated||0).toLocaleString()}</td>
+      <td>${(b.sent||0).toLocaleString()}</td>
+    </tr>`;
   }).join('');
 }
 

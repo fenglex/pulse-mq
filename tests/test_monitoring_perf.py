@@ -6,6 +6,7 @@ import socket as _sock
 
 from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _port() -> int:
@@ -32,7 +33,7 @@ async def test_latency_recorded_on_data_plane():
         cons = ConsumerClient(f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}", "c", "c")
         await cons.start()
         await prod.start()
-        await cons.subscribe("t.*", lambda m: None)
+        await cons.subscribe("t.*", mp_callbacks.on_msg_record)
         await asyncio.sleep(0.3)
         for _ in range(20):
             await prod.publish("t.x", {"k": 1})

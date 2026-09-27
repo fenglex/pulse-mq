@@ -181,7 +181,8 @@ class SyncDataThread:
                  auth: PlainAuthDict | None = None,
                  on_auth: AuthCallback | None = None,
                  loop: asyncio.AbstractEventLoop | None = None,
-                 sndhwm: int = 10000, rcvhwm: int = 10000) -> None:
+                 sndhwm: int = 10000, rcvhwm: int = 10000,
+                 buffers=None) -> None:
         self._ctx = ctx
         self._endpoint = endpoint
         self._auth = auth
@@ -189,6 +190,8 @@ class SyncDataThread:
         self._async_loop = loop
         self._sndhwm = sndhwm
         self._rcvhwm = rcvhwm
+        # 每订阅者缓冲管理器（buffering.BufferManager）；None = 全部直发
+        self._buffers = buffers
         self._socket: zmq.Socket | None = None
         self._zap: SyncZAPHandler | None = None
         self._pull: zmq.Socket | None = None
@@ -225,7 +228,10 @@ class SyncDataThread:
         poller.register(self._socket, zmq.POLLIN)
         poller.register(self._pull, zmq.POLLIN)
         while self._running:
-            events = dict(poller.poll(timeout=100))  # 100ms 超时以便检查 _running
+            # 有积压时缩短 poll 超时，让 drain 更频繁地追赶
+            timeout = 10 if (self._buffers is not None
+                             and self._buffers.has_backlog()) else 100
+            events = dict(poller.poll(timeout=timeout))
             if self._socket in events:
                 # 批量 drain：一次 poll 唤醒后连续取完所有可用消息，摊薄 poll 开销
                 while True:
@@ -249,42 +255,67 @@ class SyncDataThread:
                             self._socket.send_multipart([msg[0], msg[1]])
                         except Exception:
                             pass
+            # 每轮 poll 后 drain 订阅者缓冲积压（有缓冲订阅者时）
+            if self._buffers is not None:
+                self._buffers.drain_all()
+                self._buffers.maybe_gc()
+
+    def send_dontwait(self, ident: bytes, frame_bytes: bytes) -> bool:
+        """数据面线程内 DONTWAIT 发送；EAGAIN（对端队列满）返回 False。
+
+        供 BufferManager.drain 回调使用：False 表示背压，积压帧保留待下轮。
+        """
+        try:
+            self._socket.send_multipart([ident, frame_bytes], flags=zmq.DONTWAIT)
+            return True
+        except zmq.Again:
+            return False
+        except Exception:
+            return False
 
     def send(self, ident: bytes, frame_bytes: bytes) -> None:
         """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
         self._socket.send_multipart([ident, frame_bytes])
 
-    def broadcast(self, targets, frame_bytes: bytes,
-                  credits: dict | None = None) -> int:
-        """广播同一帧给多个 target。返回丢弃数（发送失败或信用耗尽）。
+    def broadcast(self, pairs, credits: dict | None = None,
+                  topic: str = "", buffers=None) -> int:
+        """广播给多个 target，返回直发路径的丢弃数。
+
+        pairs: [(ident, frame_bytes)] —— target 与帧成对传入（v3 单一帧
+        格式下同一帧通常对应全部 target）。
 
         - DONTWAIT：订阅者队列满时立即跳过，防 head-of-line blocking。
         - credits：消费者心跳报告的剩余容量；为 0 时跳过（信用流控）。
+        - buffers：声明了缓冲策略（drop_old/conflate）的订阅者改为入队
+          应用层缓冲，由 drain 循环按背压节奏发送（enqueue 侧的淘汰/
+          合并计数经 BufferManager.on_drop 记账，不走本函数返回值）。
         - 大 payload（≥1KB）零拷贝，小 payload 直接 send。
         """
-        if not self._socket or not targets:
+        if not self._socket or not pairs:
             return 0
         drops = 0
         sock = self._socket
-        if len(frame_bytes) >= 1024:
-            frame = zmq.Frame(frame_bytes)
+        # 按帧分组：同一帧的多个 target 复用 zmq.Frame 零拷贝对象
+        groups: dict[bytes, list[bytes]] = {}
+        for target, frame_bytes in pairs:
+            groups.setdefault(frame_bytes, []).append(target)
+        for frame_bytes, targets in groups.items():
+            zero_copy = len(frame_bytes) >= 1024
+            frame = zmq.Frame(frame_bytes) if zero_copy else frame_bytes
             for target in targets:
+                if buffers is not None and buffers.get(target) is not None:
+                    buffers.enqueue(target, topic, frame_bytes)
+                    continue
                 if credits is not None and credits.get(target, -1) == 0:
                     drops += 1
                     continue
                 try:
-                    sock.send_multipart([target, frame],
-                                        flags=zmq.DONTWAIT, copy=False)
-                except Exception:
-                    drops += 1
-        else:
-            for target in targets:
-                if credits is not None and credits.get(target, -1) == 0:
-                    drops += 1
-                    continue
-                try:
-                    sock.send_multipart([target, frame_bytes],
-                                        flags=zmq.DONTWAIT)
+                    if zero_copy:
+                        sock.send_multipart([target, frame],
+                                            flags=zmq.DONTWAIT, copy=False)
+                    else:
+                        sock.send_multipart([target, frame_bytes],
+                                            flags=zmq.DONTWAIT)
                 except Exception:
                     drops += 1
         return drops
@@ -334,29 +365,38 @@ class Transport:
                        *, auth: PlainAuthDict | None = None,
                        on_auth: AuthCallback | None = None,
                        on_message: Callable[[bytes, bytes], None] | None = None,
-                       loop: asyncio.AbstractEventLoop | None = None) -> None:
+                       loop: asyncio.AbstractEventLoop | None = None,
+                       buffers=None) -> None:
         """启动同步数据面线程（独立 zmq.Context + 独立线程）。
 
         与异步 bind() 完全隔离：使用单独的同步 ctx，ZAP 各自独立。
         on_message 回调在数据面线程中执行，可调用 send_sync_direct() 转发消息。
+        buffers：订阅者缓冲管理器；其发送回调注册为本线程的
+        send_dontwait（drain 必须在数据面线程内执行）。
         """
         sync_ctx = zmq.Context()
         self._sync_data = SyncDataThread(
             ctx=sync_ctx, endpoint=endpoint, auth=auth, on_auth=on_auth,
             loop=loop, sndhwm=self._sndhwm, rcvhwm=self._rcvhwm,
+            buffers=buffers,
         )
         self._sync_data.start(on_message)
+        if buffers is not None:
+            buffers.set_send_fn(self._sync_data.send_dontwait)
 
     def send_sync_direct(self, ident: bytes, frame_bytes: bytes) -> None:
         """数据面线程内调用（从 on_message 回调）：直接通过 ROUTER socket 发送。"""
         if self._sync_data:
             self._sync_data.send(ident, frame_bytes)
 
-    def broadcast_sync(self, targets, frame_bytes: bytes,
-                       credits: dict | None = None) -> int:
-        """数据面线程内调用：广播同一帧给多个订阅者。返回丢弃数。"""
+    def broadcast_sync(self, pairs, credits: dict | None = None,
+                       topic: str = "", buffers=None) -> int:
+        """数据面线程内调用：广播给多个订阅者。pairs = [(ident, frame_bytes)]。
+
+        返回直发丢弃数。"""
         if self._sync_data:
-            return self._sync_data.broadcast(targets, frame_bytes, credits)
+            return self._sync_data.broadcast(pairs, credits,
+                                             topic=topic, buffers=buffers)
         return 0
 
     def send_sync_data(self, ident: bytes, frame_bytes: bytes) -> None:
@@ -459,6 +499,16 @@ class Transport:
             await sock.send_multipart([identity, frame_bytes])
         else:
             await sock.send(frame_bytes)
+
+    async def send_nowait(self, identity: bytes, frame_bytes: bytes,
+                          *, role: str = "server_ingress") -> None:
+        """DONTWAIT 直发：对端队列满（muted）或已不可达时立即抛 zmq.Again /
+        ZMQError(EHOSTUNREACH)，调用方决定丢弃策略。绝不阻塞事件循环。"""
+        sock = self._socket_for(role)
+        if identity:
+            await sock.send_multipart([identity, frame_bytes], flags=zmq.DONTWAIT)
+        else:
+            await sock.send(frame_bytes, flags=zmq.DONTWAIT)
 
     async def recv(self, role: str = "server_ingress") -> tuple[bytes, bytes]:
         sock = self._socket_for(role)

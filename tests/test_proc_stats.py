@@ -3,7 +3,7 @@
 覆盖：
 - 客户端 ``_ProcStats``：record/drain 折算（count/rate/recv_avg_ns/proc_avg_ns）。
 - 服务端 ``ClientProcStats``：record/clients/topics 聚合/summarize/remove/sweep_stale。
-- e2e：inline 模式与 worker（decode_queue）模式下，心跳 proc 上报可在
+- e2e：9.2.4 唯一消费模式（多进程池）下，worker 统计随心跳上报，可在
   ``/api/v1/clients``（processing）与 ``/api/v1/stats/realtime``
   （processing_by_topic）查询到正的速率与延迟。
 """
@@ -16,9 +16,10 @@ import time
 
 import pytest
 
-from pulsemq.client import Client, _ProcStats
+from pulsemq.client import ConsumerClient, ProducerClient, _ProcStats
 from pulsemq.server import Server
 from pulsemq.stats.throughput import ClientProcStats
+from tests import mp_callbacks
 
 
 def _free_port() -> int:
@@ -154,8 +155,8 @@ def test_client_proc_stats_remove_and_stale():
 # Server e2e：心跳 proc 上报 → admin API 可见
 # ---------------------------------------------------------------------------
 
-async def _run_e2e(decode_queue_size: int) -> dict:
-    """启动 server + 1 pub + 1 sub，发布一批消息，等待心跳后取 /clients。"""
+async def _run_e2e(record_dir: str) -> dict:
+    """启动 server + 1 pub + 1 sub（多进程池），发布一批消息，等待心跳后取 /clients。"""
     dp, cp, ap = _free_port(), _free_port(), _free_port()
     srv = Server(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
@@ -164,39 +165,39 @@ async def _run_e2e(decode_queue_size: int) -> dict:
         credentials={"pub": "p", "sub": "s"},
     )
     await srv.start()
-    sub = Client(
+    sub = ConsumerClient(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         username="sub", password="s", client_id="sub-proc",
-        decode_queue_size=decode_queue_size,
     )
-    pub = Client(
+    pub = ProducerClient(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
         control_endpoint=f"tcp://127.0.0.1:{cp}",
         username="pub", password="p", client_id="pub-proc",
     )
-    got = asyncio.Event()
-    n = 0
-
-    def cb(_msg) -> None:
-        nonlocal n
-        n += 1
-        if n >= 30:
-            got.set()
-
     try:
         await sub.start()
         await pub.start()
-        await sub.subscribe("proc.t", cb)
-        await asyncio.sleep(0.2)
+        await sub.subscribe("proc.t", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.5)
         for i in range(60):
             await pub.publish("proc.t", {"i": i})
-        await asyncio.wait_for(got.wait(), timeout=5.0)
-        # 至少等两次心跳：首次上报 + 服务端可见。
-        await asyncio.sleep(2.2)
+        await mp_callbacks.wait_records(record_dir, 30, timeout=8.0)
+        # 轮询等心跳上报（worker 统计 1s 空闲批量 flush + 1s 心跳间隔 + 服务端
+        # 可见；全量回归高负载下可能要多个周期，固定 sleep 会偶发不足）。
         clients = await _get_json(ap, "/api/v1/clients", token=srv.admin_token)
         realtime = await _get_json(ap, "/api/v1/stats/realtime",
                                    token=srv.admin_token)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            by_id = {c["client_id"]: c for c in clients["clients"]}
+            p = by_id.get("sub-proc", {}).get("processing", {})
+            if "proc_avg_ms" in p and "recv_avg_ms" in p:
+                break
+            await asyncio.sleep(0.5)
+            clients = await _get_json(ap, "/api/v1/clients", token=srv.admin_token)
+            realtime = await _get_json(ap, "/api/v1/stats/realtime",
+                                       token=srv.admin_token)
         return {"clients": clients, "realtime": realtime}
     finally:
         await sub.stop()
@@ -204,9 +205,9 @@ async def _run_e2e(decode_queue_size: int) -> dict:
         await srv.stop()
 
 
-async def test_e2e_heartbeat_proc_inline_mode():
-    """inline 模式（decode_queue_size=0）：心跳 proc 上报出现在 admin API。"""
-    result = await _run_e2e(decode_queue_size=0)
+async def test_e2e_heartbeat_proc_pool_mode(record_dir):
+    """多进程池模式：worker 统计随心跳上报，出现在 admin API。"""
+    result = await _run_e2e(record_dir)
     by_id = {c["client_id"]: c for c in result["clients"]["clients"]}
     sub_entry = by_id["sub-proc"]
     assert "processing" in sub_entry, f"缺少 processing: {sub_entry}"
@@ -221,12 +222,3 @@ async def test_e2e_heartbeat_proc_inline_mode():
     topic_agg = result["realtime"]["processing_by_topic"].get("proc.t")
     assert topic_agg is not None
     assert topic_agg["rate_per_sec"] > 0
-
-
-async def test_e2e_heartbeat_proc_worker_mode():
-    """worker 模式（decode_queue_size>0）：处理耗时在解码线程统计，同样上报。"""
-    result = await _run_e2e(decode_queue_size=128)
-    by_id = {c["client_id"]: c for c in result["clients"]["clients"]}
-    p = by_id["sub-proc"]["processing"]
-    assert p["rate_per_sec"] > 0
-    assert p["count"] >= 30

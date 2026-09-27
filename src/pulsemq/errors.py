@@ -54,6 +54,11 @@ class ResourceExhaustedError(PulseMQError):
     exit_code = 7
 
 
+class PublishAckTimeout(PulseMQError):
+    """确认发布（confirm=True）在超时内未收到服务端 PUBLISH_ACK。"""
+    exit_code = 1
+
+
 def exit_code_for(exc: BaseException) -> int:
     if isinstance(exc, PulseMQError):
         return exc.exit_code

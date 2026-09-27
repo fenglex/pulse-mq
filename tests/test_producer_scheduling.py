@@ -2,6 +2,7 @@ import asyncio
 import socket as _sock
 
 from pulsemq import Server, ProducerClient, ConsumerClient
+from tests import mp_callbacks
 
 
 def _free_port():
@@ -12,7 +13,7 @@ def _free_port():
     return p
 
 
-async def test_producer_decorator_publishes_periodically():
+async def test_producer_decorator_publishes_periodically(record_dir):
     dp, cp, ap = _free_port(), _free_port(), _free_port()
     srv = Server(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
@@ -35,11 +36,9 @@ async def test_producer_decorator_publishes_periodically():
             return {"price": 12.3}
 
         rf = asyncio.create_task(producer.run_forever())
-        got = []
-        await consumer.subscribe("market.stock.*", lambda m: got.append(m.payload))
-        await asyncio.sleep(0.8)  # 让 producer 跑几轮
-        assert len(got) >= 1
-        assert got[0] == {"price": 12.3}
+        await consumer.subscribe("market.stock.*", mp_callbacks.on_msg_record_full)
+        recs = await mp_callbacks.wait_records(record_dir, 1, timeout=6.0)  # 让 producer 跑几轮
+        assert recs[0]["payload"] == {"price": 12.3}
         await producer.stop()  # _stop → run_forever 退出
         await rf
         await consumer.stop()
@@ -47,7 +46,7 @@ async def test_producer_decorator_publishes_periodically():
         await srv.stop()
 
 
-async def test_producer_callback_non_whitelist_skips_but_keeps_running():
+async def test_producer_callback_non_whitelist_skips_but_keeps_running(record_dir):
     """producer 回调返回非白名单类型：该轮被 encode 抛 TypeError → ProducerManager
     吞成 warning 跳过，服务不崩溃，后续轮次正常推送。
 
@@ -82,17 +81,13 @@ async def test_producer_callback_non_whitelist_skips_but_keeps_running():
             return {"price": 12.3}
 
         rf = asyncio.create_task(producer.run_forever())
-        got = []
-        await consumer.subscribe("market.stock.*", lambda m: got.append(m.payload))
-        await asyncio.sleep(1.2)  # 让 producer 跑多轮（首轮失败 + 后续成功）
+        await consumer.subscribe("market.stock.*", mp_callbacks.on_msg_record_full)
+        recs = await mp_callbacks.wait_records(record_dir, 1, timeout=8.0)  # 让 producer 跑多轮（首轮失败 + 后续成功）
 
         # 服务存活：run_forever 未因首轮 raise 而崩溃退出
         assert not rf.done(), "producer 任务不应因非白名单返回值崩溃"
-        # 首轮 list 不应送达消费者
-        assert all(not isinstance(p, list) for p in got), "非白名单 list 不应被推送"
-        # 后续 dict 应正常送达
-        assert len(got) >= 1, "首轮跳过后，后续 dict 应正常推送"
-        assert got[0] == {"price": 12.3}
+        # 后续 dict 应正常送达（录制器只记 dict payload，list 轮在 encode 即被跳过）
+        assert recs[0]["payload"] == {"price": 12.3}
 
         await producer.stop()
         await rf

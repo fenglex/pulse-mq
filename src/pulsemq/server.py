@@ -11,15 +11,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gc
 import os
 import secrets
 import stat
 import sys
 import time
 
+import zmq
+
 from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.server import AdminServer
 from pulsemq.auth import PlainAuth
+from pulsemq.buffering import BufferManager, VALID_POLICIES
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
                              RegisterResult)
@@ -121,11 +125,27 @@ class Server:
             ring_size=self._cfg.event_ring_size,
         )
         self._drop_stats = DropStats(retention_minutes=60)
+        # 每订阅者缓冲（慢消费者策略 drop_old/conflate），条数/字节/时间三上限。
+        # 缓冲淘汰/过期计入 DropStats；conflate 合并只在 snapshot 单列。
+        self._buffers = BufferManager(
+            max_messages=self._cfg.buffer_max_messages,
+            max_bytes=self._cfg.buffer_max_bytes,
+            max_age_s=self._cfg.buffer_max_age_s,
+            on_drop=lambda topic, n, reason: self._drop_stats.record(topic, n),
+        )
+        self._buffers.set_credit_fn(
+            lambda ident: self._credits.get(ident, -1))
         # 每客户端处理速率/延迟（心跳 proc 字段上报），供监控展示。
         self._proc_stats = ClientProcStats()
         # 消费者信用（心跳报告的剩余 decode queue 容量），用于数据面流控。
         # key = ROUTER bytes identity，value = 剩余容量。0 = 队列满，跳过发送。
         self._credits: dict[bytes, int] = {}
+        # per-topic 单调数据序号（9.2.1）：每个被接受的数据帧 +1；只在数据面
+        # 线程读写（_on_data_message），无锁。服务端内置 producer 不经过该路径。
+        self._topic_seq: dict[str, int] = {}
+        # 消费端缺口统计（心跳 gaps 字段聚合，9.2.1）：topic -> 累计缺失帧数。
+        # 控制面协程写、admin 线程读，dict 单操作 GIL 原子。
+        self._gap_stats: dict[str, int] = {}
         self._archive_writer = AsyncArchiveWriter(
             self._storage, batch_size=self._cfg.stats_archive_batch_size
         )
@@ -152,6 +172,7 @@ class Server:
             self._data_endpoint,
             auth=self._auth, on_auth=self._auth_on_auth,
             on_message=self._on_data_message, loop=loop,
+            buffers=self._buffers,
         )
         # 控制面：异步（保持原有 ROUTER + ZAP）
         await self._transport.bind(self._control_endpoint, "control", auth=self._auth)
@@ -174,6 +195,8 @@ class Server:
             latency_e2e_stats=self._lat_e2e,
             drop_stats=self._drop_stats,
             proc_stats=self._proc_stats,
+            buffer_stats=self._buffers,
+            gap_stats=self._gap_stats,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
@@ -189,6 +212,10 @@ class Server:
             self._control_endpoint,
             self._admin_endpoint,
         )
+        # GC 防护（9.2.1）：启动期对象（凭据/路由/统计骨架）冻结为永久代，
+        # 消除深积压时 gen2 全堆扫描的最大扫描面（实测 60 万条积压时数据面
+        # 吞吐掉 5 倍的元凶之一）。运行期深积压时的降代回收见 BufferManager.maybe_gc。
+        gc.freeze()
         self._install_sighup_reload()
         # 启动内置 producer 调度
         if self._producer_mgr.specs:
@@ -342,10 +369,16 @@ class Server:
             except Exception:
                 pass
 
+    def _next_seq(self, topic: str) -> int:
+        """per-topic 单调数据序号（仅数据面线程调用）。"""
+        n = self._topic_seq.get(topic, 0) + 1
+        self._topic_seq[topic] = n
+        return n
+
     def _on_data_message(self, ident: bytes, frame_bytes: bytes) -> None:
         """同步数据面回调（在数据面线程中调用）。
 
-        轻量头部解码 -> 统计 -> 路由匹配 -> 同步转发。
+        轻量头部解码 -> 统计 -> 序号分配/ACK 回执 -> 路由匹配 -> 广播。
         全程同步，无 asyncio 调度延迟。
         """
         try:
@@ -356,12 +389,33 @@ class Server:
         self._stats.record(hdr.topic, hdr.record_count, len(hdr.raw_payload))
         if self._lat_half.should_sample():
             self._lat_half.record(hdr.topic, time.time_ns() - hdr.timestamp_ns)
+
+        # 9.2.1：每个被接受的数据帧推进 per-topic 序号（无论是否带 ext）
+        seq = self._next_seq(hdr.topic)
+        # 确认发布：上行帧带 4B ack_token（v3 头部 flags bit6）→ 数据面同线程
+        # 直发回执。语义 = 服务端已接受（含路由），不代表各订阅者已送达。
+        if hdr.ack_token is not None:
+            try:
+                self._transport.send_sync_direct(
+                    ident,
+                    frames.encode_control(ControlCmd.PUBLISH_ACK, {
+                        "ack_token": hdr.ack_token, "topic": hdr.topic,
+                        "seq": seq, "record_count": hdr.record_count,
+                    }))
+            except Exception:
+                logger.debug("PUBLISH_ACK 发送失败（peer 可能已断开）", exc_info=True)
+
         matched = self._routing.match(hdr.topic)
-        if matched:
-            dropped = self._transport.broadcast_sync(
-                matched, frame_bytes, self._credits)
-            if dropped:
-                self._drop_stats.record(hdr.topic, dropped)
+        if not matched:
+            return
+        # v3 单一路径：seq 按固定偏移改写一次，同一帧广播给全部订阅者
+        # （无 v1/v2 分流副本）。CRC 上行帧同样正确转换（重算 CRC）。
+        frame_out = frames.rewrite_seq(frame_bytes, seq)
+        dropped = self._transport.broadcast_sync(
+            [(t, frame_out) for t in matched], self._credits,
+            topic=hdr.topic, buffers=self._buffers)
+        if dropped:
+            self._drop_stats.record(hdr.topic, dropped)
 
     async def _control_loop(self) -> None:
         while self._running:
@@ -385,6 +439,29 @@ class Server:
     def _username_of(self, client_id: str) -> str:
         """从 registry 反查 username（供 SUBSCRIBE/UNSUBSCRIBE 事件埋点用）。"""
         return self._registry.get_username(client_id)
+
+    async def _safe_send(self, ident: bytes, frame: bytes) -> None:
+        """控制面回复：DONTWAIT 直发，对端队列满/不可达立即丢弃。
+
+        9.2.0 及以前走 ``await transport.send``：单个僵死 peer 把控制 ROUTER
+        的 per-peer SNDHWM 打满后 send 永久挂起，单协程控制循环被整体卡死
+        （所有新连接 REGISTER 无响应，admin/sweep 线程仍存活 —— 9.2.0 A/B
+        测试期间线上实锤）。改为 DONTWAIT 后控制循环永不阻塞；关键回复
+        （REGISTER）由客户端超时与重连语义兜底。
+        """
+        try:
+            await self._transport.send_nowait(ident, frame, role="control")
+        except zmq.Again:
+            logger.warning(
+                "控制面回复丢弃（对端队列满，疑似僵死 peer）: {!r}", ident[:12])
+        except zmq.ZMQError as e:
+            # 典型：EHOSTUNREACH —— peer 已断开（DISCONNECT 回执竞态），预期内。
+            # 只记 errno，不记异常文本（"Host unreachable" 会污染优雅下线日志检查）。
+            logger.debug("控制面回复发送失败 errno={}", e.errno)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("控制面回复发送失败", exc_info=True)
 
     async def _dispatch_control(self, ident: bytes, cmd_msg: ControlMessage) -> None:
         """分发控制命令。
@@ -411,12 +488,24 @@ class Server:
                 self._ident_by_client_id[cid] = ident
                 for pattern in topics:
                     self._routing.subscribe(ident, pattern)
+                # 订阅者缓冲策略协商：payload["buffer"]={"policy": "drop_old"|"conflate", ...}
+                # 旧客户端不带该字段 → 不建缓冲，走直发路径（行为不变）。
+                buf_cfg = cmd_msg.payload.get("buffer")
+                if isinstance(buf_cfg, dict):
+                    policy = buf_cfg.get("policy", "")
+                    if policy in VALID_POLICIES:
+                        self._buffers.set_policy(ident, policy, buf_cfg)
+                    elif policy:
+                        log_event("WARNING", "CLIENT",
+                                  username=info.username,
+                                  action="buffer_policy_rejected", policy=policy)
                 # 连接事件（Spec 3）：REGISTER 成功 → on_connect
                 self._connections.on_connect(
                     cid, info.username, info.endpoint, _role_of(info.roles)
                 )
-            reply = frames.encode_control(cmd_msg.cmd, {"result": result, "request_id": req_id})
-            await self._transport.send(ident, reply, role="control")
+            reply = frames.encode_control(cmd_msg.cmd, {
+                "result": result, "request_id": req_id})
+            await self._safe_send(ident, reply)
             log_event(
                 "INFO", "CLIENT",
                 username=info.username, action="register", result=result,
@@ -433,15 +522,24 @@ class Server:
             credit = cmd_msg.payload.get("credit")
             if credit is not None:
                 self._credits[ident] = int(credit)
+                # 9.2.1：以新信用快照开启新发送窗口（窗口守恒防超发）
+                self._buffers.set_credit(ident, int(credit))
             # 处理速率/延迟指标（心跳携带，向后兼容：老客户端无 proc 字段）
             proc = cmd_msg.payload.get("proc")
             if proc:
                 self._proc_stats.record(cid, self._username_of(cid), proc)
-            await self._transport.send(
+            # 消费端缺口上报（9.2.1）：客户端按帧头 seq 检测的缺失量 delta
+            gaps = cmd_msg.payload.get("gaps")
+            if isinstance(gaps, dict):
+                for gap_topic, gap_count in gaps.items():
+                    try:
+                        self._gap_stats[gap_topic] = (
+                            self._gap_stats.get(gap_topic, 0) + int(gap_count))
+                    except (TypeError, ValueError):
+                        pass
+            await self._safe_send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
-                role="control",
-            )
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}))
 
         elif cmd_msg.cmd == ControlCmd.SUBSCRIBE:
             pattern = cmd_msg.payload.get("topic", "")
@@ -450,27 +548,24 @@ class Server:
             self._registry.subscribe(cid, pattern)
             # 订阅事件（Spec 3）：SUBSCRIBE → on_subscribe
             self._connections.on_subscribe(cid, self._username_of(cid), pattern)
-            await self._transport.send(
+            await self._safe_send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
-                role="control",
-            )
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}))
 
         elif cmd_msg.cmd == ControlCmd.UNSUBSCRIBE:
             pattern = cmd_msg.payload.get("topic", "")
             self._routing.unsubscribe(ident, pattern)
             self._registry.unsubscribe(cid, pattern)
             self._connections.on_unsubscribe(cid, self._username_of(cid), pattern)
-            await self._transport.send(
+            await self._safe_send(
                 ident,
-                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
-                role="control",
-            )
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}))
 
         elif cmd_msg.cmd == ControlCmd.DISCONNECT:
             self._routing.remove(ident)
             self._ident_by_client_id.pop(cid, None)
             self._credits.pop(ident, None)
+            self._buffers.clear(ident)
             self._proc_stats.remove(cid)
             self._registry.unregister(cid)
             # 断开事件（Spec 3）：DISCONNECT → on_disconnect
@@ -478,14 +573,9 @@ class Server:
             # 回执 OK：客户端发完 DISCONNECT 通常已立即关闭 socket，回执 send 命中
             # ROUTER_MANDATORY 的 ``Host unreachable`` 是预期竞态，不作为错误记录
             # （否则每次正常下线都会刷一条 ERROR 异常栈，误导排查）。降为 debug。
-            try:
-                await self._transport.send(
-                    ident,
-                    frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}),
-                    role="control",
-                )
-            except Exception:
-                logger.debug("DISCONNECT 回执发送失败（peer 已离开），忽略")
+            await self._safe_send(
+                ident,
+                frames.encode_control(cmd_msg.cmd, {"result": "OK", "request_id": req_id}))
 
         elif cmd_msg.cmd == ControlCmd.LATENCY_REPORT:
             # consumer 回传端到端延迟，fire-and-forget 无 ack
@@ -508,6 +598,7 @@ class Server:
                     if ident is not None:
                         self._routing.remove(ident)
                         self._credits.pop(ident, None)
+                        self._buffers.clear(ident)
                     self._proc_stats.remove(c.client_id)
                     # 断开事件（Spec 3）：心跳超时下线 → on_disconnect
                     self._connections.on_disconnect(c.client_id, "heartbeat_timeout")

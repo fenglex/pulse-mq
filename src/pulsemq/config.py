@@ -37,6 +37,13 @@ class ServerConfig:
     retention_days: int = 7
     sndhwm: int = 10000   # ZMQ 发送高水位（帧数），大 payload 可调低控制内存
     rcvhwm: int = 10000   # ZMQ 接收高水位（帧数）
+    # 订阅者缓冲（慢消费者策略 drop_old/conflate）全局上限；客户端只能请求更小值。
+    # max_age_s=0 表示不限存活时间。条数/字节/时间三上限，任一触发即开始淘汰。
+    # 默认 10 万条 / 10MB：达到任一上限即开始丢弃最旧（9.2.2 调低，控制服务端
+    # 内存；需要更大缓冲时经 TOML [server] 或环境变量调高，客户端请求不能超过此上限）。
+    buffer_max_messages: int = 100_000
+    buffer_max_bytes: int = 10 * 1024 * 1024   # 10MB
+    buffer_max_age_s: float = 0.0
 
     def __post_init__(self) -> None:
         """确保 data/ 目录存在，日志/SQLite/凭据/token 等运行时文件统一存放。"""
@@ -56,7 +63,8 @@ class ClientConfig:
     reconnect_backoff_multiplier: float = 2.0
     sndhwm: int = 10000
     rcvhwm: int = 10000
-    decode_queue_size: int = 0  # 消费端解码队列长度（0=单线程，>0=启用worker线程+丢弃队列）
+    # 9.2.4：消费端唯一模式为多进程池（workers=1 即主进程+1 worker），
+    # 由 ConsumerClient(workers=..., key=...) 直接配置。
 
 
 def _read_toml(path: str | None) -> dict:
@@ -110,6 +118,12 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         retention_days=int(m.get("retention_days", ServerConfig.retention_days)),
         sndhwm=int(s.get("sndhwm", ServerConfig.sndhwm)),
         rcvhwm=int(s.get("rcvhwm", ServerConfig.rcvhwm)),
+        buffer_max_messages=int(s.get("buffer_max_messages",
+                                      ServerConfig.buffer_max_messages)),
+        buffer_max_bytes=int(s.get("buffer_max_bytes",
+                                   ServerConfig.buffer_max_bytes)),
+        buffer_max_age_s=float(s.get("buffer_max_age_s",
+                                     ServerConfig.buffer_max_age_s)),
     )
     # 环境变量覆盖
     if (v := _env("PULSEMQ_DATA_ENDPOINT")):
@@ -138,6 +152,12 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         cfg.sse_interval = float(v)
     if (v := _env("PULSEMQ_STATS_RETENTION_MINUTES")):
         cfg.stats_retention_minutes = int(v)
+    if (v := _env("PULSEMQ_BUFFER_MAX_MESSAGES")):
+        cfg.buffer_max_messages = int(v)
+    if (v := _env("PULSEMQ_BUFFER_MAX_BYTES")):
+        cfg.buffer_max_bytes = int(v)
+    if (v := _env("PULSEMQ_BUFFER_MAX_AGE_S")):
+        cfg.buffer_max_age_s = float(v)
     return cfg
 
 

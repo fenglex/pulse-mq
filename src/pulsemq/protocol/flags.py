@@ -2,7 +2,9 @@
 
 bit[0:2] = 序列化格式 (000=msgpack, 001=bytes, 010=pyarrow, 100=str, 101=json)
 bit[3:4] = 压缩算法   (00=none, 01=snappy, 10=lz4, 11=zstd)
-bit[5:7] = reserved
+bit5     = reserved
+bit6     = ack_token（确认发布回执编号，4B uint32，跟在定长头之后、topic 之前）
+bit7     = CRC32
 """
 
 from __future__ import annotations
@@ -27,11 +29,14 @@ _COMP_MAP: dict[str, int] = {
 _COMP_MAP_REV: dict[int, str] = {v: k for k, v in _COMP_MAP.items()}
 
 
-def encode_flags(ser_fmt: str, comp: str, *, crc: bool = False) -> int:
-    """编码序列化+压缩标志为单字节。"""
+def encode_flags(ser_fmt: str, comp: str, *, crc: bool = False,
+                 ack_token: bool = False) -> int:
+    """编码序列化+压缩+ack_token+CRC 标志为单字节。"""
     ser_bits = _SER_MAP.get(ser_fmt, 0b000)
     comp_bits = _COMP_MAP.get(comp, 0b00)
     val = ser_bits | (comp_bits << 3)
+    if ack_token:
+        val |= _ACK_BIT
     if crc:
         val |= _CRC_BIT
     return val
@@ -47,7 +52,13 @@ def decode_flags(byte_val: int) -> tuple[str, str]:
     )
 
 
+_ACK_BIT = 0b0100_0000
 _CRC_BIT = 0b1000_0000
+
+
+def has_ack(byte_val: int) -> bool:
+    """是否设置了 ack_token 位（bit 6）。"""
+    return bool(byte_val & _ACK_BIT)
 
 
 def has_crc(byte_val: int) -> bool:

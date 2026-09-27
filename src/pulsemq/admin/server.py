@@ -71,6 +71,8 @@ class AdminServer:
         latency_e2e_stats=None,
         drop_stats=None,
         proc_stats=None,
+        buffer_stats=None,
+        gap_stats=None,
         admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
@@ -87,6 +89,8 @@ class AdminServer:
         self._latency_e2e = latency_e2e_stats
         self._drop_stats = drop_stats
         self._proc_stats = proc_stats
+        self._buffer_stats = buffer_stats
+        self._gap_stats = gap_stats
         self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
@@ -286,6 +290,15 @@ class AdminServer:
             await self._respond_json(writer, 200, self._realtime_snapshot())
             return
 
+        if method == "GET" and path == "/api/v1/stats/buffers":
+            # 订阅者缓冲指标：深度/字节/最老帧年龄/淘汰/过期/合并计数
+            if self._buffer_stats is not None:
+                await self._respond_json(writer, 200, self._buffer_stats.snapshot())
+            else:
+                await self._respond_json(writer, 200,
+                                         {"defaults": None, "subscribers": {}})
+            return
+
         if method == "GET" and path == "/api/v1/stats/stream":
             await self._handle_sse(writer)
             return
@@ -375,6 +388,12 @@ class AdminServer:
         # 消费端丢弃统计（来自心跳聚合）
         if self._drop_stats is not None:
             snap["drops"] = self._drop_stats.snapshot()
+        # 消费端缺口统计（9.2.1：帧头 seq 检测，心跳 gaps 字段聚合）
+        if self._gap_stats is not None:
+            snap["gaps"] = dict(self._gap_stats)
+        # 订阅者缓冲指标（深度/最老帧年龄/淘汰/过期/合并）
+        if self._buffer_stats is not None:
+            snap["buffers"] = self._buffer_stats.snapshot()
         # 每客户端上报的 per-topic 处理速率/延迟聚合（心跳 proc 字段）
         if self._proc_stats is not None:
             snap["processing_by_topic"] = self._proc_stats.topics()

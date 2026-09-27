@@ -57,3 +57,21 @@ def tmp_sqlite_url() -> str:
                 os.unlink(path + ext)
             except OSError:
                 pass
+
+
+@pytest.fixture
+def record_dir(tmp_path):
+    """多进程回调录制目录：设置 PULSEMP_RECORD 环境变量（spawn 时被 worker
+    继承），测试结束恢复并清理分片文件。配合 mp_callbacks.on_msg_record 使用。"""
+    from tests import mp_callbacks
+
+    base = str(tmp_path / "rec")
+    old = os.environ.get("PULSEMP_RECORD")
+    os.environ["PULSEMP_RECORD"] = base
+    mp_callbacks.clear_records(base)
+    yield base
+    if old is None:
+        os.environ.pop("PULSEMP_RECORD", None)
+    else:
+        os.environ["PULSEMP_RECORD"] = old
+    mp_callbacks.clear_records(base)

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+from tests import mp_callbacks
 import asyncio
 import socket as _sock
 
@@ -211,7 +212,7 @@ async def test_realtime_has_latency_and_counters():
         await srv.stop()
 
 
-async def test_admin_runs_on_independent_thread():
+async def test_admin_runs_on_independent_thread(record_dir):
     from pulsemq.client import ConsumerClient, ProducerClient
     from pulsemq.server import Server
 
@@ -229,9 +230,8 @@ async def test_admin_runs_on_independent_thread():
         prod = ProducerClient(f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}", "p", "p")
         await cons.start()
         await prod.start()
-        got: list = []
-        await cons.subscribe("t.*", lambda m: got.append(m.payload))
-        await asyncio.sleep(0.3)
+        await cons.subscribe("t.*", mp_callbacks.on_msg_record_full)
+        await asyncio.sleep(0.4)
 
         async def _poll():
             for _ in range(5):
@@ -239,8 +239,8 @@ async def test_admin_runs_on_independent_thread():
                 await asyncio.sleep(0.05)
 
         await asyncio.gather(_poll(), prod.publish("t.x", {"k": 1}))
-        await asyncio.sleep(0.5)
-        assert got == [{"k": 1}]
+        recs = await mp_callbacks.wait_records(record_dir, 1, timeout=6.0)
+        assert recs[0]["payload"] == {"k": 1}
         await cons.stop()
         await prod.stop()
     finally:

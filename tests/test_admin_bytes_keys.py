@@ -7,6 +7,7 @@ import socket as _sock
 
 from pulsemq.client import ConsumerClient
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _free_port() -> int:
@@ -50,7 +51,7 @@ async def test_realtime_json_serializable_with_live_subscription():
             password="c",
         )
         await c.start()
-        await c.subscribe("market.*", lambda m: None)
+        await c.subscribe("market.*", mp_callbacks.on_msg_record)
         await asyncio.sleep(0.4)  # 让 SUBSCRIBE 帧写入 routing 表
 
         resp = await _http_get("127.0.0.1", ap, "/api/v1/stats/realtime")

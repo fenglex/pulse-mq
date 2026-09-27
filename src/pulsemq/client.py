@@ -3,6 +3,14 @@
 
 启动硬失败 + 运行期自动重连（Spec 1 §8.3）。
 
+消费模式（9.2.4 起唯一）：多进程 worker 池。
+- 主进程 recv 循环只做 header 解码 + key 路由，payload 解码与用户回调全部
+  在 worker 进程执行（共享内存环 + spawn 进程，绕开 GIL 真并行）；
+- workers=1（默认）即"一个主进程接收 + 一个 worker 进程处理"；
+- 回调必须为模块级可导入函数（pickle 按引用传递），同步或异步均可；
+  worker 内不共享主进程内存，lambda/闭包不支持。
+旧的两线程解码队列（_DropQueue）与事件循环内联分发已于 9.2.4 移除。
+
 启动认证检测采用 monitor-based 设计（非 brief 的"握手成功即认证成功"）：
 - 在数据面 connect 时开启 ZMQ monitor，监听握手期事件。
 - ``handshake_ok`` → PLAIN 认证通过，继续控制面 connect + REGISTER。
@@ -36,26 +44,27 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import inspect
+import itertools
 import random
 import threading
 import time
 import uuid
-from collections import deque
 from typing import Any, Awaitable, Callable
 
 from pulsemq.control import ControlCmd
-from pulsemq.routing import SubscriptionTable
 from pulsemq.errors import (AuthenticationError, ClientStartupError,
-                            ConnectionError)
+                            ConnectionError, PublishAckTimeout)
 from pulsemq.logging_setup import log_event, logger
 from pulsemq.protocol import frames
+from pulsemq.protocol.msg_type import MsgType
 from pulsemq.transport.router import Transport
 
 # 启动时等待 monitor 认证裁定的最长秒数。超时即视为服务器不可达。
 _STARTUP_MONITOR_TIMEOUT = 5.0
 # REGISTER 控制帧回复的超时秒数。
 _REGISTER_REPLY_TIMEOUT = 3.0
+# 客户端控制面发送超时（9.2.1）：服务端管道满时不阻塞客户端循环。
+_CONTROL_SEND_TIMEOUT = 2.0
 # 心跳间隔（秒）。
 _HEARTBEAT_INTERVAL = 1.0
 # 运行期重连参数（Spec 1 §8.3）：指数退避，初始 1s，×2，封顶 30s。
@@ -64,74 +73,6 @@ _RECONNECT_BACKOFF_MULTIPLIER = 2.0
 _RECONNECT_MAX_DELAY = 30.0
 # 重连时单次等待 monitor 认证裁定的超时秒数。
 _RECONNECT_MONITOR_TIMEOUT = 5.0
-
-
-class _DropQueue:
-    """有界队列：满时丢弃最老消息，按 topic 统计丢弃量。线程安全。
-
-    recv 线程（asyncio 事件循环）调 put()，worker 线程调 get()。
-    deque(maxlen=N) 满时 append 自动丢弃最左（最老）项；put 在丢弃前 peek
-    最老项的 topic 做计数。
-    """
-
-    def __init__(self, maxlen: int) -> None:
-        self._queue: deque = deque(maxlen=maxlen)
-        self._maxlen = maxlen
-        self._cond = threading.Condition()
-        self._drop_counts: dict[str, int] = {}
-        self._closed = False
-
-    def put(self, item: tuple) -> bool:
-        """入队。满时丢弃最老消息并按 topic 计数。返回 False 表示已关闭。"""
-        with self._cond:
-            if self._closed:
-                return False
-            if len(self._queue) >= self._maxlen:
-                oldest = self._queue[0]
-                # item = (frame_bytes, hdr, matched)；hdr 在 index 1
-                topic = oldest[1].topic
-                self._drop_counts[topic] = self._drop_counts.get(topic, 0) + 1
-            self._queue.append(item)
-            self._cond.notify()
-            return True
-
-    def get(self, timeout: float = 1.0):
-        """出队。超时或已关闭返回 None。"""
-        with self._cond:
-            while not self._queue and not self._closed:
-                if not self._cond.wait(timeout=timeout):
-                    return None  # 超时
-            if not self._queue:
-                return None
-            return self._queue.popleft()
-
-    def get_batch(self, timeout: float = 1.0, max_items: int = 64) -> list:
-        """批量出队（最多 max_items）。一次锁获取取多条，减少锁竞争。"""
-        with self._cond:
-            while not self._queue and not self._closed:
-                if not self._cond.wait(timeout=timeout):
-                    return []
-            items = []
-            while self._queue and len(items) < max_items:
-                items.append(self._queue.popleft())
-            return items
-
-    def drain_drops(self) -> dict[str, int]:
-        """取走并清零丢弃计数（供心跳上报）。"""
-        with self._cond:
-            counts = dict(self._drop_counts)
-            self._drop_counts.clear()
-            return counts
-
-    def remaining(self) -> int:
-        """剩余可用容量（供心跳上报 credit）。"""
-        with self._cond:
-            return self._maxlen - len(self._queue)
-
-    def close(self) -> None:
-        with self._cond:
-            self._closed = True
-            self._cond.notify_all()
 
 
 class _ProcStats:
@@ -155,6 +96,17 @@ class _ProcStats:
         with self._lock:
             self._count[topic] = self._count.get(topic, 0) + 1
             self._recv_ns[topic] = self._recv_ns.get(topic, 0) + latency_ns
+
+    def merge_recv(self, topic: str, total_ns: int, count: int) -> None:
+        """worker 进程聚合上报的批量合并（total/count 形式）。"""
+        with self._lock:
+            self._count[topic] = self._count.get(topic, 0) + count
+            self._recv_ns[topic] = self._recv_ns.get(topic, 0) + total_ns
+
+    def merge_proc(self, topic: str, total_ns: int, count: int) -> None:
+        with self._lock:
+            self._proc_n[topic] = self._proc_n.get(topic, 0) + count
+            self._proc_ns[topic] = self._proc_ns.get(topic, 0) + total_ns
 
     def record_proc(self, topic: str, duration_ns: int) -> None:
         with self._lock:
@@ -204,6 +156,10 @@ def require_connected(func):
 class Client:
     """PulseMQ 客户端：发布 + 订阅。
 
+    订阅侧（9.2.4 唯一消费模式）：多进程 worker 池——主进程接收 + key 路由，
+    worker 进程解码 + 回调。start() 时已有订阅即创建池；运行期动态 subscribe()
+    时懒创建。参数 workers/key/worker_ring_mb/worker_init 见 __init__。
+
     子类 ProducerClient / ConsumerClient 通过覆写屏蔽对应能力。
     """
 
@@ -225,7 +181,12 @@ class Client:
         sndhwm: int = 10000,
         rcvhwm: int = 10000,
         latency_sample_rate: float = 0.01,
-        decode_queue_size: int = 0,
+        buffer_policy: str | None = None,
+        buffer_cfg: dict | None = None,
+        workers: int = 1,
+        key: str | None = "topic",
+        worker_ring_mb: int = 64,
+        worker_init=None,
     ) -> None:
         self._data_endpoint = data_endpoint
         self._control_endpoint = control_endpoint
@@ -242,10 +203,24 @@ class Client:
         self._sndhwm = sndhwm
         self._rcvhwm = rcvhwm
         self._latency_sample_rate = latency_sample_rate
-        self._decode_queue_size = decode_queue_size
-        # 两线程模型：recv 线程入队 → worker 线程解码。decode_queue_size<=0 时禁用。
-        self._decode_queue: _DropQueue | None = None
-        self._worker_thread: threading.Thread | None = None
+        # 服务端订阅者缓冲策略：None=直发（默认，旧行为）；"drop_old"/"conflate"
+        # 随 REGISTER 协商。旧服务端忽略该字段，向后兼容。
+        self._buffer_policy = buffer_policy
+        self._buffer_cfg = buffer_cfg or {}
+        # 9.2.4 唯一消费模式：多进程 worker 池（主进程接收+路由，worker 进程
+        # 解码+回调）。workers=1 即"一个主进程 + 一个 worker 进程"。
+        self._workers = max(1, int(workers))
+        self._key_mode = key
+        self._worker_ring_bytes = int(worker_ring_mb) * 1024 * 1024
+        self._worker_init = worker_init
+        # 确认发布：ack_token（4B per-publisher 计数器）-> Future
+        # （recv 循环收到 PUBLISH_ACK 时 resolve）
+        self._ack_counter = itertools.count(1)
+        self._pending_acks: dict[int, asyncio.Future] = {}
+        # 消费端缺口检测（9.2.1）：per-topic 最近 seq + 累计缺失 + 心跳上报基线
+        self._gap_last: dict[str, int] = {}
+        self._gap_missing: dict[str, int] = {}
+        self._gap_reported: dict[str, int] = {}
         # per-topic 处理统计（接收延迟 + 处理耗时），随心跳上报服务端。
         self._proc_stats = _ProcStats()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -253,9 +228,8 @@ class Client:
         self._connected = False
         self._authenticated = False
         self._registered = False
-        # pattern -> callback（同步或异步均可）
+        # pattern -> callback（模块级可导入函数，同步或异步均可）
         self._subscriptions: dict[str, Callable] = {}
-        self._sub_table = SubscriptionTable()  # 前缀索引匹配（D3）
         # pattern -> header_only 标记：True 表示回调只接收 FrameHeader，跳过完整 decode
         self._sub_header_only: dict[str, bool] = {}
         self._recv_task: asyncio.Task | None = None
@@ -272,6 +246,10 @@ class Client:
         self._reconnect_fatal: AuthenticationError | None = None
         # 角色标记（监控用）：子类 ProducerClient/ConsumerClient 覆写。
         self._roles: list[str] = ["publisher", "subscriber"]
+        # 多进程消费池（9.2.4 唯一消费模式）：start() 时有订阅即创建，
+        # 运行期动态 subscribe 时按需懒创建。纯发布客户端不创建。
+        self._pool = None
+        self._route_drops: dict[str, int] = {}
         # 生命周期回调（可选）。
         self.on_connected: Callable[[], Awaitable[None]] | None = None
         self.on_disconnected: Callable[[], Awaitable[None]] | None = None
@@ -350,15 +328,10 @@ class Client:
         for pattern in list(self._subscriptions):
             await self._send_subscribe(pattern)
 
-        # ---- 两线程模型：创建解码队列 + worker 线程 ----
+        # ---- 多进程消费池（9.2.4 唯一消费模式）：已有订阅即创建 ----
         self._loop = asyncio.get_running_loop()
-        if self._decode_queue_size > 0:
-            self._decode_queue = _DropQueue(self._decode_queue_size)
-            self._worker_thread = threading.Thread(
-                target=self._decode_worker_loop, daemon=True,
-                name="pulsemq-decode",
-            )
-            self._worker_thread.start()
+        if self._subscriptions:
+            self._ensure_pool()
 
         # ---- 启动后台循环 ----
         self._recv_task = asyncio.create_task(self._recv_loop())
@@ -617,17 +590,19 @@ class Client:
         - result != "OK" → ``ClientStartupError(reason=result)``。
         """
         req_id = uuid.uuid4().hex
-        req = frames.encode_control(
-            ControlCmd.REGISTER,
-            {
-                "client_id": self._client_id,
-                "username": self._username,
-                "endpoint": self._data_endpoint,
-                "roles": list(self._roles),
-                "topics": list(self._subscriptions),
-                "request_id": req_id,
-            },
-        )
+        register_payload = {
+            "client_id": self._client_id,
+            "username": self._username,
+            "endpoint": self._data_endpoint,
+            "roles": list(self._roles),
+            "topics": list(self._subscriptions),
+            "request_id": req_id,
+        }
+        if self._buffer_policy:
+            register_payload["buffer"] = {
+                "policy": self._buffer_policy, **self._buffer_cfg,
+            }
+        req = frames.encode_control(ControlCmd.REGISTER, register_payload)
         await self._transport.send(b"", req, role="control")
         try:
             payload = await self._recv_control_reply(req_id, self._register_reply_timeout)
@@ -658,17 +633,63 @@ class Client:
             ControlCmd.SUBSCRIBE,
             {"client_id": self._client_id, "topic": pattern, "request_id": req_id},
         )
-        await self._transport.send(b"", req, role="control")
         try:
-            await self._recv_control_reply(req_id, 0.5)
+            await asyncio.wait_for(
+                self._transport.send(b"", req, role="control"),
+                timeout=_CONTROL_SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.debug("SUBSCRIBE 发送超时（控制面繁忙），跳过 ack 排空")
+        except Exception:
+            logger.debug("SUBSCRIBE 发送失败", exc_info=True)
+            return
+        try:
+            await asyncio.wait_for(
+                self._recv_control_reply(req_id, 0.5),
+                timeout=0.5 + _CONTROL_SEND_TIMEOUT)
         except asyncio.TimeoutError:
             pass
         except Exception:
             logger.debug("SUBSCRIBE 排空 ack 失败", exc_info=True)
 
+    def _validate_worker_callback(self, cb, what: str = "回调") -> None:
+        """多进程模式的回调约束：可跨进程按引用传递（pickle），同步或异步均可。
+
+        lambda/闭包/局部函数无法被 pickle 按引用传递到 worker 进程（即便用
+        cloudpickle 序列化，闭包捕获的变量也是拷贝而非共享内存），必须在
+        模块顶层定义。
+        """
+        import pickle
+        try:
+            pickle.dumps(cb)
+        except Exception as e:
+            raise ValueError(
+                f"多进程消费模式的{what}必须为模块级可导入函数"
+                "（lambda/闭包无法跨进程传递；跨进程回调不共享主进程内存）；"
+                "请把回调放到模块顶层") from e
+
+    def _ensure_pool(self) -> None:
+        """创建并启动多进程消费池（幂等）。阻塞约 0.3s（等待 worker attach）。"""
+        if self._pool is not None:
+            return
+        for pattern, cb in self._subscriptions.items():
+            self._validate_worker_callback(cb, f"订阅 {pattern!r} 的回调")
+        if self._worker_init is not None:
+            self._validate_worker_callback(self._worker_init, "worker_init")
+        from pulsemq.worker_pool import WorkerPool
+        subs = [(p, cb, self._sub_header_only.get(p, False))
+                for p, cb in self._subscriptions.items()]
+        self._pool = WorkerPool(
+            self._workers, self._worker_ring_bytes, subs,
+            self._key_mode, self._worker_init)
+        self._pool.start()
+
     async def subscribe(self, topic_pattern: str, callback: Callable,
                         *, header_only: bool = False) -> None:
         """订阅 topic 模式。
+
+        回调在 worker 进程内执行（9.2.4 唯一消费模式）：必须是模块级可导入
+        函数（同步或异步均可），且不与主进程共享内存——通过回调副作用收集
+        结果时请写入文件/队列等进程外介质。
 
         Args:
             topic_pattern: 主题模式（支持 ``foo.*`` 前缀通配）。
@@ -676,11 +697,17 @@ class Client:
                 ``header_only=True`` 时接收 ``FrameHeader``（跳过完整 decode，降低延迟）。
             header_only: 仅需 topic/record_count/timestamp_ns 时设 True，跳过反序列化。
         """
+        self._validate_worker_callback(
+            callback, f"订阅 {topic_pattern!r} 的回调")
         self._subscriptions[topic_pattern] = callback
         self._sub_header_only[topic_pattern] = header_only
-        self._sub_table.subscribe(topic_pattern.encode("utf-8"), topic_pattern)
-        # 仅在已连接时立即发送；未连接时缓存，start() 末尾会 flush（A3）
+        # 仅在已连接时立即生效；未连接时缓存，start() 末尾会 flush（A3）
         if self._connected:
+            if self._pool is None:
+                # 运行期首次订阅：懒创建消费池（含全部既有订阅）
+                self._ensure_pool()
+            else:
+                self._pool.add_subscription(topic_pattern, callback, header_only)
             await self._send_subscribe(topic_pattern)
 
     # ---------------------------------------------------------------- publish
@@ -689,18 +716,79 @@ class Client:
     async def publish(self, topic: str, data: Any, *,
                       serializer: str | None = None,
                       compression: str = "none",
-                      data_type: int | None = None) -> None:
-        frame = frames.encode(topic, data, serializer=serializer,
-                              compression=compression, data_type=data_type)
-        await self._transport.send(b"", frame, role="data")
+                      data_type: int | None = None,
+                      confirm: bool = False,
+                      ack_timeout: float = 5.0) -> int | None:
+        """发布一条消息。
+
+        confirm=True（9.2.1+）：等服务端 PUBLISH_ACK，返回服务端分配的
+        per-topic 序号。语义 = 服务端已接受该帧（含路由），不代表订阅者已
+        送达。上行帧头部携带 4B ack_token（flags bit6），超时抛
+        ``PublishAckTimeout``。
+        """
+        if not confirm:
+            frame = frames.encode(topic, data, serializer=serializer,
+                                  compression=compression, data_type=data_type)
+            await self._transport.send(b"", frame, role="data")
+            return None
+        ack_token = next(self._ack_counter) & 0xFFFFFFFF
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_acks[ack_token] = fut
+        try:
+            frame = frames.encode(topic, data, serializer=serializer,
+                                  compression=compression, data_type=data_type,
+                                  ack_token=ack_token)
+            await asyncio.wait_for(
+                self._transport.send(b"", frame, role="data"),
+                timeout=ack_timeout)
+            payload = await asyncio.wait_for(fut, timeout=ack_timeout)
+            return int(payload.get("seq") or 0)
+        except asyncio.TimeoutError:
+            raise PublishAckTimeout(
+                f"确认发布超时（{ack_timeout}s）topic={topic} "
+                f"ack_token={ack_token}") from None
+        finally:
+            self._pending_acks.pop(ack_token, None)
+
+    def gap_stats(self) -> dict[str, dict[str, int]]:
+        """消费端缺口统计快照（9.2.1）：topic -> {missing, last_seq}。
+
+        missing = 按帧头 seq 检测的累计缺失帧数（断线期间不计入 last_seq，
+        重连后从新 seq 继续检测）。与心跳上报累计值一致。
+        """
+        return {
+            topic: {"missing": self._gap_missing.get(topic, 0),
+                    "last_seq": self._gap_last.get(topic, 0)}
+            for topic in set(self._gap_last) | set(self._gap_missing)
+        }
+
+    def _track_gap(self, topic: str, seq: int) -> None:
+        """帧头 seq 缺口检测（recv 线程内联，数据面热路径轻量操作）。"""
+        last = self._gap_last.get(topic)
+        if last is not None and seq > last + 1:
+            self._gap_missing[topic] = self._gap_missing.get(topic, 0) + (seq - last - 1)
+        if last is None or seq > last:
+            self._gap_last[topic] = seq
+
+    def _drain_gap_report(self) -> dict[str, int]:
+        """取自上次心跳以来新增缺口（心跳上报用），不重置累计值。"""
+        delta: dict[str, int] = {}
+        for topic, total in self._gap_missing.items():
+            d = total - self._gap_reported.get(topic, 0)
+            if d > 0:
+                delta[topic] = d
+            self._gap_reported[topic] = total
+        return delta
 
     # -------------------------------------------------------------- recv loop
 
     async def _recv_loop(self) -> None:
-        """消费数据面帧，按 topic 前缀匹配分发给订阅回调。
+        """消费数据面帧：header 解码 + 延迟采样 + 按 key 路由进 worker 池。
 
-        两线程模式：recv 线程仅做 header 解码 + 延迟采样 + 路由匹配 + 入队，
-        完整 decode + callback 由 worker 线程处理，不阻塞下一次 recv。
+        9.2.4 唯一消费模式：本循环只做接收 + 路由（零解码），完整 decode +
+        回调在 worker 进程执行（绕开 GIL，真并行）。池未创建（纯发布客户端）
+        时数据帧直接丢弃。
         """
         while not self._stop.is_set():
             try:
@@ -715,6 +803,20 @@ class Client:
             except Exception:
                 logger.debug("client 帧头部解码失败，丢弃")
                 continue
+            # 9.2.1：数据面 socket 上的控制帧（PUBLISH_ACK）→ resolve 等待方
+            if hdr.msg_type == MsgType.CONTROL:
+                try:
+                    msg = frames.decode_control(frame_bytes)
+                except Exception:
+                    logger.debug("client 数据面控制帧解码失败，丢弃")
+                    continue
+                if msg.cmd == ControlCmd.PUBLISH_ACK:
+                    ack_fut = self._pending_acks.get(msg.payload.get("ack_token"))
+                    if ack_fut is not None and not ack_fut.done():
+                        ack_fut.set_result(msg.payload)
+                continue
+            # 消费端缺口检测（v3 帧头恒带 seq，服务端已改写）
+            self._track_gap(hdr.topic, hdr.seq)
             # 端到端延迟采样回传（recv 线程内尽早测量，保证准确）
             if self._latency_sample_rate > 0 and random.random() < self._latency_sample_rate:
                 try:
@@ -723,106 +825,63 @@ class Client:
                         ControlCmd.LATENCY_REPORT,
                         {"topic": hdr.topic, "latency_ns": latency_ns},
                     )
-                    await self._transport.send(b"", rep, role="control")
+                    # 超时保护（9.2.1）：控制面管道满时不阻塞 recv 循环
+                    await asyncio.wait_for(
+                        self._transport.send(b"", rep, role="control"),
+                        timeout=_CONTROL_SEND_TIMEOUT)
                 except Exception:
                     logger.debug("延迟回传发送失败", exc_info=True)
-            # 快速过滤：先用 header 的 topic 匹配订阅
-            matched = [(self._subscriptions.get(pid),
-                        self._sub_header_only.get(pid, False))
-                       for pid in (p.decode("utf-8") for p in self._sub_table.match(hdr.topic))
-                       if pid in self._subscriptions]
-            if not matched:
-                continue
-            # 处理统计：接收延迟（帧到达 - 帧内时间戳），仅统计匹配的消息。
-            self._proc_stats.record_recv(hdr.topic, time.time_ns() - hdr.timestamp_ns)
-            if self._decode_queue is not None:
-                # 两线程模式：入队，worker 线程负责 decode + callback
-                self._decode_queue.put((frame_bytes, hdr, matched))
+            # 多进程消费池路由（9.2.4）：匹配/解码/回调全在 worker 进程
+            if self._pool is None:
+                continue  # 纯发布客户端：未订阅，数据帧丢弃
+            if self._pool.route(hdr.topic, frame_bytes):
+                self._proc_stats.record_recv(
+                    hdr.topic, time.time_ns() - hdr.timestamp_ns)
             else:
-                await self._inline_decode_and_dispatch(frame_bytes, hdr, matched)
-
-    async def _inline_decode_and_dispatch(self, frame_bytes: bytes, hdr, matched) -> None:
-        """内联解码 + 回调分发（兼容模式 / decode_queue_size<=0 时使用）。"""
-        t0 = time.perf_counter_ns()
-        need_decode = any(not ho for _, ho in matched)
-        msg = None
-        if need_decode:
-            try:
-                msg = frames.decode(frame_bytes)
-            except Exception:
-                logger.debug("client 帧解码失败，丢弃")
-                self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
-                return
-        for cb, ho in matched:
-            try:
-                target = hdr if ho else msg
-                if inspect.iscoroutinefunction(cb):
-                    await cb(target)
-                else:
-                    cb(target)
-            except Exception:
-                logger.exception("订阅回调异常")
-        self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
-
-    def _decode_worker_loop(self) -> None:
-        """worker 线程：批量出队 → 完整 decode → 回调分发。
-
-        批量出队（get_batch）一次锁获取取多条，减少与 recv 线程的锁竞争。
-        同步回调在 worker 线程直接调用（零调度开销）；异步回调通过
-        run_coroutine_threadsafe 调度回事件循环。
-        """
-        assert self._decode_queue is not None
-        while not self._stop.is_set():
-            batch = self._decode_queue.get_batch(timeout=1.0)
-            if not batch:
-                continue
-            for frame_bytes, hdr, matched in batch:
-                t0 = time.perf_counter_ns()
-                need_decode = any(not ho for _, ho in matched)
-                msg = None
-                if need_decode:
-                    try:
-                        msg = frames.decode(frame_bytes)
-                    except Exception:
-                        logger.debug("worker 帧解码失败，丢弃")
-                        self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
-                        continue
-                for cb, ho in matched:
-                    if cb is None:
-                        continue
-                    try:
-                        target = hdr if ho else msg
-                        if inspect.iscoroutinefunction(cb):
-                            if self._loop and not self._loop.is_closed():
-                                asyncio.run_coroutine_threadsafe(cb(target), self._loop)
-                        else:
-                            cb(target)
-                    except Exception:
-                        logger.exception("订阅回调异常")
-                self._proc_stats.record_proc(hdr.topic, time.perf_counter_ns() - t0)
+                self._route_drops[hdr.topic] = \
+                    self._route_drops.get(hdr.topic, 0) + 1
+                # 环满丢弃的帧 seq 已被 _track_gap 观测——回退基线，
+                # 让后续帧的缺口计数把它包含进来（否则漏报）
+                if self._gap_last.get(hdr.topic) == hdr.seq:
+                    self._gap_last[hdr.topic] = hdr.seq - 1
 
     # -------------------------------------------------------- heartbeat loop
 
     async def _heartbeat_loop(self) -> None:
         """周期发送 HEARTBEAT 控制帧；ack fire-and-forget。
 
-        两线程模式下，心跳同时携带自上次心跳以来的 per-topic 丢弃量，
-        供服务端 DropStats 聚合监控。drain_drops 取走并清零计数。
+        心跳携带 credit（全部环空闲量，服务端据此做信用流控）与自上次心跳
+        以来的 per-topic 丢弃量（环满 drop-new 计数），供服务端 DropStats
+        聚合监控。worker 统计（处理速率/耗时）一并聚合上报。
         """
         while not self._stop.is_set():
             try:
                 payload: dict = {"client_id": self._client_id}
-                if self._decode_queue is not None:
-                    drops = self._decode_queue.drain_drops()
+                if self._pool is not None:
+                    # 9.2.4 多进程池：credit = 全环空闲字节/观测最大帧（保守帧数）
+                    payload["credit"] = self._pool.free_credit()
+                    drops = dict(self._route_drops)
+                    self._route_drops.clear()
+                    for st in self._pool.drain_stats():
+                        for t, (total, cnt) in st.get("recv", {}).items():
+                            self._proc_stats.merge_recv(t, total, cnt)
+                        for t, (total, cnt) in st.get("proc", {}).items():
+                            self._proc_stats.merge_proc(t, total, cnt)
                     if drops:
                         payload["drops"] = drops
-                    payload["credit"] = self._decode_queue.remaining()
+                # 消费端缺口上报（9.2.1）：自上次心跳以来的新增缺失量
+                gaps = self._drain_gap_report()
+                if gaps:
+                    payload["gaps"] = gaps
                 # 处理统计：per-topic 处理速率 + 接收/处理延迟均值（自上次心跳以来）
                 proc = self._proc_stats.drain()
                 if proc:
                     payload["proc"] = proc
                 hb = frames.encode_control(ControlCmd.HEARTBEAT, payload)
-                await self._transport.send(b"", hb, role="control")
+                # 超时保护（9.2.1）：服务端控制管道满时不阻塞心跳循环
+                await asyncio.wait_for(
+                    self._transport.send(b"", hb, role="control"),
+                    timeout=_CONTROL_SEND_TIMEOUT)
             except Exception:
                 logger.debug("心跳发送失败", exc_info=True)
             await asyncio.sleep(self._heartbeat_interval)
@@ -889,12 +948,10 @@ class Client:
         self._recv_task = None
         self._hb_task = None
         self._reconnecting = False
-        # 关闭解码队列 + join worker 线程
-        if self._decode_queue is not None:
-            self._decode_queue.close()
-        if self._worker_thread is not None:
-            self._worker_thread.join(timeout=5)
-            self._worker_thread = None
+        # 停止多进程消费池（排空 ~150ms 后退出 worker）
+        if self._pool is not None:
+            self._pool.stop()
+            self._pool = None
         if self._registered:
             try:
                 disc = frames.encode_control(
@@ -912,17 +969,6 @@ class Client:
                 await self.on_disconnected()
             except Exception:
                 logger.exception("on_disconnected 回调异常")
-
-
-def _matches(pattern: str, topic: str) -> bool:
-    """topic 前缀匹配，与 routing.SubscriptionTable._matches 一致。
-
-    ``foo.*`` 匹配 ``foo`` 和 ``foo.<anything>``；否则精确匹配。
-    """
-    if pattern.endswith(".*"):
-        prefix = pattern[:-2]
-        return topic == prefix or topic.startswith(prefix + ".")
-    return pattern == topic
 
 
 class ProducerClient(Client):
@@ -1005,10 +1051,43 @@ class ProducerClient(Client):
 
 
 class ConsumerClient(Client):
-    """只订阅，屏蔽 publish。"""
+    """只订阅，屏蔽 publish。
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    9.2.4 起消费端只有一种模式——多进程消费池（默认 workers=1，即
+    "一个主进程接收 + 一个 worker 进程处理"）：
+
+    - 主进程 recv 循环只做 header 解码 + key 路由（零 payload 解码），
+      worker 进程经共享内存环取帧、解码并执行回调，真并行（绕开 GIL）；
+      基准见性能报告第七章（4 worker 6~23 倍于旧单进程模式）；
+    - workers=N：N 个 worker 进程；key：默认 "topic"（零解码成本，同 topic
+      落同 worker 且保序）；None = 轮询分发（不保序）；payload 字段名
+      （如 "symbol"）= 按字段值路由（接收侧需解码 payload，有代价）；
+      或 callable(payload, topic)->str 自定义提取（运行在主进程，lambda 可用）；
+    - 回调（含异步回调）必须是模块级可导入函数：跨进程按引用传递，
+      lambda/闭包不支持——worker 内不共享主进程内存，副作用需落到
+      进程外介质（文件/队列等）；worker_init(worker_index) 做每 worker 初始化；
+    - 心跳上报 credit（全部环空闲量）与丢帧（环满 drop-new 计数）；
+    - 9.2.1 默认开启服务端缓冲（buffer_policy="drop_old"）：消费端处理
+      不过来时服务端代为积压（默认上限 10 万条 / 10MB / 30s，任一触发即
+      开始丢弃最旧），把"静默丢帧"变成"可观测的积压 + 超龄过期"。
+      上限可通过 buffer_cfg 调小（不能超过服务端上限）；传
+      buffer_policy=None 恢复直发。
+    """
+
+    def __init__(self, *args,
+                 buffer_policy: str | None = "drop_old",
+                 buffer_cfg: dict | None = None,
+                 workers: int = 1,
+                 key: str | None = "topic",
+                 worker_ring_mb: int = 64,
+                 worker_init=None,
+                 **kwargs) -> None:
+        if buffer_cfg is None:
+            buffer_cfg = {"max_age_s": 30.0}
+        super().__init__(*args, buffer_policy=buffer_policy,
+                         buffer_cfg=buffer_cfg, workers=workers, key=key,
+                         worker_ring_mb=worker_ring_mb, worker_init=worker_init,
+                         **kwargs)
         self._roles = ["subscriber"]
 
     async def publish(self, topic: str, data: Any) -> None:  # type: ignore[override]

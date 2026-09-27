@@ -7,6 +7,7 @@ import pytest
 from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.security import CredentialStore
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _free_port():
@@ -14,7 +15,7 @@ def _free_port():
     s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-async def test_server_auth_via_bcrypt_credentialstore(tmp_path):
+async def test_server_auth_via_bcrypt_credentialstore(tmp_path, record_dir):
     f = str(tmp_path / "users.toml")
     store = CredentialStore(f, allow_auto_generated=False)
     store.add_user("alice", "secret", roles=["subscriber"])
@@ -30,12 +31,11 @@ async def test_server_auth_via_bcrypt_credentialstore(tmp_path):
         c = ConsumerClient(f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}", "alice", "secret")
         p = ProducerClient(f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}", "bob", "pw")
         await c.start(); await p.start()
-        got = []
-        await c.subscribe("t.*", lambda m: got.append(m.payload))
-        await asyncio.sleep(0.3)
+        await c.subscribe("t.*", mp_callbacks.on_msg_record_full)
+        await asyncio.sleep(0.4)
         await p.publish("t.x", {"k": 1})
-        await asyncio.sleep(0.5)
-        assert got == [{"k": 1}]
+        recs = await mp_callbacks.wait_records(record_dir, 1, timeout=6.0)
+        assert recs[0]["payload"] == {"k": 1}
         await c.stop(); await p.stop()
     finally:
         await srv.stop()

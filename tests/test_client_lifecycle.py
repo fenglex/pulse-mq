@@ -16,6 +16,7 @@ import pytest
 from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.errors import AuthenticationError, ClientStartupError
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _free_port() -> int:
@@ -41,7 +42,7 @@ async def _start_server(creds: dict[str, str]) -> tuple[Server, int, int]:
     return srv, dp, cp
 
 
-async def test_publish_subscribe_roundtrip():
+async def test_publish_subscribe_roundtrip(record_dir):
     srv, dp, cp = await _start_server({"alice": "s", "bob": "p"})
     try:
         c = ConsumerClient(
@@ -58,16 +59,13 @@ async def test_publish_subscribe_roundtrip():
         )
         await c.start()
         await p.start()
-        got: list = []
-        await c.subscribe("market.stock.*", lambda m: got.append(m))
+        await c.subscribe("market.stock.*", mp_callbacks.on_msg_record_full)
         # 让 SUBSCRIBE 控制帧被服务端处理并写入路由表。
-        await asyncio.sleep(0.3)
-        await p.publish("market.stock.600000", {"price": 12.3})
-        # 等数据帧被转发并由 recv_loop 投递到回调。
         await asyncio.sleep(0.5)
-        assert len(got) == 1, f"expected 1 msg, got {len(got)}"
-        assert got[0].payload == {"price": 12.3}
-        assert got[0].topic == "market.stock.600000"
+        await p.publish("market.stock.600000", {"price": 12.3})
+        recs = await mp_callbacks.wait_records(record_dir, 1)
+        assert recs[0]["payload"] == {"price": 12.3}
+        assert recs[0]["topic"] == "market.stock.600000"
         await c.stop()
         await p.stop()
     finally:
@@ -163,11 +161,14 @@ async def test_run_forever_reraises_reconnect_fatal():
 
 
 async def test_subscribe_before_start_is_cached():
-    """start 前调用 subscribe 应缓存，不抛异常（A3）。"""
+    """start 前调用 subscribe 应缓存，不抛异常（A3）。
+
+    9.2.4：回调在订阅时即校验（必须模块级可导入），缓存到 start() 时创建池。
+    """
     cons = ConsumerClient("tcp://localhost:5555", "tcp://localhost:5556",
                           username="u", password="p")
     # 未 start，transport 未就绪
-    await cons.subscribe("market.*", lambda m: None)
+    await cons.subscribe("market.*", mp_callbacks.on_msg_record)
     assert "market.*" in cons._subscriptions
 
 

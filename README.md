@@ -304,16 +304,26 @@ disconnected → cancel bg tasks → 新 Transport → PLAIN 认证 → REGISTER
 
 **业务无感**：订阅自动恢复，消息继续接收，业务层无需重新 `subscribe()`。
 
-### 两线程消费模型（可选）
+### 多进程消费模型（9.2.4 起唯一模式）
 
-默认单线程：recv 线程同时负责解码与回调。当解码成为瓶颈时，传入 `decode_queue_size > 0` 启用两线程模式：
+消费端只有一种模式——多进程消费池，默认 `workers=1`（一个主进程接收 + 一个 worker 进程处理）：
 
 ```
-recv 线程：header 解码 + 延迟采样 + 路由匹配 → 入队 _DropQueue
-worker 线程：批量出队 → 完整 decode + 回调分发
+主进程：recv → header 解码 + 延迟采样 + 缺口检测 → key 路由 → 共享内存环写入
+worker 进程 ×N：出环 → 完整 decode → 用户回调（真并行，绕开 GIL）
 ```
 
-队列满时丢弃最老消息并按 topic 计数，通过心跳上报给服务端，在 Web UI 的 topic 卡片上可见。
+```python
+c = ConsumerClient(..., workers=4, key="symbol")  # 4 个 worker 按 payload.symbol 路由
+```
+
+- `key`：默认 `"topic"`（同 topic 落同 worker 且保序）；`None` 轮询；payload 字段名；
+  或 `callable(payload, topic) -> str`（运行在主进程，lambda 可用）。
+- **回调必须是模块级可导入函数**（同步或异步均可）：跨进程按引用传递，
+  lambda/闭包在 `subscribe()` 时即报错；worker 进程内不共享主进程内存，
+  回调副作用请写入文件/队列等进程外介质。
+- 心跳上报 credit（全部环空闲量）与丢帧（环满 drop-new 计数）；
+  worker 每 1s 上报处理速率/耗时（Web UI 客户端卡片可见）。
 
 ---
 
@@ -519,7 +529,7 @@ python scripts/bench_dist.py --part a         # 只跑 Part A
 
 ### 配置文件（TOML）
 
-更多参数（`stats_db`、`event_ring_size`、`stats_archive_batch_size`、`admin_thread`、`ui_enabled`、`decode_queue_size` 等）通过 TOML 配置文件设置。在 `Server(config=...)` 传入自定义 `ServerConfig`，或调用 `load_server_config(path)` / `load_client_config(path)` 加载。完整字段见 [`ServerConfig` / `ClientConfig`](src/pulsemq/config.py)。
+更多参数（`stats_db`、`event_ring_size`、`stats_archive_batch_size`、`admin_thread`、`ui_enabled` 等）通过 TOML 配置文件设置。在 `Server(config=...)` 传入自定义 `ServerConfig`，或调用 `load_server_config(path)` / `load_client_config(path)` 加载。完整字段见 [`ServerConfig` / `ClientConfig`](src/pulsemq/config.py)。
 
 `ServerConfig` 默认值：零配置即可启动。
 

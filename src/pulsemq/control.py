@@ -12,6 +12,9 @@ class ControlCmd:
     UNSUBSCRIBE = "UNSUBSCRIBE"
     DISCONNECT = "DISCONNECT"
     LATENCY_REPORT = "LATENCY_REPORT"
+    # 确认发布回执（9.2.1+）：数据面 socket 上 server -> producer，
+    # payload = {ack_token, topic, seq, record_count}
+    PUBLISH_ACK = "PUBLISH_ACK"
 
 
 @dataclass

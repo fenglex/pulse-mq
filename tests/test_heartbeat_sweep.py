@@ -12,6 +12,7 @@ import socket as _sock
 from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.config import ServerConfig
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _free_port() -> int:
@@ -22,7 +23,7 @@ def _free_port() -> int:
     return p
 
 
-async def test_heartbeat_timeout_clears_routing():
+async def test_heartbeat_timeout_clears_routing(record_dir):
     dp, cp, ap = _free_port(), _free_port(), _free_port()
     cfg = ServerConfig(
         data_endpoint=f"tcp://127.0.0.1:{dp}",
@@ -54,13 +55,12 @@ async def test_heartbeat_timeout_clears_routing():
         )
         await c.start()
         await p.start()
-        got: list[str] = []
-        await c.subscribe("topic.x", lambda m: got.append(m.topic))
-        await asyncio.sleep(0.4)
+        await c.subscribe("topic.x", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.5)
         # 1) 正常路径：发布被转发
         await p.publish("topic.x", {"i": 1})
-        await asyncio.sleep(0.5)
-        assert got == ["topic.x"]
+        recs = await mp_callbacks.wait_records(record_dir, 1, timeout=6.0)
+        assert [r["topic"] for r in recs] == ["topic.x"]
         # routing 表此刻应有一条订阅
         assert srv._routing.snapshot(), "routing 应非空"
 
@@ -90,7 +90,8 @@ async def test_heartbeat_timeout_clears_routing():
         # 5) 再次发布不应被转发给已死 consumer（无异常即可）
         await p.publish("topic.x", {"i": 2})
         await asyncio.sleep(0.4)
-        assert got == ["topic.x"]  # 没有第二条
+        recs2 = mp_callbacks.read_records(record_dir)
+        assert len([r for r in recs2 if r["topic"] == "topic.x"]) == 1  # 没有第二条
         await p.stop()
     finally:
         await srv.stop()

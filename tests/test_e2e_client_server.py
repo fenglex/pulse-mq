@@ -17,6 +17,7 @@ import pytest
 from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.errors import ClientStartupError
 from pulsemq.server import Server
+from tests import mp_callbacks
 
 
 def _free_port() -> int:
@@ -42,7 +43,7 @@ async def _start_server(creds: dict[str, str]) -> tuple[Server, int, int]:
     return srv, dp, cp
 
 
-async def test_multi_producer_single_consumer():
+async def test_multi_producer_single_consumer(record_dir):
     """1 consumer 订阅 ``market.*``；2 producer 各发一条 → consumer 收到两条。"""
     srv, dp, cp = await _start_server({"c": "c", "p1": "p", "p2": "p"})
     try:
@@ -67,15 +68,14 @@ async def test_multi_producer_single_consumer():
         await c.start()
         await p1.start()
         await p2.start()
-        got: list[str] = []
-        await c.subscribe("market.*", lambda m: got.append(m.topic))
+        await c.subscribe("market.*", mp_callbacks.on_msg_record)
         # 让 SUBSCRIBE 控制帧被服务端处理并写入路由表。
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
         await p1.publish("market.stock.a", {"x": 1})
         await p2.publish("market.bond.b", {"x": 2})
-        # 等数据帧被转发并由 recv_loop 投递到回调。
-        await asyncio.sleep(0.5)
-        assert sorted(got) == ["market.bond.b", "market.stock.a"]
+        # 等数据帧被转发并投递到 worker 回调。
+        recs = await mp_callbacks.wait_records(record_dir, 2)
+        assert sorted(r["topic"] for r in recs) == ["market.bond.b", "market.stock.a"]
         await c.stop()
         await p1.stop()
         await p2.stop()
@@ -83,7 +83,7 @@ async def test_multi_producer_single_consumer():
         await srv.stop()
 
 
-async def test_server_producer_traffic_is_counted_by_stats():
+async def test_server_producer_traffic_is_counted_by_stats(record_dir):
     """服务端内置 producer 推送的消息必须计入 TrafficStats（监控可见）。
 
     回归 Bug：``_on_server_produce`` 曾绕过 ``_data_loop`` 直接 encode→route→send，
@@ -118,17 +118,16 @@ async def test_server_producer_traffic_is_counted_by_stats():
             password="s",
         )
         await c.start()
-        got: list[str] = []
-        await c.subscribe("server.tick", lambda m: got.append(m.topic))
+        await c.subscribe("server.tick", mp_callbacks.on_msg_record)
         # 让 producer 发若干条并被消费。
-        await asyncio.sleep(0.6)
+        recs = await mp_callbacks.wait_records(record_dir, 3, timeout=8.0)
 
         base = f"http://127.0.0.1:{ap}"
         with _url.urlopen(f"{base}/api/v1/stats/realtime", timeout=5) as r:
             snap = _json.loads(r.read().decode("utf-8"))
         topics = snap.get("topics", {})
         # 消费者确实收到了消息
-        assert len(got) > 0, "consumer 未收到 server producer 消息"
+        assert len(recs) > 0, "consumer 未收到 server producer 消息"
         # server.tick 必须出现在流量统计里
         assert "server.tick" in topics, (
             f"server producer 流量未计入 stats（topics={list(topics)})")
@@ -160,7 +159,7 @@ async def test_single_user_single_online():
         with pytest.raises(ClientStartupError):
             await c2.start()
         # c1 必须仍然在线：能正常订阅并停机。
-        await c1.subscribe("t.*", lambda m: None)
+        await c1.subscribe("t.*", mp_callbacks.on_msg_record)
         await c1.stop()
     finally:
         await srv.stop()
@@ -193,8 +192,8 @@ async def test_subscriptions_reflected_in_monitor():
             password="s",
         )
         await c.start()
-        await c.subscribe("market.*", lambda m: None)
-        await c.subscribe("sports.news", lambda m: None)
+        await c.subscribe("market.*", mp_callbacks.on_msg_record)
+        await c.subscribe("sports.news", mp_callbacks.on_msg_record)
         # 等控制帧被处理。
         await asyncio.sleep(0.3)
 

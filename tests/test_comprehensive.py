@@ -1,12 +1,11 @@
 """全面功能测试：覆盖所有新增功能 + 监控指标 + 边界条件 + 线程安全。
 
-测试矩阵:
-  A. _DropQueue — get_batch / remaining / 并发 / 边界
+测试矩阵（9.2.4：消费端唯一模式为多进程池，_DropQueue 两线程队列已删除）:
   B. DropStats — 多轮 roll_minute / 1h 窗口 / 线程安全
   C. topic interning — 同 bytes 返回同 str / 缓存上限
   D. Zstd 压缩线程安全 — 多线程并发 compress/decompress
   E. TrafficStats 无锁 — 并发 record + snapshot 不崩溃
-  F. 消费端两线程 e2e — 同步/异步回调 / 慢回调触发丢弃
+  F. 消费端多进程池 e2e — 同步/异步回调 / 慢回调限流不丢失
   G. 服务端心跳 drops + credit — e2e 心跳处理
   H. Admin API drops — realtime 快照包含丢弃指标
 """
@@ -16,16 +15,16 @@ import asyncio
 import socket as _sock
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
 
-from pulsemq.client import ConsumerClient, ProducerClient, _DropQueue
+from pulsemq.client import ConsumerClient, ProducerClient
 from pulsemq.protocol import frames
 from pulsemq.protocol.msg_type import DataType
 from pulsemq.server import Server
 from pulsemq.stats.drops import DropStats
 from pulsemq.stats.traffic import TrafficStats
+from tests import mp_callbacks
 
 
 # ---------------------------------------------------------------------------
@@ -51,81 +50,6 @@ async def _start_server(creds: dict[str, str], **kw) -> tuple[Server, int, int, 
     await srv.start()
     await asyncio.sleep(0.2)
     return srv, dp, cp, ap
-
-
-def _item(topic: str):
-    return (b"frame", SimpleNamespace(topic=topic), [])
-
-
-# ---------------------------------------------------------------------------
-# A. _DropQueue — get_batch / remaining / 并发
-# ---------------------------------------------------------------------------
-
-def test_drop_queue_get_batch():
-    q = _DropQueue(maxlen=10)
-    q.put(_item("a"))
-    q.put(_item("b"))
-    q.put(_item("c"))
-    batch = q.get_batch(timeout=1.0, max_items=2)
-    assert len(batch) == 2
-    assert batch[0][1].topic == "a"
-    assert batch[1][1].topic == "b"
-    # 第二批取剩余
-    batch2 = q.get_batch(timeout=1.0)
-    assert len(batch2) == 1
-    assert batch2[0][1].topic == "c"
-
-
-def test_drop_queue_get_batch_empty_timeout():
-    q = _DropQueue(maxlen=10)
-    batch = q.get_batch(timeout=0.3)
-    assert batch == []
-
-
-def test_drop_queue_remaining():
-    q = _DropQueue(maxlen=100)
-    assert q.remaining() == 100
-    q.put(_item("a"))
-    assert q.remaining() == 99
-    q.put(_item("b"))
-    assert q.remaining() == 98
-    q.get(timeout=0.5)
-    assert q.remaining() == 99
-
-
-def test_drop_queue_maxlen_1():
-    """边界：队列长度 1，每次 put 都丢弃最老。"""
-    q = _DropQueue(maxlen=1)
-    q.put(_item("t1"))
-    q.put(_item("t2"))  # 丢弃 t1
-    drops = q.drain_drops()
-    assert drops == {"t1": 1}
-    item = q.get(timeout=0.5)
-    assert item[1].topic == "t2"
-
-
-def test_drop_queue_concurrent_put_get():
-    """并发 put + get_batch 不丢失消息。"""
-    q = _DropQueue(maxlen=10000)
-    received = []
-
-    def producer():
-        for i in range(500):
-            q.put(_item(f"t{i}"))
-        q.close()
-
-    def consumer():
-        while True:
-            batch = q.get_batch(timeout=1.0)
-            if not batch:
-                break
-            received.extend(batch)
-
-    pt = threading.Thread(target=producer)
-    ct = threading.Thread(target=consumer)
-    pt.start(); ct.start()
-    pt.join(timeout=5); ct.join(timeout=5)
-    assert len(received) == 500
 
 
 # ---------------------------------------------------------------------------
@@ -288,16 +212,16 @@ def test_traffic_stats_roll_during_record():
 
 
 # ---------------------------------------------------------------------------
-# F. 消费端两线程 e2e
+# F. 消费端多进程池 e2e（9.2.4 唯一消费模式）
 # ---------------------------------------------------------------------------
 
-async def test_two_thread_consumer_receives_messages():
-    """两线程模式下消费端正确接收消息（同步回调）。"""
+async def test_pool_consumer_receives_messages(record_dir):
+    """多进程池模式正确接收消息（模块级同步回调 + 录制器）。"""
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=100,
+            "c", "c",
         )
         p = ProducerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
@@ -305,26 +229,26 @@ async def test_two_thread_consumer_receives_messages():
         )
         await c.start()
         await p.start()
-        got: list[str] = []
-        await c.subscribe("test.*", lambda m: got.append(m.topic))
-        await asyncio.sleep(0.3)
+        await c.subscribe("test.*", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.5)
         for i in range(5):
             await p.publish(f"test.{i}", {"i": i})
-        await asyncio.sleep(1.0)
-        assert sorted(got) == ["test.0", "test.1", "test.2", "test.3", "test.4"]
+        recs = await mp_callbacks.wait_records(record_dir, 5)
+        assert sorted(r["topic"] for r in recs) == \
+            ["test.0", "test.1", "test.2", "test.3", "test.4"]
         await c.stop()
         await p.stop()
     finally:
         await srv.stop()
 
 
-async def test_two_thread_consumer_async_callback():
-    """两线程模式下异步回调正常工作。"""
+async def test_pool_consumer_async_callback(record_dir):
+    """异步回调在 worker 进程事件循环上正常执行。"""
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=100,
+            "c", "c",
         )
         p = ProducerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
@@ -332,29 +256,28 @@ async def test_two_thread_consumer_async_callback():
         )
         await c.start()
         await p.start()
-        got: list[str] = []
-
-        async def async_cb(msg):
-            got.append(msg.topic)
-
-        await c.subscribe("async.*", async_cb)
-        await asyncio.sleep(0.3)
+        await c.subscribe("async.*", mp_callbacks.on_msg_record_async)
+        await asyncio.sleep(0.5)
         await p.publish("async.test", {"x": 1})
-        await asyncio.sleep(1.0)
-        assert got == ["async.test"]
+        recs = await mp_callbacks.wait_records(record_dir, 1)
+        assert recs[0]["topic"] == "async.test"
         await c.stop()
         await p.stop()
     finally:
         await srv.stop()
 
 
-async def test_consumer_drops_with_slow_callback():
-    """慢回调 + 小队列 → 消息丢弃，drops > 0。"""
+async def test_consumer_slow_callback_throttled_no_loss(record_dir):
+    """慢回调：信用流控 + 服务端缓冲使消息不丢失（9.2.2 后语义）。
+
+    慢回调（worker 处理慢）不再产生队列丢弃：服务端按心跳 credit 放行，
+    未放行的帧进入订阅者缓冲（drop_old），最终全部有序送达。
+    """
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=3,
+            "c", "c",
         )
         p = ProducerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
@@ -362,22 +285,13 @@ async def test_consumer_drops_with_slow_callback():
         )
         await c.start()
         await p.start()
-        received = []
-
-        def slow_cb(msg):
-            received.append(1)
-            time.sleep(0.1)  # 100ms per message
-
-        await c.subscribe("flood.*", slow_cb)
-        await asyncio.sleep(0.3)
-        # 快速发送 50 条，队列只能存 3 条
-        for i in range(50):
+        await c.subscribe("flood.*", mp_callbacks.on_msg_record_slow)
+        await asyncio.sleep(0.5)
+        for i in range(20):
             await p.publish("flood.tick", {"i": i})
-        await asyncio.sleep(2.0)  # 等心跳上报 drops
-
-        # consumer 端应该有 drops（心跳可能已 drain，改检查收到的 < 发送数）
-        assert len(received) < 20, \
-            f"Should have dropped some with slow callback, received all {len(received)}"
+        # 慢回调：20 条 × ~50ms ≈ 1s + 调度，给足超时
+        recs = await mp_callbacks.wait_records(record_dir, 20, timeout=15.0)
+        assert [r["payload_i"] for r in recs] == list(range(20))
         await c.stop()
         await p.stop()
     finally:
@@ -389,50 +303,59 @@ async def test_consumer_drops_with_slow_callback():
 # ---------------------------------------------------------------------------
 
 async def test_server_receives_drops_via_heartbeat():
-    """服务端通过心跳收到消费端丢弃指标。"""
+    """服务端通过心跳收到消费端丢弃指标（协议层直发 drops 字段验证聚合路径）。
+
+    9.2.2 信用窗口守恒后，真实客户端的解码队列在正确限流下不会溢出
+    （每窗口发送预算 <= 快照时队列空闲位，消费只会增加空闲位——数学上
+    不可能超发），队列丢弃成为结构性不可能；故心跳 drops 上报路径改由
+    协议层直接验证。_DropQueue 自身的丢弃计数见 test_drop_queue_maxlen_1。
+    """
+    import zmq
+    import zmq.asyncio
+    from pulsemq.protocol import frames as _frames
+
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
+    sock = None
     try:
-        c = ConsumerClient(
-            f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=2,
-        )
-        p = ProducerClient(
-            f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "p", "p",
-        )
-        await c.start()
-        await p.start()
-
-        def slow_cb(msg):
-            time.sleep(0.2)
-
-        await c.subscribe("drop.*", slow_cb)
+        ctx = zmq.asyncio.Context.instance()
+        sock = ctx.socket(zmq.DEALER)
+        sock.setsockopt(zmq.IDENTITY, b"hb-drops-client")
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.plain_username = b"c"
+        sock.plain_password = b"c"
+        sock.connect(f"tcp://127.0.0.1:{cp}")
+        reg = _frames.encode_control("REGISTER", {
+            "client_id": "hb-drops", "username": "c", "endpoint": "tcp://x",
+            "roles": ["subscriber"], "topics": [],
+        })
+        await sock.send(reg)
         await asyncio.sleep(0.3)
-        for i in range(20):
-            await p.publish("drop.test", {"i": i})
-        # 等至少 2 个心跳周期（2s），让 drops 上报到服务端
-        await asyncio.sleep(3.0)
-
-        # 检查服务端 DropStats
+        hb = _frames.encode_control("HEARTBEAT", {
+            "client_id": "hb-drops",
+            "drops": {"drop.test": 5},
+        })
+        await sock.send(hb)
+        await asyncio.sleep(0.5)
         snap = srv._drop_stats.snapshot()
         drop_data = snap.get("drop.test", {})
         total = drop_data.get("drops_current", 0) + drop_data.get("drops_1h_total", 0)
-        assert total > 0, f"Server should have received drops via heartbeat, got {snap}"
-        await c.stop()
-        await p.stop()
+        assert total >= 5, f"Server should have received drops via heartbeat, got {snap}"
     finally:
+        if sock is not None:
+            sock.close(linger=0)
         await srv.stop()
 
 
-async def test_server_credit_updated_by_heartbeat():
-    """服务端 credits 字典在心跳后被更新。"""
+async def test_server_credit_updated_by_heartbeat(record_dir):
+    """服务端 credits 字典在心跳后被更新（池已建时心跳携带环空闲 credit）。"""
     srv, dp, cp, ap = await _start_server({"c": "c"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=500,
+            "c", "c",
         )
         await c.start()
+        await c.subscribe("credit.*", mp_callbacks.on_msg_record)
         await asyncio.sleep(2.0)  # 等心跳
 
         # 服务端应该有该 consumer 的 credit
@@ -444,15 +367,16 @@ async def test_server_credit_updated_by_heartbeat():
         await srv.stop()
 
 
-async def test_server_credit_cleanup_on_disconnect():
+async def test_server_credit_cleanup_on_disconnect(record_dir):
     """DISCONNECT 后 credits 清理。"""
     srv, dp, cp, ap = await _start_server({"c": "c"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=100,
+            "c", "c",
         )
         await c.start()
+        await c.subscribe("credit.*", mp_callbacks.on_msg_record)
         await asyncio.sleep(1.5)  # 等心跳
         assert len(srv._credits) > 0
         await c.stop()
@@ -500,13 +424,13 @@ async def test_admin_api_drops_after_roll():
 # I. 全链路 e2e：producer → server → consumer + drops + stats + latency
 # ---------------------------------------------------------------------------
 
-async def test_full_e2e_all_metrics():
+async def test_full_e2e_all_metrics(record_dir):
     """全链路：消息收发 + 流量统计 + 延迟采样同时工作。"""
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
     try:
         c = ConsumerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}",
-            "c", "c", decode_queue_size=100,
+            "c", "c",
             latency_sample_rate=1.0,  # 100% 采样确保有延迟数据
         )
         p = ProducerClient(
@@ -515,15 +439,14 @@ async def test_full_e2e_all_metrics():
         )
         await c.start()
         await p.start()
-        got = []
-        await c.subscribe("e2e.*", lambda m: got.append(m.topic))
-        await asyncio.sleep(0.3)
+        await c.subscribe("e2e.*", mp_callbacks.on_msg_record)
+        await asyncio.sleep(0.5)
         for i in range(10):
             await p.publish("e2e.test", {"seq": i})
-        await asyncio.sleep(1.5)
+        recs = await mp_callbacks.wait_records(record_dir, 10)
 
         # 1. 消息全部收到
-        assert len(got) == 10
+        assert len(recs) == 10
 
         # 2. 服务端流量统计有数据
         snap = srv._admin._realtime_snapshot()
@@ -536,7 +459,7 @@ async def test_full_e2e_all_metrics():
         await srv.stop()
 
 
-async def test_header_only_callback():
+async def test_header_only_callback(record_dir):
     """header_only 回调跳过完整 decode，直接接收 FrameHeader。"""
     srv, dp, cp, ap = await _start_server({"c": "c", "p": "p"})
     try:
@@ -550,15 +473,12 @@ async def test_header_only_callback():
         )
         await c.start()
         await p.start()
-        received_headers = []
-        await c.subscribe("hdr.*", lambda hdr: received_headers.append(hdr),
-                          header_only=True)
-        await asyncio.sleep(0.3)
-        await p.publish("hdr.test", {"x": 1})
+        await c.subscribe("hdr.*", mp_callbacks.on_hdr_record, header_only=True)
         await asyncio.sleep(0.5)
-        assert len(received_headers) == 1
-        assert received_headers[0].topic == "hdr.test"
-        assert hasattr(received_headers[0], "record_count")  # FrameHeader
+        await p.publish("hdr.test", {"x": 1})
+        recs = await mp_callbacks.wait_records(record_dir, 1)
+        assert recs[0]["topic"] == "hdr.test"
+        assert recs[0]["rows"] == 1  # FrameHeader.record_count
         await c.stop()
         await p.stop()
     finally:
