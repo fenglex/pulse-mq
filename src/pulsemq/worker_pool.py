@@ -1,8 +1,12 @@
 """消费端多进程 worker 池：共享内存变长字节环 + worker 进程主循环。
 
 架构（ConsumerClient(workers=N) 启用）：
-  接收循环（主进程）──按 key 路由──> N 个 SM 字节环（每 worker 一个 SPSC 环）
-                                        └→ worker 进程：出环 → 解码 → 用户回调
+  接收循环（主进程，批量排空 recv）──按 key 路由──> N 个 SM 字节环
+  （每 worker 一个 SPSC 环）                └→ worker 进程：出环 → 解码 → 用户回调
+
+路由模式（key 参数）：None=最短队列（等速时即轮询）、"topic"/字段名/
+callable=jump consistent hash 粘性（同 key 恒定同 worker，n 变化仅
+~1/n 换位）。
 
 环布局（共享内存）：[tail:8][head:8][data:cap]，tail/head 为单调累计字节
 （tail 仅写者写，head 仅读者写，x86 TSO 下"先数据后序号 / 先序号后数据"
@@ -24,6 +28,7 @@ import os
 import struct
 import threading
 import time
+import zlib
 
 from pulsemq.logging_setup import logger
 from pulsemq.protocol import frames
@@ -132,10 +137,28 @@ class ShmRing:
                 pass
 
 
+def _jump_hash(key: int, n_buckets: int) -> int:
+    """Lamping-Voss 跳跃一致性哈希（整数版，O(log n)，跨平台确定）。
+
+    性质：bucket 数 n→n+1 时仅 ~1/n 的 key 换位（对比取模的近全量重排）。
+    """
+    b, j = -1, 0
+    while j < n_buckets:
+        b = j
+        key = (key * 2862933555777941757 + 1) & 0xFFFFFFFFFFFFFFFF
+        j = (b + 1) * (1 << 31) // ((key >> 33) + 1)
+    return b
+
+
 def stable_worker_index(key: str, n_workers: int) -> int:
-    """确定性 key → worker 映射（crc32，跨进程/重启一致；禁用内置 hash——有随机化）。"""
-    import zlib
-    return zlib.crc32(key.encode("utf-8")) % n_workers
+    """确定性 key → worker 映射（jump consistent hash over crc32）。
+
+    - n 不变：同 key 恒定映射（跨进程/重启一致，禁用内置 hash——有随机化）。
+    - n 变化（扩容重启）：仅 ~1/n 的 key 换位，per-key 状态/粘性大体保留。
+    """
+    if n_workers <= 1:
+        return 0
+    return _jump_hash(zlib.crc32(key.encode("utf-8")), n_workers)
 
 
 WORKER_POLL_SLEEP = 0.0002
@@ -318,11 +341,23 @@ class WorkerPool:
         time.sleep(0.3)
 
     def route(self, topic: str, payload_bytes: bytes) -> bool:
-        """按 key 路由一帧。返回 False 表示环满（drop-new，调用方计数）。"""
+        """按 key 路由一帧。返回 False 表示环满（drop-new，调用方计数）。
+
+        key_mode=None → 最短队列路由：优先积压字节数最少的环（慢 worker
+        自动降载、快 worker 自动补位），并列时按轮询计数器取——worker
+        等速时退化为完美轮询，均匀性不丢。其余模式见 stable_worker_index。
+        """
         n = self.n_workers
         if self.key_mode is None:
-            idx = self._rr % n
-            self._rr += 1
+            pend = [r.pending_bytes() for r in self._rings]
+            target = min(pend)
+            idx = -1
+            for k in range(n):
+                i = (self._rr + k) % n
+                if pend[i] == target:
+                    idx = i
+                    self._rr += 1
+                    break
         elif self.key_mode == "topic":
             idx = stable_worker_index(topic, n)
         elif callable(self.key_mode):

@@ -524,6 +524,18 @@ class Transport:
         # DEALER 收到单帧
         return b"", parts[0]
 
+    async def recv_nowait(self, role: str = "server_ingress") -> tuple[bytes, bytes]:
+        """DONTWAIT 立即接收：无消息抛 zmq.Again，绝不挂起事件循环。
+
+        客户端接收循环批量排空用——一次唤醒内连收多帧，摊薄逐帧 await
+        的事件循环往返开销（pyzmq asyncio socket 对 DONTWAIT 走同步短路）。
+        """
+        sock = self._socket_for(role)
+        parts = await sock.recv_multipart(flags=zmq.DONTWAIT)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        return b"", parts[0]
+
     async def close(self) -> None:
         # 同步数据面先关（独立线程 + 独立 ctx）
         if self._sync_data:

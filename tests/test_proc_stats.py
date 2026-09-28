@@ -189,16 +189,22 @@ async def _run_e2e(record_dir: str) -> dict:
         realtime = await _get_json(ap, "/api/v1/stats/realtime",
                                    token=srv.admin_token)
         deadline = time.monotonic() + 10.0
+        # count/rate 是窗口量：worker 统计晚于 recv 一个心跳窗口（≥1s 批量
+        # flush）时，末窗快照可能是 proc-only 的 count=0——按轮询期最大
+        # count 断言；延迟字段要求服务端 latch 后两者齐备。
+        best_count = 0
         while time.monotonic() < deadline:
             by_id = {c["client_id"]: c for c in clients["clients"]}
             p = by_id.get("sub-proc", {}).get("processing", {})
-            if "proc_avg_ms" in p and "recv_avg_ms" in p:
+            best_count = max(best_count, p.get("count", 0))
+            if "proc_avg_ms" in p and "recv_avg_ms" in p and best_count >= 30:
                 break
             await asyncio.sleep(0.5)
             clients = await _get_json(ap, "/api/v1/clients", token=srv.admin_token)
             realtime = await _get_json(ap, "/api/v1/stats/realtime",
                                        token=srv.admin_token)
-        return {"clients": clients, "realtime": realtime}
+        return {"clients": clients, "realtime": realtime,
+                "best_count": best_count}
     finally:
         await sub.stop()
         await pub.stop()
@@ -212,13 +218,47 @@ async def test_e2e_heartbeat_proc_pool_mode(record_dir):
     sub_entry = by_id["sub-proc"]
     assert "processing" in sub_entry, f"缺少 processing: {sub_entry}"
     p = sub_entry["processing"]
-    assert p["rate_per_sec"] > 0
-    assert p["count"] >= 30
+    assert result["best_count"] >= 30
     assert "recv_avg_ms" in p and p["recv_avg_ms"] >= 0
     assert "proc_avg_ms" in p and p["proc_avg_ms"] >= 0
     # publisher 不订阅 → 无 processing
     assert "processing" not in by_id["pub-proc"]
-    # realtime 聚合包含该 topic
+    # realtime 聚合包含该 topic（速率是窗口量可能归零；延迟经 latch 恒在）
     topic_agg = result["realtime"]["processing_by_topic"].get("proc.t")
     assert topic_agg is not None
-    assert topic_agg["rate_per_sec"] > 0
+    assert "proc_avg_ms" in topic_agg and topic_agg["proc_avg_ms"] >= 0
+
+
+def test_proc_stats_proc_only_window_not_lost():
+    """9.2.7 修复：proc 统计晚于 recv 一个心跳窗口到达时（worker ≥1s 批量
+    flush 的常态），proc-only 窗口不能把数据静默吞掉。"""
+    ps = _ProcStats()
+    # 窗口 1：只有接收计数（worker 统计尚未 flush）
+    for _ in range(60):
+        ps.record_recv("t.x", 1_000_000)
+    w1 = ps.drain()
+    assert w1["t.x"]["count"] == 60
+    assert "proc_avg_ns" not in w1["t.x"]
+    # 窗口 2：无新消息，worker 才把处理统计送来（merge_proc 路径）
+    ps.merge_proc("t.x", 2_000_000 * 60, 60)
+    w2 = ps.drain()
+    assert "t.x" in w2, "proc-only 窗口不得丢弃处理统计"
+    assert w2["t.x"]["proc_avg_ns"] == 2_000_000
+    assert w2["t.x"]["count"] == 0
+    # 窗口 3：真正空闲 → 空 dict
+    assert ps.drain() == {}
+
+
+def test_client_proc_stats_latency_latch_across_windows():
+    """9.2.7 修复：服务端按 topic latch 延迟字段——recv 与 proc 落在不同
+    心跳窗口时，最终快照两个字段都可见。"""
+    s = ClientProcStats()
+    s.record("c1", "u1", {"t.a": {"count": 60, "rate": 60.0,
+                                  "recv_avg_ns": 3_000_000}})
+    # 下一窗口 proc-only（count=0，无 recv）
+    s.record("c1", "u1", {"t.a": {"count": 0, "rate": 0.0,
+                                  "proc_avg_ns": 2_000_000}})
+    summary = ClientProcStats.summarize(s.client_entry("c1"))
+    assert summary["recv_avg_ms"] == pytest.approx(3.0, abs=0.01)
+    assert summary["proc_avg_ms"] == pytest.approx(2.0, abs=0.01)
+    assert summary["count"] == 0  # count 是窗口量，不被 latch

@@ -1,10 +1,10 @@
-# PulseMQ 系统设计文档（v9.2.4）
+# PulseMQ 系统设计文档（v9.2.7）
 
 > 本文描述 PulseMQ **当前实现的真实状态**（以代码为准，非愿景规划）。
 > 涵盖：消息帧格式、进程/线程模型、线路协议、流控与缓冲、多进程消费池、
 > 丢弃语义全景、配置参考、监控接口、实测性能摘要与已知问题。
 >
-> 更新日期：2026-09-27 · 对应版本：9.2.4 · 代码位置：`src/pulsemq/`
+> 更新日期：2026-09-28 · 对应版本：9.2.7 · 代码位置：`src/pulsemq/`
 
 ---
 
@@ -42,8 +42,8 @@ PulseMQ 是一个基于 ZeroMQ（ROUTER/DEALER + PLAIN 认证）的轻量级 Pyt
 └────────────────────────────────────────────────────────────┘
 
 ┌─ ConsumerClient 进程（9.2.4 起唯一消费形态：多进程池）──────┐
-│ 主进程：recv→帧头解码→缺口检测→key 路由→SM 环写入          │
-│         （零 payload 解码，供给循环保持轻量）               │
+│ 主进程：批量排空 recv→轻量头部解析→缺口检测→key 路由→写入  │
+│         SM 环（零 payload 解码/零逐帧 await，9.2.7）        │
 │ worker 进程×N：出环→完整解码→回调（共享内存字节环，真并行） │
 │ 默认 workers=1：一个主进程接收 + 一个 worker 进程处理       │
 │ start() 时已有订阅即建池；运行期动态 subscribe 懒建池       │
@@ -241,7 +241,8 @@ DropStats 与 `/api/v1/stats/buffers`，与客户端缺口精确对账（实测�
 
 ```
 ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
-  本进程（ingestor）：recv → 帧头解码 → 缺口检测 → key 路由 → SM 环写入
+  本进程（ingestor）：批量排空 recv → 轻量头部解析 → 缺口检测 → key 路由
+                    → SM 环写入（9.2.7：一次唤醒连收，批内零 await）
   worker 进程 ×N   ：出环 → 完整解码 → 用户回调（真并行，绕开 GIL）
 ```
 
@@ -251,9 +252,12 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
   头尾为单调字节计数（物理偏移取模），x86 TSO 下无锁安全（ARM 需栅栏，暂不支持）。
   满语义 **drop-new**（丢最新帧并计数；credit 守恒下正常运行不会满，仅 worker
   停滞兜底）。诊断计数由 worker 写、主进程直读（强对账通道）。
-- **key 路由**：`crc32(key) % N`（确定性，跨进程/重启一致）。
-  key 形态：`"topic"`（默认，零解码成本 + 同 topic 保序）/ None（轮询）/
-  payload 字段名 / `callable(payload, topic)->str`（运行在主进程，lambda 可用）。
+- **key 路由**（9.2.7）：`None`（**默认**）= **最短队列路由**：每帧选积压字节
+  数最少的环、并列时轮询——worker 等速时即完美轮询，慢 worker 自动降载
+  （不保序）。`"topic"` / payload 字段名 /
+  `callable(payload, topic)->str`（运行在主进程，lambda 可用）
+  → **jump consistent hash**（over crc32；确定性，跨进程/重启一致；worker 数
+  变化时仅 ~1/n 换位；同 key 恒定同 worker、保序）。
 - **回调契约**：模块级可导入函数（跨进程按引用 pickle），**同步或异步均可**
   （9.2.4：异步回调在 worker 进程自有事件循环上执行，同一 worker 内串行）；
   lambda/闭包在订阅时即报错——worker 内不共享主进程内存，闭包捕获是拷贝。
@@ -310,7 +314,7 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
 |---|---|---|
 | buffer_policy / buffer_cfg | drop_old / {max_age_s:30} | 服务端缓冲协商（None=直发不缓冲） |
 | workers | 1 | worker 进程数（唯一消费模式；1=主进程+1 worker） |
-| key | "topic" | 路由键：topic / None 轮询 / payload 字段名 / callable |
+| key | None | 路由键：None（默认，最短队列，等速即轮询）/ topic / payload 字段名 / callable |
 | worker_ring_mb | 64 | 每 worker 共享内存环大小 |
 | worker_init | None | 每 worker 初始化函数 |
 | latency_sample_rate | 0.01 | 端到端延迟采样率 |
@@ -346,6 +350,7 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 | 池模式 workers=1 无丢失吞吐 | 9.2.4：轻 ≈ 1.64 万帧/s（零丢失至 18000 档）；重回调 ≈ 1.03 万帧/s（处理边界）。9.2.5 v3（发布端独立进程工装，`perf_test.py`）：轻零丢失至 1.74 万帧/s（发布端饱和，系统下限）；重回调 1.07 万帧/s（处理边界，与 9.2.4 持平） |
 | 行情快照 200 条/帧（749B/条） | 持续 ≤ 5 万条/s 零丢失；超载 ~30s 后开始可观测驱逐 |
 | 多进程池隔离基准 | P4 较单线程 ×6.7~23（GIL 密集/批量场景） |
+| 9.2.7 批量接收（4 核远程测试机） | 旧接收循环 ~43k 帧/s 单点上限消除：workers=2 峰值 7.6 万帧/s；workers=4 全程总吞吐 86.5 万帧（topic 粘性模式 78.5 万）。同机跨次方差 ±20%，峰值与 4-worker 总量为主要信号 |
 | 僵尸 peer 攻击 | 洪灌 11.4 万心跳后新客户端 0.74s 完成注册（9.1.1 同场景卡死） |
 
 完整数据与图表见《性能报告》（perf_921_final.html）。
@@ -362,10 +367,10 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| 9.2.7 | 客户端接收循环批量化 | 逐帧 await 的循环开销仍占主进程接收成本（实测 17.4k 帧/s 零丢失通过）；批量 recv 可再抬上限 |
-| 9.2.7 | credit 粒度细化 | 1s 窗口 → 数据通道按需捎带 + 字节预算（混合帧长失真、突发响应慢一拍）|
-| 9.2.7 | worker 统计通路加固 | mp.Queue 在 Windows feeder 延迟不可靠；SM diag 为权威，Queue 通道需重做 |
-| 9.2.7 | 缓冲"条数"改记录数语义 | max_messages 按帧计数，批量负载下形同虚设（§5.2） |
+| ~~9.2.7~~ 已完成 | 客户端接收循环批量化 | 9.2.7 落地：DONTWAIT 批量排空 + peek_topic_seq 轻量头部 + 批尾聚合统计 |
+| 9.2.8 | credit 粒度细化 | 1s 窗口 → 数据通道按需捎带 + 字节预算（混合帧长失真、突发响应慢一拍）|
+| 9.2.8 | worker 统计通路加固 | mp.Queue 在 Windows feeder 延迟不可靠；SM diag 为权威，Queue 通道需重做 |
+| 9.2.8 | 缓冲"条数"改记录数语义 | max_messages 按帧计数，批量负载下形同虚设（§5.2） |
 | 9.3.0 | **消费端拉模式（FETCH 协议）** | 删除 credit 机制整体（背压天然成立），抬高供给上限；API 不变 |
 | 9.3.0 | 消费端丢弃策略统一参数化 | 池模式 drop-new 与行情语义相反（worker 停滞丢最新），需 Vyukov 序列号环改 drop-oldest |
 | 9.3.0 | 服务端数据面多线程/分片 | 单线程出流 ~51k 帧/s 上限（fetch 批量回发可先缓解） |
@@ -387,6 +392,7 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 | 9.2.4 | **消费端架构收敛为唯一模式：多进程池**（删除两线程解码队列与内联分发，默认 workers=1 = 主进程+1 worker）；池下沉到基类（任意订阅走池，运行期懒建）；异步回调 worker 内事件循环支持；worker 空闲统计 flush 修复；回调订阅时校验 |
 | 9.2.5 | **v3 帧格式（唯一版本，无兼容层）**：扩展帧并入头部（seq 8B 恒在帧内，偏移 7），ack_id uuid → 4B ack_token 计数器（flags bit6），topic 上限 65535→255 字节（topic_len 2B→1B），头 20B→27B；删除 v1/v2 分流、proto 协商、ext 变换（stamp/strip）；新增 MAX_FRAME_BYTES(256MB) 编码防护 |
 | 9.2.6 | 客户端动态退订 `unsubscribe()`（本地订阅表 + worker 池 + 服务端 UNSUBSCRIBE 三层同步，幂等）；`pulsemq` CLI 接入 argparse（--help/--version 立即返回，不再启动服务器）；同进程双 Server 报错清晰化（ZAP inproc 端点独占约束文档化） |
+| 9.2.7 | **消费端吞吐与路由三连改**：客户端接收循环批量化（一次唤醒 DONTWAIT 连收 ≤256 帧 + `peek_topic_seq` 轻量头部 + 批尾聚合统计，消除逐帧 await）；`key=None` 改最短队列路由并将其设为**默认**（积压最少优先、并列轮询——等速时即轮询、慢 worker 自动降载）；key 路由换 jump consistent hash（worker 数变化仅 ~1/n 换位）。附带修复心跳处理统计丢失：`_ProcStats.drain` 只遍历有新接收计数的 topic，worker 统计晚到一个窗口时被静默吞掉——改为接收∪处理并集，服务端按 topic latch 延迟字段 |
 
 ---
 
@@ -407,5 +413,5 @@ src/pulsemq/
 ├── stats/           traffic/latency/drops/throughput/connections/storage
 ├── admin/           AdminServer（HTTP/SSE）+ web_ui.py（监控面板）
 └── security.py      CredentialStore（凭据文件/哈希）
-tests/               246 项（协议/生命周期/缓冲/池/CLI/压测辅助，mp 回调录制器）
+tests/               260 项（协议/生命周期/缓冲/池/CLI/路由/压测辅助，mp 回调录制器）
 ```

@@ -397,6 +397,28 @@ def decode_header(frame: bytes) -> FrameHeader:
                        seq=seq, ack_token=ack_token)
 
 
+# seq+ts 连续 16B（偏移 7/15），批量接收热路径专用
+_SEQ_TS_V3 = struct.Struct(">QQ")
+
+
+def peek_topic_seq(frame: bytes) -> tuple[str, int, int, int]:
+    """主进程接收循环热路径专用：仅取 (topic, seq, ts_ns, msg_type)。
+
+    不构造 FrameHeader、不解析 ack_token/CRC/payload 边界——完整性由
+    worker 侧 decode_header/decode 兜底；ack_token 存在时只修正 topic
+    偏移。逐帧开销从"对象构造+9 字段解包"降为两次 struct 读。
+    """
+    if (len(frame) < _HEAD_V3.size or frame[:2] != MAGIC
+            or frame[2] != VERSION):
+        raise FrameError("帧头非法")
+    seq, ts = _SEQ_TS_V3.unpack_from(frame, _SEQ_OFFSET)
+    off = _HEAD_V3.size + (4 if has_ack(frame[4]) else 0)
+    topic_len = frame[6]
+    if len(frame) - off < topic_len:
+        raise FrameError("topic 越界")
+    return (_intern_topic(frame[off:off + topic_len]), seq, ts, frame[3])
+
+
 def encode_control(
     cmd: str,
     payload: dict | None = None,

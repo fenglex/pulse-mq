@@ -315,7 +315,7 @@ disconnected → cancel bg tasks → 新 Transport → PLAIN 认证 → REGISTER
 消费端只有一种模式——多进程消费池，默认 `workers=1`（一个主进程接收 + 一个 worker 进程处理）：
 
 ```
-主进程：recv → header 解码 + 延迟采样 + 缺口检测 → key 路由 → 共享内存环写入
+主进程：批量排空 recv（一次唤醒连收多帧，9.2.7）→ header 解码 + 延迟采样 + 缺口检测 → key 路由 → 共享内存环写入
 worker 进程 ×N：出环 → 完整 decode → 用户回调（真并行，绕开 GIL）
 ```
 
@@ -323,8 +323,10 @@ worker 进程 ×N：出环 → 完整 decode → 用户回调（真并行，绕�
 c = ConsumerClient(..., workers=4, key="symbol")  # 4 个 worker 按 payload.symbol 路由
 ```
 
-- `key`：默认 `"topic"`（同 topic 落同 worker 且保序）；`None` 轮询；payload 字段名；
-  或 `callable(payload, topic) -> str`（运行在主进程，lambda 可用）。
+- `key`：默认 `None` = 最短队列（worker 等速时即轮询，慢 worker 自动降载，
+  不保序）；`"topic"` 同 key 恒定落同 worker 且保序（jump hash，worker 数
+  变化仅 ~1/n 换位）；payload 字段名；或 `callable(payload, topic) -> str`
+  （运行在主进程，lambda 可用）。
 - **回调必须是模块级可导入函数**（同步或异步均可）：跨进程按引用传递，
   lambda/闭包在 `subscribe()` 时即报错；worker 进程内不共享主进程内存，
   回调副作用请写入文件/队列等进程外介质。

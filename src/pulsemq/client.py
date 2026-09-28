@@ -4,8 +4,8 @@
 启动硬失败 + 运行期自动重连（Spec 1 §8.3）。
 
 消费模式（9.2.4 起唯一）：多进程 worker 池。
-- 主进程 recv 循环只做 header 解码 + key 路由，payload 解码与用户回调全部
-  在 worker 进程执行（共享内存环 + spawn 进程，绕开 GIL 真并行）；
+- 主进程 recv 循环批量排空接收 + 轻量头部解析 + key 路由，payload 解码
+  与用户回调全部在 worker 进程执行（共享内存环 + spawn 进程，绕开 GIL 真并行）；
 - workers=1（默认）即"一个主进程接收 + 一个 worker 进程处理"；
 - 回调必须为模块级可导入函数（pickle 按引用传递），同步或异步均可；
   worker 内不共享主进程内存，lambda/闭包不支持。
@@ -49,11 +49,11 @@ import random
 import threading
 import time
 import uuid
+import zmq
 from typing import Any, Awaitable, Callable
 
 from pulsemq.control import ControlCmd
-from pulsemq.errors import (AuthenticationError, ClientStartupError,
-                            ConnectionError, PublishAckTimeout)
+from pulsemq.errors import (AuthenticationError, ClientStartupError,                            ConnectionError, PublishAckTimeout)
 from pulsemq.logging_setup import log_event, logger
 from pulsemq.protocol import frames
 from pulsemq.protocol.msg_type import MsgType
@@ -65,6 +65,10 @@ _STARTUP_MONITOR_TIMEOUT = 5.0
 _REGISTER_REPLY_TIMEOUT = 3.0
 # 客户端控制面发送超时（9.2.1）：服务端管道满时不阻塞客户端循环。
 _CONTROL_SEND_TIMEOUT = 2.0
+
+# 接收循环单次唤醒的最大排空帧数：摊薄事件循环往返；上限防止批过大
+# 挤占心跳/控制面调度（4 核机器上 256 帧 × ~µs 级处理 ≈ 亚毫秒，安全）
+_RECV_DRAIN_MAX = 256
 # 心跳间隔（秒）。
 _HEARTBEAT_INTERVAL = 1.0
 # 运行期重连参数（Spec 1 §8.3）：指数退避，初始 1s，×2，封顶 30s。
@@ -117,7 +121,12 @@ class _ProcStats:
         """取走并清零，返回 {topic: {count, rate, recv_avg_ns, proc_avg_ns}}。
 
         rate 按实际流逝时间（两次 drain 间隔）折算，比名义心跳间隔更准。
-        空窗口（无消息）返回空 dict，心跳里省略 proc 字段。
+        空窗口（无消息且无待发 proc）返回空 dict，心跳里省略 proc 字段。
+
+        9.2.7 修复：遍历"新接收 ∪ 待发处理统计"的并集。worker 统计 ≥1s
+        批量 flush，通常比 recv 晚一个心跳窗口到达——只遍历 count 会把
+        proc-only 窗口的数据静默吞掉（proc_n 已清零，永不补发），表现为
+        admin API 偶发/持续缺 proc_avg_ms。
         """
         with self._lock:
             now = time.time_ns()
@@ -130,7 +139,8 @@ class _ProcStats:
             self._proc_ns = {}
             self._proc_n = {}
         out: dict[str, dict] = {}
-        for topic, n in count.items():
+        for topic in set(count) | set(proc_n):
+            n = count.get(topic, 0)
             entry: dict = {"count": n, "rate": round(n / elapsed, 2)}
             if n > 0:
                 entry["recv_avg_ns"] = recv_ns.get(topic, 0) // n
@@ -184,7 +194,7 @@ class Client:
         buffer_policy: str | None = None,
         buffer_cfg: dict | None = None,
         workers: int = 1,
-        key: str | None = "topic",
+        key: str | None = None,
         worker_ring_mb: int = 64,
         worker_init=None,
     ) -> None:
@@ -823,27 +833,72 @@ class Client:
     # -------------------------------------------------------------- recv loop
 
     async def _recv_loop(self) -> None:
-        """消费数据面帧：header 解码 + 延迟采样 + 按 key 路由进 worker 池。
+        """消费数据面帧：批量排空接收 + 轻量头部解析 + 按 key 路由进池。
 
-        9.2.4 唯一消费模式：本循环只做接收 + 路由（零解码），完整 decode +
-        回调在 worker 进程执行（绕开 GIL，真并行）。池未创建（纯发布客户端）
-        时数据帧直接丢弃。
+        9.2.7 批量化：一次事件循环唤醒后 DONTWAIT 连收（最多 _RECV_DRAIN_MAX
+        帧）成批处理，摊薄逐帧 await 的事件循环往返；批内为纯同步热路径
+        （无 await），接收统计按 topic 聚合一次合并。完整 decode + 回调仍在
+        worker 进程执行（绕开 GIL，真并行）。池未创建（纯发布客户端）时
+        数据帧直接丢弃。
         """
         while not self._stop.is_set():
             try:
-                _, frame_bytes = await self._transport.recv("data")
+                _, first = await self._transport.recv("data")
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("client 数据面 recv 异常")
                 continue
+            batch = [first]
+            for _ in range(_RECV_DRAIN_MAX - 1):
+                try:
+                    _, fb = await self._transport.recv_nowait("data")
+                except zmq.Again:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("client 数据面排空异常")
+                    break
+                batch.append(fb)
+            reports = self._process_batch(batch)
+            for topic, latency_ns in reports:
+                try:
+                    rep = frames.encode_control(
+                        ControlCmd.LATENCY_REPORT,
+                        {"topic": topic, "latency_ns": latency_ns},
+                    )
+                    # 超时保护（9.2.1）：控制面管道满时不阻塞 recv 循环
+                    await asyncio.wait_for(
+                        self._transport.send(b"", rep, role="control"),
+                        timeout=_CONTROL_SEND_TIMEOUT)
+                except Exception:
+                    logger.debug("延迟回传发送失败", exc_info=True)
+
+    def _process_batch(self, batch: list[bytes]) -> list[tuple[str, int]]:
+        """同步处理一批帧（热路径，无 await）。
+
+        逐帧：peek 头部（不构造 FrameHeader）→ 控制帧分发（PUBLISH_ACK）/
+        缺口检测 → 池路由；接收延迟统计按 topic 聚合，批尾一次
+        merge_recv（替代逐帧 record_recv 加锁）。返回待发送的延迟采样
+        回传 (topic, latency_ns) 列表，由调用方批后统一发送。
+        """
+        pool = self._pool
+        gap_last = self._gap_last
+        gap_missing = self._gap_missing
+        route_drops = self._route_drops
+        recv_acc: dict[str, list[int]] = {}
+        reports: list[tuple[str, int]] = []
+        do_sample = self._latency_sample_rate > 0
+        now_ns = time.time_ns()
+        for frame_bytes in batch:
             try:
-                hdr = frames.decode_header(frame_bytes)
+                topic, seq, ts_ns, msg_type = frames.peek_topic_seq(frame_bytes)
             except Exception:
                 logger.debug("client 帧头部解码失败，丢弃")
                 continue
             # 9.2.1：数据面 socket 上的控制帧（PUBLISH_ACK）→ resolve 等待方
-            if hdr.msg_type == MsgType.CONTROL:
+            if msg_type == MsgType.CONTROL:
                 try:
                     msg = frames.decode_control(frame_bytes)
                 except Exception:
@@ -854,35 +909,34 @@ class Client:
                     if ack_fut is not None and not ack_fut.done():
                         ack_fut.set_result(msg.payload)
                 continue
-            # 消费端缺口检测（v3 帧头恒带 seq，服务端已改写）
-            self._track_gap(hdr.topic, hdr.seq)
-            # 端到端延迟采样回传（recv 线程内尽早测量，保证准确）
-            if self._latency_sample_rate > 0 and random.random() < self._latency_sample_rate:
-                try:
-                    latency_ns = time.time_ns() - hdr.timestamp_ns
-                    rep = frames.encode_control(
-                        ControlCmd.LATENCY_REPORT,
-                        {"topic": hdr.topic, "latency_ns": latency_ns},
-                    )
-                    # 超时保护（9.2.1）：控制面管道满时不阻塞 recv 循环
-                    await asyncio.wait_for(
-                        self._transport.send(b"", rep, role="control"),
-                        timeout=_CONTROL_SEND_TIMEOUT)
-                except Exception:
-                    logger.debug("延迟回传发送失败", exc_info=True)
+            # 消费端缺口检测（v3 帧头恒带 seq，服务端已改写；与 _track_gap 同构）
+            last = gap_last.get(topic)
+            if last is not None and seq > last + 1:
+                gap_missing[topic] = gap_missing.get(topic, 0) + (seq - last - 1)
+            if last is None or seq > last:
+                gap_last[topic] = seq
+            # 端到端延迟采样回传（批内仅记录，批后统一发送）
+            if do_sample and random.random() < self._latency_sample_rate:
+                reports.append((topic, time.time_ns() - ts_ns))
             # 多进程消费池路由（9.2.4）：匹配/解码/回调全在 worker 进程
-            if self._pool is None:
+            if pool is None:
                 continue  # 纯发布客户端：未订阅，数据帧丢弃
-            if self._pool.route(hdr.topic, frame_bytes):
-                self._proc_stats.record_recv(
-                    hdr.topic, time.time_ns() - hdr.timestamp_ns)
+            if pool.route(topic, frame_bytes):
+                acc = recv_acc.get(topic)
+                if acc is None:
+                    recv_acc[topic] = [now_ns - ts_ns, 1]
+                else:
+                    acc[0] += now_ns - ts_ns
+                    acc[1] += 1
             else:
-                self._route_drops[hdr.topic] = \
-                    self._route_drops.get(hdr.topic, 0) + 1
-                # 环满丢弃的帧 seq 已被 _track_gap 观测——回退基线，
+                route_drops[topic] = route_drops.get(topic, 0) + 1
+                # 环满丢弃的帧 seq 已被观测——回退基线，
                 # 让后续帧的缺口计数把它包含进来（否则漏报）
-                if self._gap_last.get(hdr.topic) == hdr.seq:
-                    self._gap_last[hdr.topic] = hdr.seq - 1
+                if gap_last.get(topic) == seq:
+                    gap_last[topic] = seq - 1
+        for topic, (total_ns, cnt) in recv_acc.items():
+            self._proc_stats.merge_recv(topic, total_ns, cnt)
+        return reports
 
     # -------------------------------------------------------- heartbeat loop
 
@@ -1095,11 +1149,14 @@ class ConsumerClient(Client):
     9.2.4 起消费端只有一种模式——多进程消费池（默认 workers=1，即
     "一个主进程接收 + 一个 worker 进程处理"）：
 
-    - 主进程 recv 循环只做 header 解码 + key 路由（零 payload 解码），
-      worker 进程经共享内存环取帧、解码并执行回调，真并行（绕开 GIL）；
+    - 主进程 recv 循环批量排空接收（一次唤醒 DONTWAIT 连收），只做轻量
+      头部解析 + key 路由（零 payload 解码），worker 进程经共享内存环取帧、
+      解码并执行回调，真并行（绕开 GIL）；
       基准见性能报告第七章（4 worker 6~23 倍于旧单进程模式）；
-    - workers=N：N 个 worker 进程；key：默认 "topic"（零解码成本，同 topic
-      落同 worker 且保序）；None = 轮询分发（不保序）；payload 字段名
+    - workers=N：N 个 worker 进程；key：默认 None = 最短队列分发（不保序；
+      worker 等速时即轮询，慢 worker 自动降载）；"topic" = 同 topic 恒定
+      落同 worker 且保序（零解码成本，jump consistent hash——worker 数
+      变化时仅 ~1/n 换位）；payload 字段名
       （如 "symbol"）= 按字段值路由（接收侧需解码 payload，有代价）；
       或 callable(payload, topic)->str 自定义提取（运行在主进程，lambda 可用）；
     - 回调（含异步回调）必须是模块级可导入函数：跨进程按引用传递，
@@ -1117,7 +1174,7 @@ class ConsumerClient(Client):
                  buffer_policy: str | None = "drop_old",
                  buffer_cfg: dict | None = None,
                  workers: int = 1,
-                 key: str | None = "topic",
+                 key: str | None = None,
                  worker_ring_mb: int = 64,
                  worker_init=None,
                  **kwargs) -> None:

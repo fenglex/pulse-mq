@@ -26,10 +26,23 @@ class ClientProcStats:
         if not proc:
             return
         with self._lock:
+            prev = self._by_client.get(client_id)
+            topics = dict(proc)
+            if prev is not None:
+                # 字段级 latch：count/rate 是窗口量、每跳覆盖；延迟均值是
+                # 观测量，recv 与 proc 常落在不同心跳窗口（worker ≥1s 批量
+                # flush）——保留最后一次非空值，快照才始终完整（9.2.7）。
+                for t, m in topics.items():
+                    pm = prev["topics"].get(t)
+                    if pm is None:
+                        continue
+                    for f in ("recv_avg_ns", "proc_avg_ns"):
+                        if f not in m and f in pm:
+                            m[f] = pm[f]
             self._by_client[client_id] = {
                 "username": username,
                 "ts": time.time(),
-                "topics": proc,
+                "topics": topics,
             }
 
     def remove(self, client_id: str) -> None:
