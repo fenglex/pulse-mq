@@ -31,21 +31,26 @@ class DropStats:
         self._retention = retention_minutes
         self._current: dict[str, int] = {}
         self._history: dict[str, deque[MinuteDrop]] = {}
+        self._cum: dict[str, int] = {}   # 自启动累计（对账视图用，9.2.8）
         self._lock = threading.Lock()
 
     def record(self, topic: str, count: int) -> None:
-        """累加 topic 的丢弃量（来自消费者心跳）。"""
+        """累加 topic 的丢弃量（来自消费者心跳/服务端缓冲淘汰）。"""
         if count <= 0:
             return
         with self._lock:
             self._current[topic] = self._current.get(topic, 0) + count
+            self._cum[topic] = self._cum.get(topic, 0) + count
 
-    def roll_minute(self) -> None:
-        """整分钟归档：当前累积 → 历史窗口。"""
+    def roll_minute(self) -> list[tuple[str, int, int]]:
+        """整分钟归档：当前累积 → 历史窗口。返回 [(topic, ts, count)] 归档行
+        （9.2.8，供 SQLite 持久化；旧调用方忽略返回值，兼容）。"""
         ts = int(time.time()) // 60 * 60
+        rows: list[tuple[str, int, int]] = []
         with self._lock:
             for topic, count in self._current.items():
                 if count > 0:
+                    rows.append((topic, ts, count))
                     dq = self._history.get(topic)
                     if dq is None:
                         dq = deque(maxlen=self._retention)
@@ -56,6 +61,7 @@ class DropStats:
             empty = [t for t, q in self._history.items() if len(q) == 0]
             for t in empty:
                 del self._history[t]
+        return rows
 
     def snapshot(self) -> dict[str, dict]:
         """各 topic 丢弃快照（给 Admin API / SSE）。"""
@@ -71,5 +77,25 @@ class DropStats:
                     "drops_current": cur,
                     "drops_last_min": last_min,
                     "drops_1h_total": total_1h + cur,
+                    "drops_cum": self._cum.get(topic, 0),
                 }
             return result
+
+    def history(self, minutes: int) -> list[dict]:
+        """分钟历史（内存窗口，合并 SQLite 由 admin 层做，9.2.8）。
+
+        返回 [{timestamp, topics: {topic: count}}]，含当前进行中分钟。
+        """
+        with self._lock:
+            out: dict[int, dict] = {}
+            for topic, dq in self._history.items():
+                for m in dq:
+                    slot = out.setdefault(m.timestamp, {"timestamp": m.timestamp, "topics": {}})
+                    slot["topics"][topic] = m.drop_count
+            cur_ts = int(time.time()) // 60 * 60
+            if self._current:
+                slot = out.setdefault(cur_ts, {"timestamp": cur_ts, "topics": {}})
+                for topic, count in self._current.items():
+                    slot["topics"][topic] = count
+            cutoff = int(time.time()) - minutes * 60
+            return [out[k] for k in sorted(out) if k >= cutoff]

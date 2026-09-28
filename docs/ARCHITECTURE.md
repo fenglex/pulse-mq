@@ -543,6 +543,13 @@ worker 进程 ×N（spawn，独立 GIL）:
 随心跳上报服务端 DropStats；已观测的 seq 回退基线，缺口计数不漏报。
 credit = Σ 环空闲字节 ÷ 观测最大帧长（保守帧数上界）。
 
+key 拆分（字段名/callable 路由，9.2.9）仅支持 dict / str 载荷且要求精确
+topic 订阅；DataFrame/bytes、字段缺失、callable 异常 → `_key_fallback`：
+显式 WARNING（每原因一次）+ 回退 `stable_worker_index(topic)`，帧数经
+心跳 `key_fallback` delta 上报（服务端累计 `/clients` 的 `key_fallback`）。
+修复点：`_peek_payload` 此前对非 dict 载荷返回 `{}`，key="None" 使全部
+帧静默落单 worker。
+
 ### 9.5 控制面回复匹配 `_recv_control_reply`
 
 循环 recv 控制面回复直到 `request_id` 匹配，丢弃不匹配的帧（防多订阅 ack 串扰）。兼容旧 server（reply 无 request_id）时退化为直接返回。

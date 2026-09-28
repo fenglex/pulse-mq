@@ -130,6 +130,41 @@ def test_token_file_mode_0600_posix(tmp_path, monkeypatch):
     assert mode == 0o600
 
 
+def test_admin_token_file_reused_across_restarts(tmp_path, monkeypatch):
+    """9.2.8：admin_token_file 已有 token 时重启必须复用，不得重新生成。
+
+    回归：_resolve_admin_token 此前只生成+覆写，从不读已有文件——
+    每次重启换 token，浏览器收藏/告警 webhook 全部失效。
+    """
+    import os
+
+    from pulsemq.server import Server
+
+    monkeypatch.delenv("PULSEMQ_ADMIN_TOKEN", raising=False)
+    tok_file = str(tmp_path / "admin.token")
+    endpoints = (_port(), _port(), _port())
+    kwargs = dict(
+        data_endpoint=f"tcp://127.0.0.1:{endpoints[0]}",
+        control_endpoint=f"tcp://127.0.0.1:{endpoints[1]}",
+        admin_endpoint=f"127.0.0.1:{endpoints[2]}",
+        credentials={"a": "b"},
+        admin_token_file=tok_file,
+    )
+    srv1 = Server(**kwargs)  # 首次：生成并写盘
+    tok1 = open(tok_file).read().strip()
+    assert tok1
+    mtime1 = os.stat(tok_file).st_mtime_ns
+    srv2 = Server(**kwargs)  # 二次启动：复用文件中的 token
+    assert srv2.admin_token == tok1
+    assert srv2.admin_token == srv1.admin_token
+    assert os.stat(tok_file).st_mtime_ns == mtime1  # 文件未被覆写
+    # 空文件（如异常截断）→ 重新生成
+    open(tok_file, "w").close()
+    srv3 = Server(**kwargs)
+    assert srv3.admin_token and srv3.admin_token != tok1
+    assert open(tok_file).read().strip() == srv3.admin_token
+
+
 def test_non_bcrypt_hash_algo_warns(tmp_path, capsys):
     """Fix 3：非 bcrypt 的 hash_algo 应告警（不抛异常）。"""
     from pulsemq.security import CredentialStore

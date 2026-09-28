@@ -28,22 +28,68 @@ class ClientProcStats:
         with self._lock:
             prev = self._by_client.get(client_id)
             topics = dict(proc)
-            if prev is not None:
+            for t, m in topics.items():
+                pm = prev["topics"].get(t) if prev is not None else None
+                if pm is None:
+                    m["count_cum"] = int(m.get("count", 0) or 0)
+                    continue
                 # 字段级 latch：count/rate 是窗口量、每跳覆盖；延迟均值是
                 # 观测量，recv 与 proc 常落在不同心跳窗口（worker ≥1s 批量
                 # flush）——保留最后一次非空值，快照才始终完整（9.2.7）。
-                for t, m in topics.items():
-                    pm = prev["topics"].get(t)
-                    if pm is None:
-                        continue
-                    for f in ("recv_avg_ns", "proc_avg_ns"):
-                        if f not in m and f in pm:
-                            m[f] = pm[f]
+                # count_cum（对账用累计处理量）由服务端滚动累加，不取客户端值。
+                for f in ("recv_avg_ns", "proc_avg_ns",
+                          "e2e_avg_ns", "e2e_max_ns"):
+                    if f not in m and f in pm:
+                        m[f] = pm[f]
+                m["count_cum"] = (pm.get("count_cum", 0)
+                                  + int(m.get("count", 0) or 0))
             self._by_client[client_id] = {
                 "username": username,
                 "ts": time.time(),
                 "topics": topics,
             }
+            if prev is not None:
+                # 保留扩展指标（confirm/workers/key_fallback_cum 由
+                # record_extra 单独维护——record 每跳重建条目，不保留即丢）
+                for k in ("confirm", "workers", "key_fallback_cum"):
+                    if k in prev:
+                        self._by_client[client_id][k] = prev[k]
+
+    def record_extra(self, client_id: str, *, confirm: dict | None = None,
+                     workers: list | None = None,
+                     key_fallback: int | None = None) -> None:
+        """记录心跳携带的扩展指标（9.2.8）：
+
+        - confirm：发布端确认统计窗口 {acks, ack_ns, ack_max_ns, timeouts}，
+          acks/timeouts 服务端累计，延迟取窗口值。
+        - workers：消费端 worker 池明细（最后一次心跳的快照，整体覆盖）。
+        - key_fallback（9.2.9）：key 拆分失败回退 topic 路由的帧数 delta，
+          累计到 key_fallback_cum（DataFrame 等不支持载荷的可观测信号）。
+        条目不存在时先建空壳（客户端可能只发 confirm 不发 proc）。
+        """
+        with self._lock:
+            e = self._by_client.get(client_id)
+            if e is None:
+                e = {"username": "", "ts": time.time(), "topics": {}}
+                self._by_client[client_id] = e
+            e["ts"] = time.time()
+            if confirm:
+                c = e.get("confirm") or {"acks": 0, "timeouts": 0}
+                c["acks"] = c.get("acks", 0) + int(confirm.get("acks", 0) or 0)
+                c["timeouts"] = (c.get("timeouts", 0)
+                                 + int(confirm.get("timeouts", 0) or 0))
+                acks = int(confirm.get("acks", 0) or 0)
+                if acks > 0:
+                    c["ack_avg_ms"] = round(
+                        int(confirm.get("ack_ns", 0)) / acks / 1e6, 3)
+                    c["ack_max_ms"] = round(
+                        int(confirm.get("ack_max_ns", 0)) / 1e6, 3)
+                e["confirm"] = c
+            if workers is not None:
+                e["workers"] = workers
+            if key_fallback:
+                e["key_fallback_cum"] = (e.get("key_fallback_cum", 0)
+                                         + int(key_fallback))
 
     def remove(self, client_id: str) -> None:
         with self._lock:
@@ -79,7 +125,8 @@ class ClientProcStats:
     def topics(self) -> dict[str, dict]:
         """按 topic 跨客户端聚合：总处理速率 + 按 count 加权的平均延迟。
 
-        返回 {topic: {rate_per_sec, recv_avg_ms?, proc_avg_ms?}}。
+        返回 {topic: {rate_per_sec, recv_avg_ms?, proc_avg_ms?,
+        e2e_avg_ms?, e2e_max_ms?, processed_cum}}（9.2.8 增补后三项）。
         """
         agg: dict[str, dict] = {}
         now = time.time()
@@ -90,8 +137,12 @@ class ClientProcStats:
                 continue
             for topic, m in topics.items():
                 a = agg.setdefault(topic, {"rate": 0.0, "recv_sum": 0,
-                                           "recv_w": 0, "proc_sum": 0, "proc_w": 0})
+                                           "recv_w": 0, "proc_sum": 0,
+                                           "proc_w": 0, "e2e_sum": 0,
+                                           "e2e_w": 0, "e2e_max": 0,
+                                           "cum": 0})
                 a["rate"] += float(m.get("rate", 0.0))
+                a["cum"] += int(m.get("count_cum", 0) or 0)
                 w = max(int(m.get("count", 0) or 0), 1)
                 recv_ns = m.get("recv_avg_ns")
                 if recv_ns is not None:
@@ -101,13 +152,25 @@ class ClientProcStats:
                 if proc_ns is not None:
                     a["proc_sum"] += int(proc_ns) * w
                     a["proc_w"] += w
+                e2e_ns = m.get("e2e_avg_ns")
+                if e2e_ns is not None:
+                    a["e2e_sum"] += int(e2e_ns) * w
+                    a["e2e_w"] += w
+                e2e_max = m.get("e2e_max_ns")
+                if e2e_max is not None:
+                    a["e2e_max"] = max(a["e2e_max"], int(e2e_max))
         out: dict[str, dict] = {}
         for topic, a in agg.items():
-            entry: dict = {"rate_per_sec": round(a["rate"], 2)}
+            entry: dict = {"rate_per_sec": round(a["rate"], 2),
+                           "processed_cum": a["cum"]}
             if a["recv_w"]:
                 entry["recv_avg_ms"] = round(a["recv_sum"] / a["recv_w"] / 1e6, 3)
             if a["proc_w"]:
                 entry["proc_avg_ms"] = round(a["proc_sum"] / a["proc_w"] / 1e6, 3)
+            if a["e2e_w"]:
+                entry["e2e_avg_ms"] = round(a["e2e_sum"] / a["e2e_w"] / 1e6, 3)
+            if a["e2e_max"]:
+                entry["e2e_max_ms"] = round(a["e2e_max"] / 1e6, 3)
             out[topic] = entry
         return out
 
@@ -115,7 +178,7 @@ class ClientProcStats:
     def summarize(entry: dict) -> dict:
         """单客户端条目 → 汇总（总速率 + 加权平均延迟），供 /api/v1/clients。"""
         total_rate = 0.0
-        recv_sum = recv_w = proc_sum = proc_w = 0
+        recv_sum = recv_w = proc_sum = proc_w = e2e_sum = e2e_w = e2e_max = 0
         count_total = 0
         for m in entry.get("topics", {}).values():
             total_rate += float(m.get("rate", 0.0))
@@ -129,6 +192,13 @@ class ClientProcStats:
             if proc_ns is not None:
                 proc_sum += int(proc_ns) * w
                 proc_w += w
+            e2e_ns = m.get("e2e_avg_ns")
+            if e2e_ns is not None:
+                e2e_sum += int(e2e_ns) * w
+                e2e_w += w
+            e2e_m = m.get("e2e_max_ns")
+            if e2e_m is not None:
+                e2e_max = max(e2e_max, int(e2e_m))
         out: dict = {
             "rate_per_sec": round(total_rate, 2),
             "count": count_total,
@@ -138,4 +208,8 @@ class ClientProcStats:
             out["recv_avg_ms"] = round(recv_sum / recv_w / 1e6, 3)
         if proc_w:
             out["proc_avg_ms"] = round(proc_sum / proc_w / 1e6, 3)
+        if e2e_w:
+            out["e2e_avg_ms"] = round(e2e_sum / e2e_w / 1e6, 3)
+        if e2e_max:
+            out["e2e_max_ms"] = round(e2e_max / 1e6, 3)
         return out

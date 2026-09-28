@@ -1,10 +1,10 @@
-# PulseMQ 系统设计文档（v9.2.7）
+# PulseMQ 系统设计文档（v9.2.8）
 
 > 本文描述 PulseMQ **当前实现的真实状态**（以代码为准，非愿景规划）。
 > 涵盖：消息帧格式、进程/线程模型、线路协议、流控与缓冲、多进程消费池、
 > 丢弃语义全景、配置参考、监控接口、实测性能摘要与已知问题。
 >
-> 更新日期：2026-09-28 · 对应版本：9.2.7 · 代码位置：`src/pulsemq/`
+> 更新日期：2026-09-28 · 对应版本：9.2.8 · 代码位置：`src/pulsemq/`
 
 ---
 
@@ -94,7 +94,7 @@ ProducerClient 进程：publish = 编码 → DEALER fire-and-forget
   27+4+255+4 = 290B；v1/v2 因 2B topic_len 最坏 ~64KB）。
 - **单帧上限保护**：`encode()` 拒绝超过 `MAX_FRAME_BYTES`（256MB）的帧。
   真正的运行时瓶颈在消费端共享内存环（默认 64MB，超限帧静默丢弃）与
-  服务端订阅者缓冲（默认 10MB，慢消费者下单帧超限即被淘汰）。
+  服务端订阅者缓冲（默认 64MB/50 万帧，慢消费者下单帧超限即被淘汰）。
 
 ### 3.2 flags 位域（1 字节）
 
@@ -206,8 +206,9 @@ cmd 作为 topic，msgpack 载荷，无压缩。控制帧走**控制面 socket**
 | conflate | `dict[topic→最新帧]` | 新帧覆盖旧帧（仅字节上限触发淘汰） |
 
 三上限（服务端全局封顶，客户端 REGISTER 只能请求更小值，`_clamp`）：
-`buffer_max_messages=100,000 帧`、`buffer_max_bytes=10MB`（部署可调大，
-测试实例 500k/200MB）、`buffer_max_age_s=0`（不限龄；消费端默认协商 30s）。
+`buffer_max_messages=500,000 帧`、`buffer_max_bytes=64MB`（9.2.8 起；
+9.2.2~9.2.7 曾为 10 万条/10MB，按帧计数下批量负载几乎总是字节上限先触发，
+故调大）、`buffer_max_age_s=0`（不限龄；消费端默认协商 30s）。
 **计数按帧不按记录**——批量负载下字节上限是实际生效的闸门。
 
 缓冲满时的行为：drop_old 持续驱逐最旧（新数据优先），驱逐/过期全部计入
@@ -258,6 +259,18 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
   `callable(payload, topic)->str`（运行在主进程，lambda 可用）
   → **jump consistent hash**（over crc32；确定性，跨进程/重启一致；worker 数
   变化时仅 ~1/n 换位；同 key 恒定同 worker、保序）。
+- **key 拆分载荷契约**（9.2.9）：字段名/callable 路由**仅支持 dict / str
+  载荷**——dict 按字段值提取（缺失视为不可拆分）、callable 收到真实
+  payload（dict/str 本身）、str 载荷消息内容本身即 key；且订阅必须是
+  **精确 topic**（通配符在 `subscribe()` 即报错——key 提取假设该 topic
+  载荷结构已知）。路由粒度为整帧，**DataFrame 不支持 key 拆分**（帧内
+  不按列拆分）：多股票 DataFrame 在发布端按 key 拆分（groupby 逐组
+  发布 dict/str），或 `key=None` + worker 回调内自行 groupby。不支持
+  载荷/字段缺失/callable 异常 → **显式 WARNING（每原因一次）+ 回退
+  topic 路由**（确定性、同 topic 保序），回退帧数经心跳 `key_fallback`
+  delta 上报，服务端累计进 `/clients` 的 `key_fallback` 字段——
+  修复 9.2.8 前非 dict 载荷一律得 `{}`、key="None" 全帧静默落单 worker
+  的缺陷。
 - **回调契约**：模块级可导入函数（跨进程按引用 pickle），**同步或异步均可**
   （9.2.4：异步回调在 worker 进程自有事件循环上执行，同一 worker 内串行）；
   lambda/闭包在订阅时即报错——worker 内不共享主进程内存，闭包捕获是拷贝。
@@ -303,10 +316,12 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
 | data/control/admin_endpoint | 5555/5556/9090 | 三通道监听 |
 | heartbeat_timeout | 6.0s | 心跳超时踢线 |
 | sndhwm / rcvhwm | 10000 / 10000 | zmq 管道高水位 |
-| buffer_max_messages | 100,000 帧 | 订阅者缓冲条数上限（按帧） |
-| buffer_max_bytes | 10 MB | 订阅者缓冲字节上限（压缩后帧大小） |
+| buffer_max_messages | 500,000 帧 | 订阅者缓冲条数上限（按帧，9.2.8 起） |
+| buffer_max_bytes | 64 MB | 订阅者缓冲字节上限（压缩后帧大小，9.2.8 起） |
 | buffer_max_age_s | 0（不限） | 缓冲存活时间 |
 | stats_db / retention / admin_token / latency_sample_rate … | — | 统计与监控 |
+| alert_webhook | ""（仅日志） | 告警 webhook URL；空=降级 log_event WARNING |
+| alert_cooldown_s / alert_drop_per_min / alert_gap_per_min / alert_buffer_age_s / alert_starved_per_s / alert_loop_stall_ms | 60 / 1000 / 1000 / 5.0 / 100 / 1000 | 告警阈值（0=关闭规则），环境变量 `PULSEMQ_ALERT_*` 可覆盖 |
 
 ### ConsumerClient 关键参数
 
@@ -314,7 +329,7 @@ ConsumerClient(workers=N, key=..., worker_ring_mb=..., worker_init=...)
 |---|---|---|
 | buffer_policy / buffer_cfg | drop_old / {max_age_s:30} | 服务端缓冲协商（None=直发不缓冲） |
 | workers | 1 | worker 进程数（唯一消费模式；1=主进程+1 worker） |
-| key | None | 路由键：None（默认，最短队列，等速即轮询）/ topic / payload 字段名 / callable |
+| key | None | 路由键：None（默认，最短队列，等速即轮询）/ topic / payload 字段名 / callable。字段名/callable（key 拆分）仅 dict/str 载荷 + 精确 topic 订阅，DataFrame 不支持（9.2.9，详见 §5.5） |
 | worker_ring_mb | 64 | 每 worker 共享内存环大小 |
 | worker_init | None | 每 worker 初始化函数 |
 | latency_sample_rate | 0.01 | 端到端延迟采样率 |
@@ -328,11 +343,36 @@ subscribe() 时即报错。基类 `Client` 订阅同样走池（workers 等参�
 ## 8. 监控与观测
 
 Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢弃/缺口/
-缓冲/在线客户端）、`/api/v1/stats/buffers`（每订阅者缓冲：策略/深度/字节/
-最老年龄/淘汰/过期/合并/已发）、`/api/v1/stats/stream`（SSE）、
-`/api/v1/clients`、`/api/v1/events`、`/api/v1/topics/{t}/history`、
-`/api/v1/latency/topics/{t}/history`、`/api/v1/system/status`、`/healthz`。
-管理面板（INDEX_HTML）含缓冲区与缺口汇总页签。
+缓冲/在线客户端 + **数据面健康 dataplane + 心跳质量 heartbeat + 对账
+reconciliation**，9.2.8）、`/api/v1/stats/buffers`（每订阅者缓冲：策略/深度/
+字节/最老年龄/淘汰/过期/合并/已发 + **credit 余量/窗口/拦截轮次**）、
+`/api/v1/stats/drops/history` 与 `/api/v1/stats/gaps/history`（**分钟历史，
+内存 + SQLite 合并**，`?topic=` 可选）、`/api/v1/stats/stream`（SSE）、
+`/api/v1/clients`（含 **per-worker 细分 workers、confirm 统计、credit 视图**）、
+`/api/v1/events`、`/api/v1/topics/{t}/history`、
+`/api/v1/latency/topics/{t}/history`、`/api/v1/system/status`（uptime/version/
+pid/线程数/RSS）、`/healthz`、**`/metrics`（Prometheus 文本 exposition）**。
+管理面板（INDEX_HTML）含缓冲区与缺口汇总、**对账、服务端健康（数据面
+chips + 心跳质量）页签**。
+
+**9.2.8 新增观测面**：
+
+| 观测点 | 载体 | 回答的问题 |
+|---|---|---|
+| credit 余量/窗口剩余/拦截轮次 | buffers snapshot、/clients、/metrics | 消费端是否被流控掐住、掐了多少 |
+| 数据面循环 avg/max、收/发速率、EAGAIN、信用拦截 | DataPlaneStats → realtime.dataplane、/metrics | 转发线程是否饱和/停顿、背压强度 |
+| 心跳到达间隔 avg/max、踢线计数 | HeartbeatMonitor → realtime.heartbeat、/metrics | 踢线前的"心跳迟到"前置预警 |
+| 处理时 e2e 延迟（avg/max） | worker 出环时刻 − 帧内生产 ts，心跳 proc.e2e → /clients、processing_by_topic | 消费端真实积压延迟（含环内排队） |
+| per-worker 细分（速率/CPU/环积压/累计） | 心跳 workers 字段 → /clients | 最短队列路由下 worker 均衡度 |
+| 发布端 confirm 统计（ack 均值/最大/超时累计） | 心跳 confirm 字段 → /clients | 确认发布延迟与超时率 |
+| per-topic 对账（发布/处理/缺失/丢弃累计 + 在途估算） | realtime.reconciliation | 三方账本一屏对齐 |
+| 丢弃/缺口分钟归档 | minute_drops/minute_gaps 表 + history API | 事后回溯"何时开始丢" |
+
+**告警（AlertManager）**：固定规则集 + 阈值可配（`PULSEMQ_ALERT_*` 环境变量
+或 TOML `[monitoring]`）：drops_burst / gap_burst / buffer_backlog /
+credit_starved / dataplane_stall / client_kicked。每规则独立冷却（默认 60s），
+配置 `alert_webhook` 时 POST JSON，未配置降级为日志 WARNING 事件。阈值设 0
+关闭对应规则。
 
 **压测方法学**（可复现脚本在性能测试目录）：阶梯增速 + 每档排空对账，
 对账恒等式 `发送 = worker处理 + 驱逐 + 过期 + 环丢弃 + 在途`，
@@ -393,6 +433,8 @@ Admin API（Bearer token）：`/api/v1/stats/realtime`（主题速率/延迟/丢
 | 9.2.5 | **v3 帧格式（唯一版本，无兼容层）**：扩展帧并入头部（seq 8B 恒在帧内，偏移 7），ack_id uuid → 4B ack_token 计数器（flags bit6），topic 上限 65535→255 字节（topic_len 2B→1B），头 20B→27B；删除 v1/v2 分流、proto 协商、ext 变换（stamp/strip）；新增 MAX_FRAME_BYTES(256MB) 编码防护 |
 | 9.2.6 | 客户端动态退订 `unsubscribe()`（本地订阅表 + worker 池 + 服务端 UNSUBSCRIBE 三层同步，幂等）；`pulsemq` CLI 接入 argparse（--help/--version 立即返回，不再启动服务器）；同进程双 Server 报错清晰化（ZAP inproc 端点独占约束文档化） |
 | 9.2.7 | **消费端吞吐与路由三连改**：客户端接收循环批量化（一次唤醒 DONTWAIT 连收 ≤256 帧 + `peek_topic_seq` 轻量头部 + 批尾聚合统计，消除逐帧 await）；`key=None` 改最短队列路由并将其设为**默认**（积压最少优先、并列轮询——等速时即轮询、慢 worker 自动降载）；key 路由换 jump consistent hash（worker 数变化仅 ~1/n 换位）。附带修复心跳处理统计丢失：`_ProcStats.drain` 只遍历有新接收计数的 topic，worker 统计晚到一个窗口时被静默吞掉——改为接收∪处理并集，服务端按 topic latch 延迟字段 |
+| 9.2.8 | **监控可观测性大补**：数据面健康统计（DataPlaneStats：循环 avg/max、收/发速率、EAGAIN、信用拦截）；credit 可见性（buffers/clients 含余量/窗口剩余/拦截轮次）；心跳质量监控（HeartbeatMonitor：per-client 到达间隔 + 踢线计数）；worker 处理时 e2e 延迟（出环时刻−生产 ts，avg/max）；per-worker 细分与发布端 confirm 统计随心跳上报；per-topic 对账视图（发布/处理/缺失/丢弃累计+在途估算，TrafficStats 累计计数 + proc count_cum 服务端滚动累加）；drops/gaps 分钟归档到 SQLite（minute_drops/minute_gaps 表 + history API）；Prometheus `/metrics` exposition；AlertManager 告警规则（阈值可配，webhook 可选，0=关闭）；Web UI 新增服务端健康/对账面板与客户端弹窗扩展（e2e/credit/workers/confirm），表格斑马纹+粘性表头。**订阅者缓冲默认上限调大为 50 万帧/64MB**（10 万条/10MB 按帧计数在批量负载下形同虚设，几乎总是字节上限先触发） |
+| 9.2.9 | **key 拆分载荷契约收紧**：字段名/callable 路由仅支持 dict/str 载荷（str 消息内容本身即 key）且订阅必须精确 topic（通配符 `subscribe()` 即报错）；DataFrame 明确不支持 key 拆分（路由粒度为整帧，帧内不按列拆分——多股票 DataFrame 请发布端 groupby 拆分或 key=None+worker 内拆）。不支持载荷/字段缺失/callable 异常 → 显式 WARNING + 回退 topic 路由（同 topic 保序），帧数心跳上报累计进 `/clients` 的 `key_fallback`。**修复**：`_peek_payload` 对非 dict 载荷返回 `{}` 使 key="None" 全帧静默落单 worker 的缺陷 |
 
 ---
 
@@ -411,7 +453,9 @@ src/pulsemq/
 ├── control.py       控制命令集 + OnlineRegistry
 ├── config.py        ServerConfig/ClientConfig（TOML + 环境变量）
 ├── stats/           traffic/latency/drops/throughput/connections/storage
+│                    + dataplane（数据面健康）/health（心跳质量）/gaps（缺口归档）
+├── alerts.py        AlertManager（阈值规则 → webhook / 日志事件）
 ├── admin/           AdminServer（HTTP/SSE）+ web_ui.py（监控面板）
 └── security.py      CredentialStore（凭据文件/哈希）
-tests/               260 项（协议/生命周期/缓冲/池/CLI/路由/压测辅助，mp 回调录制器）
+tests/               292 项（协议/生命周期/缓冲/池/CLI/路由/监控/压测辅助，mp 回调录制器）
 ```

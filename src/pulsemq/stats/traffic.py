@@ -34,6 +34,8 @@ class TrafficStats:
         self._slots: dict[str, deque[MinuteSlot]] = {}
         # 当前分钟累积器: {topic: MinuteSlot}
         self._current: dict[str, MinuteSlot] = {}
+        # 自启动累计发布帧数（9.2.8 对账视图用；数据面线程单写者）
+        self._msg_cum: dict[str, int] = {}
         self._current_minute: int = self._minute_now()
         self._lock = threading.RLock()
 
@@ -50,6 +52,7 @@ class TrafficStats:
             cur.msg_count += 1
             cur.record_count += record_count
             cur.bytes_total += payload_size
+            self._msg_cum[topic] = self._msg_cum.get(topic, 0) + 1
             # 定期检查分钟滚动（~每 1024 条），避免全热 topic 路径永不觉滚动
             if (cur.msg_count & 0x3FF) == 0:
                 now = self._minute_now()
@@ -69,6 +72,7 @@ class TrafficStats:
             cur.msg_count += 1
             cur.record_count += record_count
             cur.bytes_total += payload_size
+            self._msg_cum[topic] = self._msg_cum.get(topic, 0) + 1
 
     def roll_minute(self) -> dict[str, MinuteSlot]:
         """整分钟时调用：归档当前累积器 → 滚动窗口淘汰过期数据。
@@ -175,6 +179,7 @@ class TrafficStats:
                 "record_rate_1min": round(window_rec / 60.0, 2),
                 "bytes_rate_1min": round(window_bytes / 60.0, 2),
                 "history_minutes": len(slots) if slots else 0,
+                "msg_count_cum": self._msg_cum.get(topic, 0),
             }
         return result
 

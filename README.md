@@ -324,14 +324,27 @@ c = ConsumerClient(..., workers=4, key="symbol")  # 4 个 worker 按 payload.sym
 ```
 
 - `key`：默认 `None` = 最短队列（worker 等速时即轮询，慢 worker 自动降载，
-  不保序）；`"topic"` 同 key 恒定落同 worker 且保序（jump hash，worker 数
+  不保序）；`"topic"` 同 topic 恒定落同 worker 且保序（jump hash，worker 数
   变化仅 ~1/n 换位）；payload 字段名；或 `callable(payload, topic) -> str`
   （运行在主进程，lambda 可用）。
+- **key 拆分（字段名/callable）仅支持 dict / str 载荷，且必须精确 topic
+  订阅**（通配符在 `subscribe()` 时报错，9.2.9）：dict 按字段值路由、
+  callable 收到 dict/str 本身、str 载荷的消息内容本身即 key。路由粒度是
+  **整帧**——**DataFrame 不支持 key 拆分**（帧内多股票不会按列拆分到多
+  worker）。多股票 DataFrame 想按 symbol 并行 + 同股保序，请在**发布端**
+  按列 groupby 拆分后逐组发布（dict 带 symbol 字段，消费端 `key="symbol"`；
+  或每 symbol 一个 topic，消费端 `key="topic"`）；行级独立的处理也可
+  `key=None` + worker 回调内自行 groupby。消费端收到 DataFrame 等不支持
+  载荷时**显式 WARNING 并回退按 topic 路由**（同 topic 保序、不再静默
+  退化成单 worker），回退计数经心跳上报（`/api/v1/clients` 的
+  `key_fallback` 字段）。
 - **回调必须是模块级可导入函数**（同步或异步均可）：跨进程按引用传递，
   lambda/闭包在 `subscribe()` 时即报错；worker 进程内不共享主进程内存，
   回调副作用请写入文件/队列等进程外介质。
 - 心跳上报 credit（全部环空闲量）与丢帧（环满 drop-new 计数）；
-  worker 每 1s 上报处理速率/耗时（Web UI 客户端卡片可见）。
+  worker 每 1s 上报处理速率/耗时与**处理时 e2e 延迟**（出环时刻−生产时间戳，
+  含环内排队，Web UI 客户端卡片可见 avg/max）、per-worker 明细与发布端
+  confirm 统计（9.2.8）。
 
 ---
 
@@ -347,11 +360,22 @@ c = ConsumerClient(..., workers=4, key="symbol")  # 4 个 worker 按 payload.sym
 - 延迟趋势曲线（P50/P95/P99 时间序列，半程/全程可切换）+ 端到端延迟列表
 - 实时事件流（认证 / 连接 / 断线 / 订阅）
 - topic 卡片含丢弃指示；在线 Client 详情
+- 对账面板（9.2.8）：per-topic 发布 vs 处理/缺失/丢弃累计 + 在途估算
+- 服务端健康面板（9.2.8）：数据面循环耗时/收发速率/EAGAIN/信用拦截 chips
+  + 心跳到达间隔表与踢线计数
+
+### 告警（9.2.8）
+
+内置阈值规则：丢弃突增 / 缺口突增 / 缓冲积压变老 / 信用窗口持续拦截 /
+数据面循环停顿 / 心跳踢线。配置 `PULSEMQ_ALERT_WEBHOOK` 后告警 POST JSON
+到 webhook，未配置时降级为日志 WARNING；各阈值经 `PULSEMQ_ALERT_*` 环境变量
+调整，设 0 关闭对应规则。
 
 ### REST API
 
 ```bash
-# 实时指标（topics / latency / drops / 在线计数 / 最近事件）
+# 实时指标（topics / latency / drops / 在线计数 / 最近事件
+#   + 9.2.8：dataplane 数据面健康 / heartbeat 心跳质量 / reconciliation 对账）
 curl 'http://localhost:9090/api/v1/stats/realtime?token=<token>'
 
 # 主题列表
@@ -363,14 +387,21 @@ curl 'http://localhost:9090/api/v1/topics/market.tick/history?minutes=60&token=<
 # 延迟历史（kind=half 半程 / e2e 全程）
 curl 'http://localhost:9090/api/v1/latency/topics/market.tick/history?minutes=60&kind=e2e&token=<token>'
 
-# 在线客户端明细
+# 丢弃 / 缺口分钟历史（9.2.8；?topic= 可选，缺省为全量合计）
+curl 'http://localhost:9090/api/v1/stats/drops/history?minutes=60&token=<token>'
+curl 'http://localhost:9090/api/v1/stats/gaps/history?topic=market.tick&token=<token>'
+
+# 在线客户端明细（含 per-worker 细分、confirm 统计、credit 视图）
 curl 'http://localhost:9090/api/v1/clients?token=<token>'
 
 # 生命周期事件
 curl 'http://localhost:9090/api/v1/events?limit=50&token=<token>'
 
-# 系统状态
+# 系统状态（uptime / pid / 线程数 / RSS）
 curl 'http://localhost:9090/api/v1/system/status?token=<token>'
+
+# Prometheus 指标 exposition（9.2.8，支持 Bearer token 抓取）
+curl -H 'Authorization: Bearer <token>' http://localhost:9090/metrics
 
 # 健康检查（无需 token）
 curl http://localhost:9090/healthz
@@ -456,9 +487,9 @@ created_at = "2026-06-27T00:00:00Z"
 
 ### Admin Token
 
-优先级：显式 `admin_token=` 参数 > 配置文件 > 环境变量 `PULSEMQ_ADMIN_TOKEN` > 随机生成。
+优先级：显式 `admin_token=` 参数 > 配置文件 > 环境变量 `PULSEMQ_ADMIN_TOKEN` > token 文件。
 
-首次启动自动生成 32 字节随机 base64url token，写入 `./data/pulsemq_admin.token`（POSIX 下 0600 权限），并在 stderr 输出一次。Web UI 和 REST API 通过 `?token=...` 或 `Authorization: Bearer ...` 传递。
+未显式指定时：读取 `./data/pulsemq_admin.token` 已有 token **直接复用**（9.2.8 起，重启不再换 token）；文件不存在才生成 32 字节随机 base64url 写入（POSIX 下 0600 权限）并在 stderr 输出一次。Web UI 和 REST API 通过 `?token=...` 或 `Authorization: Bearer ...` 传递。
 
 ---
 
@@ -533,6 +564,13 @@ python scripts/bench_dist.py --part a         # 只跑 Part A
 | `PULSEMQ_BCRYPT_COST` | bcrypt 代价因子 | `12` |
 | `PULSEMQ_SSE_INTERVAL` | SSE 推送间隔（秒） | `1.0` |
 | `PULSEMQ_STATS_RETENTION_MINUTES` | 内存统计窗口（分钟） | `480` |
+| `PULSEMQ_ALERT_WEBHOOK` | 告警 webhook URL（空=仅日志） | — |
+| `PULSEMQ_ALERT_COOLDOWN_S` | 告警每规则冷却（秒） | `60` |
+| `PULSEMQ_ALERT_DROP_PER_MIN` | 丢弃突增阈值（帧/分钟，0=关） | `1000` |
+| `PULSEMQ_ALERT_GAP_PER_MIN` | 缺口突增阈值（帧/分钟，0=关） | `1000` |
+| `PULSEMQ_ALERT_BUFFER_AGE_S` | 缓冲积压告警阈值（秒，0=关） | `5.0` |
+| `PULSEMQ_ALERT_STARVED_PER_S` | 信用拦截告警阈值（次/秒，0=关） | `100` |
+| `PULSEMQ_ALERT_LOOP_STALL_MS` | 数据面循环停顿阈值（ms，0=关） | `1000` |
 | `PULSEMQ_USERNAME` | 客户端用户名 | — |
 | `PULSEMQ_PASSWORD` | 客户端密码 | — |
 | `PULSEMQ_PID` | Server PID（供 `pulsemq-users reload` 发 SIGHUP） | — |

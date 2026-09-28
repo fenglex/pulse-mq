@@ -201,7 +201,7 @@ def _worker_main(worker_index: int, ring_name: str, ring_bytes: int,
             aloop.run_until_complete(cb(target))
         else:
             cb(target)
-    stats = {"processed": 0, "rows": 0, "proc": {}, "read": 0}
+    stats = {"processed": 0, "rows": 0, "proc": {}, "read": 0, "e2e": {}}
     trace_path = os.environ.get("PULSEMP_TRACE")
     trace_fd = os.open(f"{trace_path}.{worker_index}",
                        os.O_APPEND | os.O_CREAT | os.O_WRONLY) if trace_path else None
@@ -225,6 +225,7 @@ def _worker_main(worker_index: int, ring_name: str, ring_bytes: int,
             time.sleep(WORKER_POLL_SLEEP)
             continue
         empty_polls = 0
+        now_ns = time.time_ns()
         stats["read"] += len(batch)
         ring.add_diag(len(batch), 0)
         for fb in batch:
@@ -237,6 +238,17 @@ def _worker_main(worker_index: int, ring_name: str, ring_bytes: int,
                 continue
             if trace_fd:
                 os.write(trace_fd, f"R {hdr.topic} {hdr.timestamp_ns}\n".encode())
+            # 处理时端到端延迟（9.2.8）：出环时刻 - 帧内生产时间戳。
+            # 含环内排队等待——积压时该值直接反映消费延迟，随统计批量上报。
+            e2e = now_ns - hdr.timestamp_ns
+            ent = stats["e2e"].get(hdr.topic)
+            if ent is None:
+                stats["e2e"][hdr.topic] = [e2e, 1, e2e]
+            else:
+                ent[0] += e2e
+                ent[1] += 1
+                if e2e > ent[2]:
+                    ent[2] = e2e
             matched = [cb_map[p.decode("utf-8")]
                        for p in sub_table.match(hdr.topic)
                        if p.decode("utf-8") in cb_map]
@@ -288,11 +300,14 @@ def _flush_stats(stats: dict, stats_q, worker_index: int,
         "rows": stats["rows"],
         "cpu_cores": (time.process_time() - cpu0) / max(1e-9, time.perf_counter() - t0),
         "proc": {t: v for t, v in stats["proc"].items()},
+        # 处理时 e2e：{topic: [累计ns, 条数, 最大ns]}（9.2.8）
+        "e2e": {t: v for t, v in stats["e2e"].items()},
     }
     stats["processed"] = 0
     stats["rows"] = 0
     stats["read"] = 0
     stats["proc"].clear()
+    stats["e2e"].clear()
     try:
         stats_q.put_nowait(payload)
     except Exception:
@@ -320,6 +335,8 @@ class WorkerPool:
         self._rr = 0
         self.routed = 0
         self.write_fail = 0
+        self.key_fallback = 0        # key 拆分失败回退 topic 路由的帧数（delta 上报）
+        self._key_warned: set[str] = set()
 
     def start(self) -> None:
         ctx = __import__("multiprocessing").get_context("spawn")
@@ -360,13 +377,29 @@ class WorkerPool:
                     break
         elif self.key_mode == "topic":
             idx = stable_worker_index(topic, n)
-        elif callable(self.key_mode):
-            key = self.key_mode(_peek_payload(payload_bytes), topic)
-            idx = stable_worker_index(str(key), n)
-        else:  # payload 字段名
-            obj = _peek_payload(payload_bytes)
-            key = obj.get(self.key_mode) if isinstance(obj, dict) else None
-            idx = stable_worker_index(str(key), n)
+        else:
+            # key 拆分（payload 字段名 / callable）：仅支持 dict / str 载荷。
+            # DataFrame/bytes、字段缺失、callable 异常/返回 None、解码失败
+            # → 显式告警并回退 topic 路由（确定性、同 topic 保序），
+            # 不再静默退化成单 worker（9.2.9）。
+            try:
+                obj = _peek_payload(payload_bytes)
+                if callable(self.key_mode):
+                    key = self.key_mode(obj, topic)
+                    if key is None:
+                        raise _KeyNotExtractable("callable 返回 None")
+                elif isinstance(obj, dict):
+                    key = obj.get(self.key_mode)
+                    if key is None:
+                        raise _KeyNotExtractable(
+                            f"missing_field:{self.key_mode}")
+                else:  # str 载荷：消息内容本身即 key
+                    key = obj
+                idx = stable_worker_index(str(key), n)
+            except _KeyNotExtractable as e:
+                idx = self._key_fallback(topic, e.reason)
+            except Exception as e:
+                idx = self._key_fallback(topic, f"error:{type(e).__name__}")
         ok = self._rings[idx].write(payload_bytes)
         self.routed += 1
         if not ok:
@@ -375,6 +408,28 @@ class WorkerPool:
             if len(payload_bytes) > self._max_frame:
                 self._max_frame = len(payload_bytes)
         return ok
+
+    def _key_fallback(self, topic: str, reason: str) -> int:
+        """key 拆分失败 → 回退 topic 路由（确定性、同 topic 保序）。
+
+        每个原因只告警一次（含首帧计数）；key_fallback 计数经心跳
+        take_key_fallback() 上报服务端（/clients 的 key_fallback 字段）。
+        """
+        self.key_fallback += 1
+        if reason not in self._key_warned:
+            self._key_warned.add(reason)
+            logger.warning(
+                "key 路由回退为 topic 路由（原因 {}，topic {!r}）："
+                "key 拆分仅支持 dict/str 载荷，DataFrame 不支持——"
+                "请在发布端按 key 拆分后逐组发布，或改用 key='topic'/None",
+                reason, topic)
+        return stable_worker_index(topic, self.n_workers)
+
+    def take_key_fallback(self) -> int:
+        """返回并清零 key 回退计数（心跳 delta 上报用）。"""
+        v = self.key_fallback
+        self.key_fallback = 0
+        return v
 
     def add_subscription(self, pattern: str, cb, header_only: bool) -> None:
         """向全部 worker 下发新订阅（start 后调用 subscribe 时）。"""
@@ -411,6 +466,20 @@ class WorkerPool:
             ps += b
         return rs, ps
 
+    def ring_snapshots(self) -> list[dict]:
+        """每 worker 环的即时快照（9.2.8，心跳上报用）：
+        [{pending_bytes, free_bytes, read_n, proc_n}]，按 worker 序排列。"""
+        out = []
+        for r in self._rings:
+            read_n, proc_n = r.diag_counters()
+            out.append({
+                "pending_bytes": r.pending_bytes(),
+                "free_bytes": r.free_bytes(),
+                "read_n": read_n,
+                "proc_n": proc_n,
+            })
+        return out
+
     def pending_bytes(self) -> int:
         return sum(r.pending_bytes() for r in self._rings)
 
@@ -439,10 +508,31 @@ class WorkerPool:
         self._procs.clear()
 
 
-def _peek_payload(frame_bytes: bytes) -> dict:
-    """ingestor 侧按 payload 字段路由时的解码（有代价，文档已注明）。"""
+class _KeyNotExtractable(Exception):
+    """payload 不支持 key 拆分（DataFrame/bytes 载荷、字段缺失、解码失败）。
+
+    9.2.9：key 拆分（字段名/callable 路由）仅支持 dict / str 载荷；
+    DataFrame 明确不支持——多股票 DataFrame 请在发布端按 key 拆分
+    （groupby 后逐组发布 dict/str 消息），见 README「消费」一节。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _peek_payload(frame_bytes: bytes):
+    """ingestor 侧 key 拆分路由的解码（有代价，文档已注明）。
+
+    返回真实 payload：dict（字段路由/callable 收到 dict 本身）或 str
+    （消息内容本身即 key）。其它载荷抛 _KeyNotExtractable，由 route()
+    显式告警并回退 topic 路由——9.2.9 前此处对非 dict 载荷一律返回 {}，
+    key="None" 会把全部帧静默打到同一个 worker（DataFrame 场景必踩）。
+    """
     try:
-        msg = frames.decode(frame_bytes)
-        return msg.payload if isinstance(msg.payload, dict) else {}
+        p = frames.decode(frame_bytes).payload
     except Exception:
-        return {}
+        raise _KeyNotExtractable("decode_failed") from None
+    if isinstance(p, (dict, str)):
+        return p
+    raise _KeyNotExtractable(f"payload_type:{type(p).__name__}")

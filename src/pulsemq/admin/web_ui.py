@@ -219,6 +219,7 @@ main{padding:14px 20px;max-width:1440px;margin:0 auto}
 .lat-table th{padding:8px 10px;color:#8a9ab3;font-weight:600;border-bottom:1px solid var(--border)}
 .lat-table td{padding:7px 10px;border-bottom:1px solid rgba(30,48,84,0.4);text-align:center;font-variant-numeric:tabular-nums}
 .lat-table td:first-child{text-align:left}
+.lat-table tbody tr:nth-child(even) td{background:rgba(30,48,84,0.12)}
 .lat-table tr:hover td{background:rgba(59,130,246,0.06)}
 #event-stream .ev-row:hover{background:rgba(59,130,246,0.06)}
 #event-stream .ev-type{
@@ -243,7 +244,7 @@ main{padding:14px 20px;max-width:1440px;margin:0 auto}
 .modal{
   background:linear-gradient(135deg,rgba(13,26,48,0.96),rgba(10,19,38,0.96));
   border:1px solid var(--border);border-radius:16px;
-  padding:24px;max-width:880px;width:92%;max-height:80vh;overflow:auto;
+  padding:24px;max-width:1080px;width:94%;max-height:80vh;overflow:auto;
   box-shadow:0 24px 64px rgba(0,0,0,0.6);
 }
 .modal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
@@ -259,12 +260,29 @@ main{padding:14px 20px;max-width:1440px;margin:0 auto}
   text-align:left;padding:8px 10px;color:var(--text-secondary);
   font-weight:600;border-bottom:1px solid var(--border);
 }
-.client-table td{padding:8px 10px;border-bottom:1px solid rgba(30,48,84,0.4);color:var(--text-primary)}
+.client-table td{padding:8px 10px;border-bottom:1px solid rgba(30,48,84,0.4);color:var(--text-primary);font-variant-numeric:tabular-nums}
+.client-table thead th{position:sticky;top:0;background:#0d1a30;z-index:1}
+.client-table tbody tr:nth-child(even) td{background:rgba(30,48,84,0.10)}
 .client-table tr:hover td{background:rgba(59,130,246,0.06)}
 .client-role{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600}
 .client-role.pub{background:rgba(251,191,36,0.15);color:var(--accent-amber)}
 .client-role.sub{background:rgba(52,211,153,0.15);color:var(--accent-green)}
 .client-role.mixed{background:rgba(59,130,246,0.15);color:var(--accent-blue)}
+
+/* ===== 健康状态 chips（9.2.8） ===== */
+.chip-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:12px}
+.chip{
+  background:rgba(10,19,38,0.5);border:1px solid var(--border);
+  border-radius:10px;padding:10px 12px;transition:border-color .25s;
+}
+.chip:hover{border-color:rgba(59,130,246,0.45)}
+.chip .c-label{font-size:10px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;font-weight:600}
+.chip .c-value{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--text-primary)}
+.chip .c-sub{font-size:10px;color:var(--text-muted);margin-top:2px;font-variant-numeric:tabular-nums}
+.chip.warn{border-color:rgba(251,191,36,0.55)}
+.chip.warn .c-value{color:var(--accent-amber)}
+.chip.bad{border-color:rgba(251,113,133,0.55)}
+.chip.bad .c-value{color:var(--accent-rose)}
 
 /* ===== 滚动条 ===== */
 ::-webkit-scrollbar{width:7px;height:7px}
@@ -431,8 +449,49 @@ main{padding:14px 20px;max-width:1440px;margin:0 auto}
         <th>过期</th>
         <th>合并</th>
         <th>已发</th>
+        <th>credit 余/窗</th>
       </tr></thead>
-      <tbody id="buffer-list-body"><tr><td colspan="10" class="empty" style="text-align:center">无缓冲订阅者</td></tr></tbody>
+      <tbody id="buffer-list-body"><tr><td colspan="11" class="empty" style="text-align:center">无缓冲订阅者</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>对账（9.2.8）<span class="chart-hint" style="margin-left:6px">发布 vs 处理/缺失/丢弃累计 · 在途 = 发布 − 处理 − 缺失 − 丢弃（客户端重启会重置处理累计，作趋势参考）</span></span>
+      </div>
+    </div>
+    <table class="lat-table">
+      <thead><tr>
+        <th style="text-align:left">Topic</th>
+        <th>发布累计</th>
+        <th>处理累计</th>
+        <th>缺失累计</th>
+        <th>丢弃累计</th>
+        <th>在途(估)</th>
+        <th>处理速率/s</th>
+      </tr></thead>
+      <tbody id="recon-list-body"><tr><td colspan="7" class="empty" style="text-align:center">暂无流量</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="chart-section">
+    <div class="chart-header">
+      <div class="chart-title">
+        <div class="dot-indicator"></div>
+        <span>服务端健康（9.2.8）<span class="chart-hint" style="margin-left:6px">数据面循环 / 背压 / 信用拦截 / 心跳质量</span></span>
+      </div>
+      <span class="chart-hint" id="sys-info-hint"></span>
+    </div>
+    <div class="chip-grid" id="health-chips"><div class="chip"><div class="c-label">数据面</div><div class="c-value">—</div></div></div>
+    <table class="lat-table">
+      <thead><tr>
+        <th style="text-align:left">Client</th>
+        <th>心跳间隔 avg / max</th>
+        <th>样本数</th>
+      </tr></thead>
+      <tbody id="hb-list-body"><tr><td colspan="3" class="empty" style="text-align:center">暂无心跳数据</td></tr></tbody>
     </table>
   </div>
 
@@ -501,6 +560,9 @@ let state = {
   bytesSpark: [],   // 近 60 次 SSE 的流量/秒（sparkline 用）
   latKind: 'half',  // 延迟趋势：half / e2e
   latHistoryCache: {},  // {topic: {half: [...], e2e: [...]}}
+  dataplane: {},        // 9.2.8 数据面健康（循环/EAGAIN/信用拦截）
+  heartbeat: {},        // 9.2.8 心跳质量（间隔 + 踢线）
+  reconciliation: {},   // 9.2.8 per-topic 对账视图
 };
 
 let chart = null;
@@ -531,6 +593,9 @@ function connectSSE() {
       if (d.drops != null) state.drops = d.drops;
       if (d.buffers != null) state.buffers = d.buffers;
       if (d.gaps != null) state.gaps = d.gaps;
+      if (d.dataplane != null) state.dataplane = d.dataplane;
+      if (d.heartbeat != null) state.heartbeat = d.heartbeat;
+      if (d.reconciliation != null) state.reconciliation = d.reconciliation;
       // SSE 事件流（全量替换，无重复）
       if (Array.isArray(d.sse_events)) {
         state.events = d.sse_events.map(e => ({
@@ -545,6 +610,8 @@ function connectSSE() {
       renderLatencyList();
       renderEvents();
       renderSparklines();
+      renderHealth();
+      renderRecon();
       if (!firstSelectDone && Object.keys(d.topics || {}).length > 0) {
         firstSelectDone = true;
         const firstName = Object.keys(d.topics)[0];
@@ -678,7 +745,7 @@ function renderBuffers() {
   const body = $('buffer-list-body');
   if (!body) return;
   if (keys.length === 0) {
-    body.innerHTML = '<tr><td colspan="10" class="empty" style="text-align:center">无缓冲订阅者（直发路径）</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="empty" style="text-align:center">无缓冲订阅者（直发路径）</td></tr>';
     return;
   }
   body.innerHTML = keys.map(k => {
@@ -688,6 +755,10 @@ function renderBuffers() {
       : `${(b.max_messages/1000).toFixed(0)}k条/${(b.max_bytes/1048576).toFixed(0)}MB/不限`;
     const hot = b.depth > 0 ? 'style="color:var(--accent-amber);font-weight:600"' : '';
     const dropHot = (b.evicted + b.expired) > 0 ? 'style="color:var(--accent-rose);font-weight:600"' : '';
+    const creditTxt = (b.credit_remaining != null && b.credit != null)
+      ? `${b.credit_remaining.toLocaleString()} / ${b.credit.toLocaleString()}` : '—';
+    const starvedTxt = b.starved_rounds > 0
+      ? `<span style="color:var(--accent-rose)">拦截 ${b.starved_rounds.toLocaleString()}</span>` : '';
     return `<tr>
       <td style="text-align:left;font-family:monospace">${esc(k)}</td>
       <td>${esc(b.policy)}</td>
@@ -699,6 +770,84 @@ function renderBuffers() {
       <td ${dropHot}>${(b.expired||0).toLocaleString()}</td>
       <td>${(b.conflated||0).toLocaleString()}</td>
       <td>${(b.sent||0).toLocaleString()}</td>
+      <td>${creditTxt}${starvedTxt ? '<br>' + starvedTxt : ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ---- 服务端健康（9.2.8）：数据面 chips + 心跳质量表 ---- */
+function renderHealth() {
+  const dp = state.dataplane || {};
+  const hb = state.heartbeat || {};
+  const chips = [];
+  const mk = (label, value, sub, cls) =>
+    `<div class="chip ${cls||''}"><div class="c-label">${label}</div>` +
+    `<div class="c-value">${value}</div>` +
+    (sub ? `<div class="c-sub">${sub}</div>` : '') + `</div>`;
+
+  if (dp.window_loops != null) {
+    const avg = dp.loop_avg_ms || 0, mx = dp.loop_max_ms || 0;
+    chips.push(mk('数据面循环', avg.toFixed(2) + ' ms',
+      `max ${mx.toFixed(1)} ms · ${dp.loops_per_s || 0} 轮/s`,
+      mx >= 500 ? 'bad' : (mx >= 200 ? 'warn' : '')));
+    chips.push(mk('收 / 发', `${(dp.in_per_s||0).toLocaleString()} / ${(dp.out_per_s||0).toLocaleString()}`,
+      `帧/s · 窗口 ${(dp.window_s||0)}s`));
+    chips.push(mk('EAGAIN 背压', (dp.eagain_per_s||0).toLocaleString() + '/s',
+      `累计 ${(dp.eagain||0).toLocaleString()}`,
+      (dp.eagain_per_s||0) > 0 ? 'warn' : ''));
+    chips.push(mk('信用拦截', (dp.starved_per_s||0).toLocaleString() + '/s',
+      `累计 ${(dp.credit_starved||0).toLocaleString()}`,
+      (dp.starved_per_s||0) >= 10 ? 'warn' : ''));
+  } else {
+    chips.push(mk('数据面', '—', '服务端版本过低'));
+  }
+  chips.push(mk('心跳踢线', (hb.kick_total||0).toLocaleString(), '累计',
+    (hb.kick_total||0) > 0 ? 'bad' : ''));
+  const el = $('health-chips');
+  if (el) el.innerHTML = chips.join('');
+
+  const rows = Object.entries(hb.clients || {}).map(([cid, h]) => {
+    const danger = (h.interval_max_s||0) >= 4 ? 'style="color:var(--accent-rose);font-weight:600"' : '';
+    return `<tr>
+      <td style="text-align:left;font-family:monospace">${esc(cid)}</td>
+      <td ${danger}>${(h.interval_avg_s||0).toFixed(2)}s / ${(h.interval_max_s||0).toFixed(2)}s</td>
+      <td>${h.samples||0}</td>
+    </tr>`;
+  }).join('');
+  const body = $('hb-list-body');
+  if (body) body.innerHTML = rows ||
+    '<tr><td colspan="3" class="empty" style="text-align:center">暂无心跳数据</td></tr>';
+}
+
+/* ---- 对账（9.2.8）：发布 vs 处理/缺失/丢弃累计 ---- */
+function renderRecon() {
+  const recon = state.reconciliation || {};
+  const topics = Object.keys(recon).sort();
+  const body = $('recon-list-body');
+  if (!body) return;
+  if (!topics.length) {
+    body.innerHTML = '<tr><td colspan="7" class="empty" style="text-align:center">暂无流量</td></tr>';
+    return;
+  }
+  body.innerHTML = topics.map(t => {
+    const r = recon[t] || {};
+    const pub = r.published_cum || 0;
+    const proc = r.processed_cum || 0;
+    const miss = r.missing_cum || 0;
+    const drop = r.dropped_cum || 0;
+    const inflight = r.in_flight_est;
+    const loss = miss + drop;
+    const lossCls = loss > 0 ? 'style="color:var(--accent-rose)"' : '';
+    const ifTxt = inflight == null ? '—' : inflight.toLocaleString();
+    const ifCls = (inflight != null && inflight < 0) ? 'style="color:var(--accent-rose)"' : '';
+    return `<tr>
+      <td style="text-align:left">${esc(t)}</td>
+      <td>${pub.toLocaleString()}</td>
+      <td>${proc.toLocaleString()}</td>
+      <td ${lossCls}>${miss.toLocaleString()}</td>
+      <td ${lossCls}>${drop.toLocaleString()}</td>
+      <td ${ifCls}>${ifTxt}</td>
+      <td>${(r.processing_rate || 0).toLocaleString()}</td>
     </tr>`;
   }).join('');
 }
@@ -1029,7 +1178,8 @@ async function openClientModal() {
     body.innerHTML = `<table class="client-table">
       <thead><tr>
         <th>Client ID</th><th>用户</th><th>角色</th>
-        <th>订阅数</th><th>处理速率</th><th>延迟(收/理)</th>
+        <th>订阅数</th><th>处理速率</th><th>延迟(收/理)</th><th>处理e2e</th>
+        <th>credit 余/窗</th><th>Workers</th>
         <th>连接时长</th><th>远端</th>
       </tr></thead>
       <tbody>${clients.map(c => {
@@ -1044,10 +1194,38 @@ async function openClientModal() {
         const rate = p && p.rate_per_sec != null ? p.rate_per_sec : null;
         const recvMs = p && p.recv_avg_ms != null ? p.recv_avg_ms : null;
         const procMs = p && p.proc_avg_ms != null ? p.proc_avg_ms : null;
+        const e2eMs = p && p.e2e_avg_ms != null ? p.e2e_avg_ms : null;
+        const e2eMax = p && p.e2e_max_ms != null ? p.e2e_max_ms : null;
         const rateText = rate != null ? esc(String(rate)) + ' msg/s' : '-';
         const latText = (recvMs != null || procMs != null)
           ? esc((recvMs != null ? recvMs : '-') + ' / ' + (procMs != null ? procMs : '-') + ' ms')
           : '-';
+        const e2eText = e2eMs != null
+          ? esc(e2eMs + ' ms' + (e2eMax != null ? ' · max ' + e2eMax : '')) : '-';
+        const cr = c.credit || null;
+        const creditText = (cr && cr.credit_remaining != null && cr.credit != null)
+          ? esc(cr.credit_remaining + ' / ' + cr.credit)
+            + (cr.starved_rounds > 0
+               ? ' <span style="color:var(--accent-rose)">拦' + esc(String(cr.starved_rounds)) + '</span>' : '')
+          : '-';
+        const ws = c.workers || null;
+        let workersText = '-';
+        let workersTip = '';
+        if (ws && ws.length) {
+          workersText = esc(String(ws.length));
+          workersTip = ' title="' + esc(ws.map(w =>
+            '#' + w.worker + ': ' + (w.processed||0) + ' 帧/s · CPU ' +
+            (w.cpu_cores||0) + ' · 积压 ' + formatBufBytes(w.pending_bytes||0)).join('&#10;')) + '"';
+        }
+        let confirmTip = '';
+        if (c.confirm) {
+          const cf = c.confirm;
+          const parts = [];
+          if (cf.ack_avg_ms != null) parts.push('ack 均值 ' + cf.ack_avg_ms + ' ms');
+          if (cf.ack_max_ms != null) parts.push('max ' + cf.ack_max_ms + ' ms');
+          parts.push('累计 ' + (cf.acks||0) + ' 次 · 超时 ' + (cf.timeouts||0));
+          confirmTip = ' title="' + esc('确认发布：' + parts.join(' · ')) + '"';
+        }
         const topicsTip = c.processing_topics
           ? ' title="' + esc(Object.entries(c.processing_topics).map(([t, m]) =>
               t + ': ' + (m.rate != null ? m.rate : '?') + ' msg/s').join('&#10;')) + '"'
@@ -1057,8 +1235,11 @@ async function openClientModal() {
           <td>${esc(c.user || c.username || '-')}</td>
           <td><span class="client-role ${roleCls}">${roleText}</span></td>
           <td>${esc((c.subscriptions != null ? c.subscriptions : (c.sub_count != null ? c.sub_count : '-')))}</td>
-          <td${topicsTip}>${rateText}</td>
+          <td${topicsTip||confirmTip}>${rateText}</td>
           <td${topicsTip}>${latText}</td>
+          <td${topicsTip}>${e2eText}</td>
+          <td>${creditText}</td>
+          <td${workersTip}>${workersText}</td>
           <td>${formatUptime(up)}</td>
           <td>${esc(c.remote || c.peer || '-')}</td>
         </tr>`;
@@ -1070,24 +1251,36 @@ async function openClientModal() {
 }
 function closeClientModal() { $('client-modal').classList.remove('show'); }
 
-/* ---- 图表 30s 自动刷新 ---- */
+/* ---- 图表 30s 自动刷新 + 系统信息 ---- */
+function refreshSysInfo() {
+  fetch(_withToken('/api/v1/system/status'), {headers: _authHeaders()}).then(r=>r.json()).then(d => {
+    state.uptime = d.uptime_seconds || 0;
+    $('version-tag').textContent = 'v' + (d.version || '-');
+    const hint = $('sys-info-hint');
+    if (hint) {
+      const parts = [];
+      if (d.pid != null) parts.push('PID ' + d.pid);
+      if (d.rss_mb != null) parts.push('RSS ' + d.rss_mb + ' MB');
+      if (d.threads != null) parts.push('线程 ' + d.threads);
+      hint.textContent = parts.join(' · ');
+    }
+    render();
+  }).catch(()=>{});
+}
 setInterval(() => {
   if (state.selected.length > 0) {
     state.history_cache = {};
     state.latHistoryCache = {};
     loadSelectedHistories().then(() => renderChart());
-    loadSelectedLatencyHistories().then(() => renderLatencyTrend());
+    loadSelectedLatencyHistories().then(() => renderLatTrend());
   }
+  refreshSysInfo();
 }, 30000);
 
 /* ---- 初始化 ---- */
 connectSSE();
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeClientModal(); });
-fetch(_withToken('/api/v1/system/status'), {headers: _authHeaders()}).then(r=>r.json()).then(d => {
-  state.uptime = d.uptime_seconds || 0;
-  $('version-tag').textContent = 'v' + (d.version || '-');
-  render();
-}).catch(()=>{});
+refreshSysInfo();
 </script>
 </body>
 </html>

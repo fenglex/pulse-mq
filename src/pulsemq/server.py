@@ -23,6 +23,7 @@ import zmq
 from pulsemq.admin.auth import TokenAuth
 from pulsemq.admin.server import AdminServer
 from pulsemq.auth import PlainAuth
+from pulsemq.alerts import AlertManager
 from pulsemq.buffering import BufferManager, VALID_POLICIES
 from pulsemq.config import ServerConfig, load_server_config
 from pulsemq.control import (ClientInfo, ControlCmd, ControlMessage, OnlineRegistry,
@@ -34,7 +35,10 @@ from pulsemq.protocol.msg_type import DataType
 from pulsemq.routing import SubscriptionTable
 from pulsemq.security import CredentialStore
 from pulsemq.stats.connections import ConnectionStats, _role_of
+from pulsemq.stats.dataplane import DataPlaneStats
 from pulsemq.stats.drops import DropStats
+from pulsemq.stats.gaps import GapStats
+from pulsemq.stats.health import HeartbeatMonitor
 from pulsemq.stats.latency import LatencyStatsRegistry
 from pulsemq.stats.storage import AsyncArchiveWriter, StatsStorage
 from pulsemq.stats.throughput import ClientProcStats
@@ -125,6 +129,9 @@ class Server:
             ring_size=self._cfg.event_ring_size,
         )
         self._drop_stats = DropStats(retention_minutes=60)
+        # 数据面健康统计（9.2.8）：循环耗时/EAGAIN/信用拦截，数据面线程写。
+        # 须先于 BufferManager 构造（其 drain 计数挂到这里）。
+        self._dp_stats = DataPlaneStats()
         # 每订阅者缓冲（慢消费者策略 drop_old/conflate），条数/字节/时间三上限。
         # 缓冲淘汰/过期计入 DropStats；conflate 合并只在 snapshot 单列。
         self._buffers = BufferManager(
@@ -132,6 +139,7 @@ class Server:
             max_bytes=self._cfg.buffer_max_bytes,
             max_age_s=self._cfg.buffer_max_age_s,
             on_drop=lambda topic, n, reason: self._drop_stats.record(topic, n),
+            metrics=self._dp_stats,
         )
         self._buffers.set_credit_fn(
             lambda ident: self._credits.get(ident, -1))
@@ -143,9 +151,22 @@ class Server:
         # per-topic 单调数据序号（9.2.1）：每个被接受的数据帧 +1；只在数据面
         # 线程读写（_on_data_message），无锁。服务端内置 producer 不经过该路径。
         self._topic_seq: dict[str, int] = {}
-        # 消费端缺口统计（心跳 gaps 字段聚合，9.2.1）：topic -> 累计缺失帧数。
-        # 控制面协程写、admin 线程读，dict 单操作 GIL 原子。
-        self._gap_stats: dict[str, int] = {}
+        # 消费端缺口统计（9.2.1 引入，9.2.8 升级为独立类：累计 + 分钟历史 +
+        # SQLite 归档）。控制面协程写、admin 线程读（内部 threading.Lock）。
+        self._gap_stats = GapStats(retention_minutes=60)
+        # 心跳质量监控（9.2.8）：per-client 心跳到达间隔 + 踢线计数。
+        self._hb_monitor = HeartbeatMonitor()
+        # 告警规则引擎（9.2.8）：阈值 → webhook / 日志事件。
+        self._alerts = AlertManager(
+            webhook=self._cfg.alert_webhook,
+            cooldown_s=self._cfg.alert_cooldown_s,
+            drop_per_min=self._cfg.alert_drop_per_min,
+            gap_per_min=self._cfg.alert_gap_per_min,
+            buffer_age_s=self._cfg.alert_buffer_age_s,
+            starved_per_s=self._cfg.alert_starved_per_s,
+            loop_stall_ms=self._cfg.alert_loop_stall_ms,
+        )
+        self._alert_kick_base = 0
         self._archive_writer = AsyncArchiveWriter(
             self._storage, batch_size=self._cfg.stats_archive_batch_size
         )
@@ -172,7 +193,7 @@ class Server:
             self._data_endpoint,
             auth=self._auth, on_auth=self._auth_on_auth,
             on_message=self._on_data_message, loop=loop,
-            buffers=self._buffers,
+            buffers=self._buffers, metrics=self._dp_stats,
         )
         # 控制面：异步（保持原有 ROUTER + ZAP）
         await self._transport.bind(self._control_endpoint, "control", auth=self._auth)
@@ -197,6 +218,9 @@ class Server:
             proc_stats=self._proc_stats,
             buffer_stats=self._buffers,
             gap_stats=self._gap_stats,
+            dataplane_stats=self._dp_stats,
+            hb_monitor=self._hb_monitor,
+            credit_fn=self._client_credit,
             admin_thread=self._cfg.admin_thread,
         )
         await self._admin.start()
@@ -205,6 +229,7 @@ class Server:
             asyncio.create_task(self._control_loop()),
             asyncio.create_task(self._heartbeat_sweep_loop()),
             asyncio.create_task(self._minute_roll_loop()),
+            asyncio.create_task(self._alert_loop()),
         ]
         logger.info(
             "Server 启动完成 data={} control={} admin={}",
@@ -231,7 +256,9 @@ class Server:
         2. config ``monitoring.admin_token``（含被环境变量 ``PULSEMQ_ADMIN_TOKEN``
            覆盖后的值，见 ``load_server_config``）
         3. 环境变量 ``PULSEMQ_ADMIN_TOKEN``（双保险；正常路径已被 step 2 吸收）
-        4. 随机生成 32 字节 base64url，写 ``admin_token_file``（0600）+ stderr 输出一次
+        4. 读取 ``admin_token_file`` 已有 token 复用（9.2.8：重启不再换 token，
+           浏览器收藏/告警 webhook 不失效）；文件缺失/为空才随机生成 32 字节
+           base64url 写入（0600）+ stderr 输出一次
 
         返回最终 token 字符串（空串表示禁用）。
         """
@@ -242,8 +269,17 @@ class Server:
         env_tok = os.environ.get("PULSEMQ_ADMIN_TOKEN")
         if env_tok:
             return env_tok
-        tok = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
         path = token_file or self._cfg.admin_token_file
+        # 复用已生成的 token 文件（不重复生成，9.2.8）
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            if existing:
+                log_event("INFO", "ADMIN", action="admin_token_reused", path=path)
+                return existing
+        except OSError:
+            pass  # 不存在/不可读 → 走生成路径
+        tok = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(tok)
@@ -513,6 +549,7 @@ class Server:
 
         elif cmd_msg.cmd == ControlCmd.HEARTBEAT:
             self._registry.heartbeat(cid)
+            self._hb_monitor.record(cid)
             # 消费端丢弃指标（心跳携带，向后兼容：老客户端无 drops 字段）
             drops = cmd_msg.payload.get("drops")
             if drops:
@@ -528,13 +565,27 @@ class Server:
             proc = cmd_msg.payload.get("proc")
             if proc:
                 self._proc_stats.record(cid, self._username_of(cid), proc)
+            # 扩展指标（9.2.8）：confirm 统计 + per-worker 明细（向后兼容：
+            # 老客户端无该字段；workers 为 list 空时跳过）
+            confirm = cmd_msg.payload.get("confirm")
+            workers = cmd_msg.payload.get("workers")
+            if confirm or workers:
+                self._proc_stats.record_extra(
+                    cid,
+                    confirm=confirm if isinstance(confirm, dict) else None,
+                    workers=workers if isinstance(workers, list) else None,
+                )
+            # key 拆分回退计数（9.2.9）：消费端 key 路由遇到不支持载荷
+            # （DataFrame 等）回退 topic 路由的帧数 delta，累计到客户端条目
+            key_fb = cmd_msg.payload.get("key_fallback")
+            if key_fb:
+                self._proc_stats.record_extra(cid, key_fallback=int(key_fb))
             # 消费端缺口上报（9.2.1）：客户端按帧头 seq 检测的缺失量 delta
             gaps = cmd_msg.payload.get("gaps")
             if isinstance(gaps, dict):
                 for gap_topic, gap_count in gaps.items():
                     try:
-                        self._gap_stats[gap_topic] = (
-                            self._gap_stats.get(gap_topic, 0) + int(gap_count))
+                        self._gap_stats.record(gap_topic, int(gap_count))
                     except (TypeError, ValueError):
                         pass
             await self._safe_send(
@@ -567,6 +618,7 @@ class Server:
             self._credits.pop(ident, None)
             self._buffers.clear(ident)
             self._proc_stats.remove(cid)
+            self._hb_monitor.remove(cid)
             self._registry.unregister(cid)
             # 断开事件（Spec 3）：DISCONNECT → on_disconnect
             self._connections.on_disconnect(cid, "disconnect")
@@ -600,6 +652,8 @@ class Server:
                         self._credits.pop(ident, None)
                         self._buffers.clear(ident)
                     self._proc_stats.remove(c.client_id)
+                    self._hb_monitor.remove(c.client_id)
+                    self._hb_monitor.kick(c.client_id, c.username)
                     # 断开事件（Spec 3）：心跳超时下线 → on_disconnect
                     self._connections.on_disconnect(c.client_id, "heartbeat_timeout")
                     log_event(
@@ -625,11 +679,61 @@ class Server:
                 self._lat_half.roll_minute()
                 self._lat_e2e.roll_minute()
                 # 消费端丢弃统计分钟滚动
-                self._drop_stats.roll_minute()
+                drop_rows = self._drop_stats.roll_minute()
+                # 丢弃/缺口分钟归档（9.2.8）：SQLite 持久化，跨重启可回溯
+                if drop_rows:
+                    await self._archive_writer.enqueue_rows("drops", drop_rows)
+                gap_rows = self._gap_stats.roll_minute()
+                if gap_rows:
+                    await self._archive_writer.enqueue_rows("gaps", gap_rows)
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("分钟归档异常")
+
+    # ------------------------------------------------------------ alerts
+
+    def _client_credit(self, client_id: str) -> dict | None:
+        """client_id → 信用视图（/api/v1/clients 逐行拼接，9.2.8）。"""
+        ident = self._ident_by_client_id.get(client_id)
+        if ident is None:
+            return None
+        return self._buffers.credit_snapshot(ident)
+
+    def _alert_snapshot(self) -> dict:
+        """告警评估输入（控制面线程组装，读取各统计对象的线程安全快照）。"""
+        drops = self._drop_stats.snapshot()
+        last_min_total = sum(d.get("drops_last_min", 0) for d in drops.values())
+        buffer_snap = self._buffers.snapshot()
+        max_age_s = 0.0
+        for b in buffer_snap.get("subscribers", {}).values():
+            max_age_s = max(max_age_s, (b.get("oldest_age_ms") or 0) / 1000.0)
+        dp = self._dp_stats.snapshot()
+        hb = self._hb_monitor.snapshot()
+        kicks = hb.get("kick_total", 0)
+        kick_delta = kicks - self._alert_kick_base
+        self._alert_kick_base = kicks
+        gaps_total = sum(self._gap_stats.snapshot().values())
+        return {
+            "drops_last_min_total": last_min_total,
+            "gaps_total": gaps_total,
+            "buffer_max_age_s": max_age_s,
+            "hb_kicks": kicks,
+            "hb_kick_delta": kick_delta,
+            "starved_per_s": dp.get("starved_per_s", 0.0),
+            "loop_max_ms": dp.get("loop_max_ms", 0.0),
+        }
+
+    async def _alert_loop(self) -> None:
+        """每秒评估告警规则（与 SSE 同节奏；无规则命中时零开销）。"""
+        while self._running:
+            await asyncio.sleep(1.0)
+            try:
+                await self._alerts.check(self._alert_snapshot())
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("告警评估异常", exc_info=True)
 
     async def _on_auth_event(self, username: str, address: str, ok: bool,
                              reason: str | None = None) -> None:

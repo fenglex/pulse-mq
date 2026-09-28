@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
 import threading
 import time
 from pathlib import Path
@@ -44,16 +45,20 @@ def _iso(ts: float) -> str:
 
 
 class AdminServer:
-    """后台管理 HTTP 服务: REST + SSE + Web UI。
+    """后台管理 HTTP 服务: REST + SSE + Web UI + Prometheus。
 
     端点:
       GET  /                              深色 Web UI 首页
       GET  /static/{path}                 静态资源（ECharts 等）
       GET  /api/v1/stats/realtime         实时指标 JSON
       GET  /api/v1/stats/stream           SSE 实时推送（1s 一帧）
+      GET  /api/v1/stats/buffers          订阅者缓冲（含 credit 余量，9.2.8）
+      GET  /api/v1/stats/drops/history    丢弃分钟历史（内存 + SQLite，9.2.8）
+      GET  /api/v1/stats/gaps/history     缺口分钟历史（同上）
       GET  /api/v1/topics                 所有 topic 列表 + 当前指标
       GET  /api/v1/topics/{topic}/history 分钟级历史（最近 N 分钟）
-      GET  /api/v1/system/status          系统状态（uptime, version）
+      GET  /api/v1/system/status          系统状态（uptime/version/RSS，9.2.8 扩展）
+      GET  /metrics                       Prometheus 文本 exposition（9.2.8）
       GET  /healthz                       健康检查
     """
 
@@ -73,6 +78,9 @@ class AdminServer:
         proc_stats=None,
         buffer_stats=None,
         gap_stats=None,
+        dataplane_stats=None,
+        hb_monitor=None,
+        credit_fn=None,
         admin_thread: bool = True,
     ) -> None:
         host, port = bind.split(":")
@@ -91,6 +99,10 @@ class AdminServer:
         self._proc_stats = proc_stats
         self._buffer_stats = buffer_stats
         self._gap_stats = gap_stats
+        # 9.2.8 扩展：数据面健康 / 心跳质量 / per-client 信用视图
+        self._dataplane = dataplane_stats
+        self._hb_monitor = hb_monitor
+        self._credit_fn = credit_fn
         self._admin_thread = admin_thread
         self._server: asyncio.AbstractServer | None = None
         # SSE 客户端
@@ -303,6 +315,21 @@ class AdminServer:
             await self._handle_sse(writer)
             return
 
+        # 丢弃/缺口分钟历史（9.2.8）：?topic= 指定单 topic 曲线，缺省为全量合计
+        if method == "GET" and path in ("/api/v1/stats/drops/history",
+                                        "/api/v1/stats/gaps/history"):
+            minutes = 60
+            try:
+                minutes = int(query.get("minutes", ["60"])[0])
+            except (ValueError, IndexError):
+                pass
+            topic = query.get("topic", [None])[0]
+            is_drops = path.endswith("drops/history")
+            await self._respond_json(
+                writer, 200,
+                self._drop_or_gap_history(is_drops, topic, minutes))
+            return
+
         if method == "GET" and path == "/api/v1/clients":
             await self._respond_json(writer, 200, self._clients_snapshot())
             return
@@ -361,6 +388,21 @@ class AdminServer:
             await self._respond_json(writer, 200, self._system_status())
             return
 
+        if method == "GET" and path == "/metrics":
+            body = self._render_prometheus().encode("utf-8")
+            header = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("utf-8")
+            try:
+                writer.write(header + body)
+                await writer.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            return
+
         if method == "GET" and path == "/healthz":
             await self._respond_json(writer, 200, {"status": "ok"})
             return
@@ -390,13 +432,25 @@ class AdminServer:
             snap["drops"] = self._drop_stats.snapshot()
         # 消费端缺口统计（9.2.1：帧头 seq 检测，心跳 gaps 字段聚合）
         if self._gap_stats is not None:
-            snap["gaps"] = dict(self._gap_stats)
-        # 订阅者缓冲指标（深度/最老帧年龄/淘汰/过期/合并）
+            snap["gaps"] = self._gap_stats.snapshot()
+        # 订阅者缓冲指标（深度/最老帧年龄/淘汰/过期/合并 + credit 余量）
         if self._buffer_stats is not None:
             snap["buffers"] = self._buffer_stats.snapshot()
         # 每客户端上报的 per-topic 处理速率/延迟聚合（心跳 proc 字段）
+        proc_by_topic: dict[str, dict] = {}
         if self._proc_stats is not None:
-            snap["processing_by_topic"] = self._proc_stats.topics()
+            proc_by_topic = self._proc_stats.topics()
+            snap["processing_by_topic"] = proc_by_topic
+        # 数据面健康（9.2.8）：循环耗时/收发速率/EAGAIN/信用拦截
+        if self._dataplane is not None:
+            snap["dataplane"] = self._dataplane.snapshot()
+        # 心跳质量（9.2.8）：per-client 到达间隔 + 踢线计数
+        if self._hb_monitor is not None:
+            snap["heartbeat"] = self._hb_monitor.snapshot()
+        # 对账视图（9.2.8）：per-topic 发布累计 vs 消费端处理/缺失/丢弃累计，
+        # 在途 = published - processed - missing - dropped（瞬时可为负/正，
+        # 客户端重启会重置 processed_cum，作趋势参考而非精确恒等式）
+        snap["reconciliation"] = self._reconciliation_snapshot(proc_by_topic)
         # Spec 3 监控扩展：在线 client 计数（online_users/producers/consumers/...）
         if self._connections is not None:
             snap.update(self._connections.counters())
@@ -412,6 +466,36 @@ class AdminServer:
         if self._start_time:
             snap["start_time"] = self._start_time
         return snap
+
+    def _reconciliation_snapshot(self, proc_by_topic: dict) -> dict[str, dict]:
+        """per-topic 三方账本合并（发布/处理/缺失/丢弃累计 + 在途估算）。"""
+        topics: dict[str, dict] = {}
+        if self._traffic is not None:
+            for t, d in self._traffic.all_topics_snapshot().items():
+                cum = d.get("msg_count_cum")
+                if cum:
+                    topics.setdefault(t, {})["published_cum"] = cum
+        for t, d in proc_by_topic.items():
+            e = topics.setdefault(t, {})
+            if d.get("processed_cum"):
+                e["processed_cum"] = d["processed_cum"]
+            if d.get("rate_per_sec") is not None:
+                e["processing_rate"] = d["rate_per_sec"]
+        drops = self._drop_stats.snapshot() if self._drop_stats else {}
+        for t, d in drops.items():
+            if d.get("drops_cum"):
+                topics.setdefault(t, {})["dropped_cum"] = d["drops_cum"]
+        gaps = self._gap_stats.snapshot() if self._gap_stats else {}
+        for t, g in gaps.items():
+            if g:
+                topics.setdefault(t, {})["missing_cum"] = g
+        for t, e in topics.items():
+            pub = e.get("published_cum", 0)
+            if pub:
+                e["in_flight_est"] = pub - (e.get("processed_cum", 0)
+                                            + e.get("missing_cum", 0)
+                                            + e.get("dropped_cum", 0))
+        return topics
 
     def _clients_snapshot(self) -> dict:
         """在线 client 明细（跨线程只读快照；connection_stats 为 None 时返回空）。"""
@@ -439,6 +523,19 @@ class AdminServer:
                 if proc is not None:
                     entry["processing"] = self._proc_stats.summarize(proc)
                     entry["processing_topics"] = proc["topics"]
+                    if "confirm" in proc:
+                        entry["confirm"] = proc["confirm"]
+                    if "workers" in proc:
+                        entry["workers"] = proc["workers"]
+                    # key 拆分回退累计（9.2.9）：>0 说明该消费端 key 路由
+                    # 遇到 DataFrame 等不支持载荷，已回退 topic 路由
+                    if proc.get("key_fallback_cum"):
+                        entry["key_fallback"] = proc["key_fallback_cum"]
+            # 信用窗口视图（9.2.8）：最近上报 credit / 窗口剩余 / 拦截轮次
+            if self._credit_fn is not None:
+                credit = self._credit_fn(c.client_id)
+                if credit is not None:
+                    entry["credit"] = credit
             clients.append(entry)
         return {"clients": clients}
 
@@ -515,11 +612,184 @@ class AdminServer:
         return {"topic": topic, "minutes": minutes, "history": merged}
 
     def _system_status(self) -> dict:
-        return {
+        out = {
             "version": SERVER_VERSION,
             "start_time": self._start_time,
             "uptime_seconds": round(time.time() - self._start_time, 2),
+            "pid": os.getpid(),
+            "threads": threading.active_count(),
         }
+        # RSS（MB）：Linux 读 /proc；Windows/其他平台缺省（不引 psutil 依赖）
+        try:
+            with open("/proc/self/status", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        out["rss_mb"] = round(int(line.split()[1]) / 1024, 1)
+                        break
+        except OSError:
+            pass
+        return out
+
+    # ---- 丢弃/缺口分钟历史（内存 + SQLite 合并，9.2.8）----
+
+    def _drop_or_gap_history(self, is_drops: bool, topic: str | None,
+                             minutes: int) -> dict:
+        """单 topic（或全量合计）的分钟曲线 [{timestamp, count}]。"""
+        if is_drops:
+            mem = self._drop_stats.history(minutes) if self._drop_stats else []
+        else:
+            mem = self._gap_stats.history(minutes) if self._gap_stats else []
+        series: dict[int, int] = {}
+        for slot in mem:
+            topics = slot.get("topics", {})
+            if topic is not None:
+                series[slot["timestamp"]] = topics.get(topic, 0)
+            else:
+                series[slot["timestamp"]] = series.get(slot["timestamp"], 0) \
+                    + sum(topics.values())
+        since = int(time.time()) - minutes * 60
+        if self._storage is not None and topic is not None:
+            if is_drops:
+                rows = self._storage.load_drop_history(topic, since)
+            else:
+                rows = self._storage.load_gap_history(topic, since)
+            for r in rows:
+                if r["timestamp"] not in series:
+                    series[r["timestamp"]] = r["count"]
+        history = [{"timestamp": ts, "count": c}
+                   for ts, c in sorted(series.items())]
+        kind = "drops" if is_drops else "gaps"
+        return {"kind": kind, "topic": topic, "minutes": minutes,
+                "history": history}
+
+    # ---- Prometheus 文本 exposition（9.2.8）----
+
+    @staticmethod
+    def _esc_label(v: str) -> str:
+        return (v.replace("\\", "\\\\").replace('"', '\\"')
+                .replace("\n", "\\n"))
+
+    def _render_prometheus(self) -> str:
+        lines: list[str] = []
+
+        def metric(name: str, mtype: str, help_text: str) -> None:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {mtype}")
+
+        def emit(name: str, value, labels: str = "") -> None:
+            if labels:
+                lines.append(f'{name}{{{labels}}} {value}')
+            else:
+                lines.append(f"{name} {value}")
+
+        snap = self._realtime_snapshot()
+        metric("pulsemq_up", "gauge", "Server is up")
+        emit("pulsemq_up", 1)
+        metric("pulsemq_uptime_seconds", "gauge", "Uptime in seconds")
+        emit("pulsemq_uptime_seconds",
+             round(time.time() - self._start_time, 1))
+        metric("pulsemq_build_info", "gauge", "Version info")
+        emit("pulsemq_build_info", 1, f'version="{SERVER_VERSION}"')
+
+        for k in ("online_users", "online_producers", "online_consumers",
+                  "total_subscriptions"):
+            if k in snap:
+                metric(f"pulsemq_{k}", "gauge", k)
+                emit(f"pulsemq_{k}", snap[k])
+
+        metric("pulsemq_topic_msg_rate_1min", "gauge",
+               "Published frames/s (1min est) per topic")
+        metric("pulsemq_topic_msg_count_cum", "counter",
+               "Published frames since server start per topic")
+        for t, d in snap.get("topics", {}).items():
+            lb = f'topic="{self._esc_label(t)}"'
+            emit("pulsemq_topic_msg_rate_1min", d.get("msg_rate_1min", 0), lb)
+            emit("pulsemq_topic_msg_count_cum",
+                 d.get("msg_count_cum", 0), lb)
+
+        metric("pulsemq_drops_last_min", "gauge", "Drops in last minute")
+        metric("pulsemq_drops_cum", "counter", "Drops since server start")
+        for t, d in snap.get("drops", {}).items():
+            lb = f'topic="{self._esc_label(t)}"'
+            emit("pulsemq_drops_last_min", d.get("drops_last_min", 0), lb)
+            emit("pulsemq_drops_cum", d.get("drops_cum", 0), lb)
+
+        metric("pulsemq_gaps_cum", "counter", "Missing frames per topic")
+        for t, g in snap.get("gaps", {}).items():
+            emit("pulsemq_gaps_cum", g, f'topic="{self._esc_label(t)}"')
+
+        metric("pulsemq_buffer_depth", "gauge", "Subscriber buffer depth")
+        metric("pulsemq_buffer_bytes", "gauge", "Subscriber buffer bytes")
+        metric("pulsemq_buffer_oldest_age_ms", "gauge",
+               "Oldest buffered frame age ms")
+        for s, b in snap.get("buffers", {}).get("subscribers", {}).items():
+            lb = f'subscriber="{self._esc_label(s)}"'
+            emit("pulsemq_buffer_depth", b.get("depth", 0), lb)
+            emit("pulsemq_buffer_bytes", b.get("bytes", 0), lb)
+            emit("pulsemq_buffer_oldest_age_ms",
+                 b.get("oldest_age_ms", 0), lb)
+
+        for kind in ("latency_half", "latency_e2e"):
+            reg = snap.get(kind, {})
+            if not reg:
+                continue
+            tag = "half" if kind == "latency_half" else "e2e"
+            metric(f"pulsemq_latency_ms", "gauge", f"Latency ms ({tag})")
+            for t, d in reg.items():
+                lb = (f'topic="{self._esc_label(t)}",kind="{tag}"')
+                for p in ("p50", "p95", "p99"):
+                    if f"{p}_ms" in d:
+                        emit("pulsemq_latency_ms", d[f"{p}_ms"], lb)
+
+        proc = snap.get("processing_by_topic", {})
+        if proc:
+            metric("pulsemq_processing_rate", "gauge",
+                   "Consumer processing frames/s per topic")
+            metric("pulsemq_processing_cum", "counter",
+                   "Consumer processed frames since client start")
+            metric("pulsemq_processing_e2e_avg_ms", "gauge",
+                   "Processing-time e2e latency avg ms")
+            for t, d in proc.items():
+                lb = f'topic="{self._esc_label(t)}"'
+                emit("pulsemq_processing_rate", d.get("rate_per_sec", 0), lb)
+                emit("pulsemq_processing_cum",
+                     d.get("processed_cum", 0), lb)
+                if "e2e_avg_ms" in d:
+                    emit("pulsemq_processing_e2e_avg_ms",
+                         d["e2e_avg_ms"], lb)
+
+        dp = snap.get("dataplane", {})
+        if dp:
+            metric("pulsemq_dataplane_loop_ms", "gauge",
+                   "Data-plane loop avg/max ms in window")
+            emit("pulsemq_dataplane_loop_ms", dp.get("loop_avg_ms", 0),
+                 'kind="avg"')
+            emit("pulsemq_dataplane_loop_ms", dp.get("loop_max_ms", 0),
+                 'kind="max"')
+            for k in ("in_per_s", "out_per_s", "eagain_per_s",
+                      "starved_per_s"):
+                metric(f"pulsemq_dataplane_{k}", "gauge", k)
+                emit(f"pulsemq_dataplane_{k}", dp.get(k, 0))
+            for k in ("msgs_in", "msgs_out", "eagain", "credit_starved"):
+                metric(f"pulsemq_dataplane_{k}_total", "counter", k)
+                emit(f"pulsemq_dataplane_{k}_total", dp.get(k, 0))
+
+        hb = snap.get("heartbeat", {})
+        if hb:
+            metric("pulsemq_heartbeat_interval_s", "gauge",
+                   "Client heartbeat interval avg/max (recent window)")
+            for cid, d in hb.get("clients", {}).items():
+                lb = f'client_id="{self._esc_label(cid)}"'
+                emit("pulsemq_heartbeat_interval_s",
+                     d.get("interval_avg_s", 0), lb + ',kind="avg"')
+                emit("pulsemq_heartbeat_interval_s",
+                     d.get("interval_max_s", 0), lb + ',kind="max"')
+            metric("pulsemq_heartbeat_kicks_total", "counter",
+                   "Clients kicked by heartbeat timeout")
+            emit("pulsemq_heartbeat_kicks_total", hb.get("kick_total", 0))
+
+        lines.append("")
+        return "\n".join(lines)
 
     # ---- SSE ----
 

@@ -39,11 +39,22 @@ class ServerConfig:
     rcvhwm: int = 10000   # ZMQ 接收高水位（帧数）
     # 订阅者缓冲（慢消费者策略 drop_old/conflate）全局上限；客户端只能请求更小值。
     # max_age_s=0 表示不限存活时间。条数/字节/时间三上限，任一触发即开始淘汰。
-    # 默认 10 万条 / 10MB：达到任一上限即开始丢弃最旧（9.2.2 调低，控制服务端
-    # 内存；需要更大缓冲时经 TOML [server] 或环境变量调高，客户端请求不能超过此上限）。
-    buffer_max_messages: int = 100_000
-    buffer_max_bytes: int = 10 * 1024 * 1024   # 10MB
+    # 默认 50 万帧 / 64MB（9.2.8 从 10 万条/10MB 调大，匹配批量行情负载下
+    # 的积压容量需求；需要控制服务端内存时经 TOML [server] 或环境变量调低，
+    # 客户端请求不能超过此上限）。
+    buffer_max_messages: int = 500_000
+    buffer_max_bytes: int = 64 * 1024 * 1024   # 64MB
     buffer_max_age_s: float = 0.0
+    # 告警规则阈值（9.2.8）：无 webhook 时降级为日志事件。
+    # 各阈值语义见 pulsemq.alerts.AlertManager；设 0 关闭对应规则
+    # （buffer_age_s=0 关闭积压告警，kick 规则随 heartbeat_kick 布尔）。
+    alert_webhook: str = ""
+    alert_cooldown_s: float = 60.0
+    alert_drop_per_min: int = 1000
+    alert_gap_per_min: int = 1000
+    alert_buffer_age_s: float = 5.0
+    alert_starved_per_s: float = 100.0
+    alert_loop_stall_ms: float = 1000.0
 
     def __post_init__(self) -> None:
         """确保 data/ 目录存在，日志/SQLite/凭据/token 等运行时文件统一存放。"""
@@ -124,6 +135,19 @@ def load_server_config(path: str | None = None) -> ServerConfig:
                                    ServerConfig.buffer_max_bytes)),
         buffer_max_age_s=float(s.get("buffer_max_age_s",
                                      ServerConfig.buffer_max_age_s)),
+        alert_webhook=m.get("alert_webhook", ServerConfig.alert_webhook),
+        alert_cooldown_s=float(m.get("alert_cooldown_s",
+                                     ServerConfig.alert_cooldown_s)),
+        alert_drop_per_min=int(m.get("alert_drop_per_min",
+                                     ServerConfig.alert_drop_per_min)),
+        alert_gap_per_min=int(m.get("alert_gap_per_min",
+                                    ServerConfig.alert_gap_per_min)),
+        alert_buffer_age_s=float(m.get("alert_buffer_age_s",
+                                       ServerConfig.alert_buffer_age_s)),
+        alert_starved_per_s=float(m.get("alert_starved_per_s",
+                                        ServerConfig.alert_starved_per_s)),
+        alert_loop_stall_ms=float(m.get("alert_loop_stall_ms",
+                                        ServerConfig.alert_loop_stall_ms)),
     )
     # 环境变量覆盖
     if (v := _env("PULSEMQ_DATA_ENDPOINT")):
@@ -158,6 +182,20 @@ def load_server_config(path: str | None = None) -> ServerConfig:
         cfg.buffer_max_bytes = int(v)
     if (v := _env("PULSEMQ_BUFFER_MAX_AGE_S")):
         cfg.buffer_max_age_s = float(v)
+    if (v := _env("PULSEMQ_ALERT_WEBHOOK")):
+        cfg.alert_webhook = v
+    if (v := _env("PULSEMQ_ALERT_COOLDOWN_S")):
+        cfg.alert_cooldown_s = float(v)
+    if (v := _env("PULSEMQ_ALERT_DROP_PER_MIN")):
+        cfg.alert_drop_per_min = int(v)
+    if (v := _env("PULSEMQ_ALERT_GAP_PER_MIN")):
+        cfg.alert_gap_per_min = int(v)
+    if (v := _env("PULSEMQ_ALERT_BUFFER_AGE_S")):
+        cfg.alert_buffer_age_s = float(v)
+    if (v := _env("PULSEMQ_ALERT_STARVED_PER_S")):
+        cfg.alert_starved_per_s = float(v)
+    if (v := _env("PULSEMQ_ALERT_LOOP_STALL_MS")):
+        cfg.alert_loop_stall_ms = float(v)
     return cfg
 
 

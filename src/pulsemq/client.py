@@ -94,6 +94,12 @@ class _ProcStats:
         self._recv_ns: dict[str, int] = {}  # 接收延迟累计（ns）
         self._proc_ns: dict[str, int] = {}  # 处理耗时累计（ns）
         self._proc_n: dict[str, int] = {}   # 完成处理的消息条数
+        # 9.2.8：处理时端到端延迟（worker 出环时刻 - 帧内生产时间戳，
+        # 含环内排队等待），以及自客户端启动的累计接收数（服务端对账用）
+        self._e2e_ns: dict[str, int] = {}
+        self._e2e_n: dict[str, int] = {}
+        self._e2e_max: dict[str, int] = {}
+        self._cum: dict[str, int] = {}
         self._last_drain = time.time_ns()
 
     def record_recv(self, topic: str, latency_ns: int) -> None:
@@ -111,6 +117,15 @@ class _ProcStats:
         with self._lock:
             self._proc_n[topic] = self._proc_n.get(topic, 0) + count
             self._proc_ns[topic] = self._proc_ns.get(topic, 0) + total_ns
+
+    def merge_e2e(self, topic: str, total_ns: int, count: int,
+                  max_ns: int) -> None:
+        """worker 上报的处理时端到端延迟批量合并（9.2.8）。"""
+        with self._lock:
+            self._e2e_n[topic] = self._e2e_n.get(topic, 0) + count
+            self._e2e_ns[topic] = self._e2e_ns.get(topic, 0) + total_ns
+            if max_ns > self._e2e_max.get(topic, 0):
+                self._e2e_max[topic] = max_ns
 
     def record_proc(self, topic: str, duration_ns: int) -> None:
         with self._lock:
@@ -134,19 +149,29 @@ class _ProcStats:
             self._last_drain = now
             count, recv_ns = self._count, self._recv_ns
             proc_ns, proc_n = self._proc_ns, self._proc_n
+            e2e_ns, e2e_n, e2e_max = self._e2e_ns, self._e2e_n, self._e2e_max
             self._count = {}
             self._recv_ns = {}
             self._proc_ns = {}
             self._proc_n = {}
+            self._e2e_ns = {}
+            self._e2e_n = {}
+            self._e2e_max = {}
         out: dict[str, dict] = {}
-        for topic in set(count) | set(proc_n):
+        for topic in set(count) | set(proc_n) | set(e2e_n):
             n = count.get(topic, 0)
-            entry: dict = {"count": n, "rate": round(n / elapsed, 2)}
+            self._cum[topic] = self._cum.get(topic, 0) + n
+            entry: dict = {"count": n, "rate": round(n / elapsed, 2),
+                           "count_cum": self._cum[topic]}
             if n > 0:
                 entry["recv_avg_ns"] = recv_ns.get(topic, 0) // n
             pn = proc_n.get(topic, 0)
             if pn > 0:
                 entry["proc_avg_ns"] = proc_ns.get(topic, 0) // pn
+            en = e2e_n.get(topic, 0)
+            if en > 0:
+                entry["e2e_avg_ns"] = e2e_ns.get(topic, 0) // en
+                entry["e2e_max_ns"] = e2e_max.get(topic, 0)
             out[topic] = entry
         return out
 
@@ -227,6 +252,9 @@ class Client:
         # （recv 循环收到 PUBLISH_ACK 时 resolve）
         self._ack_counter = itertools.count(1)
         self._pending_acks: dict[int, asyncio.Future] = {}
+        # 确认发布统计（9.2.8，随心跳上报）：窗口内 ack 次数/延迟累计/最大值
+        # + 累计超时。publish 与心跳同在事件循环线程，无锁读写安全。
+        self._confirm = {"acks": 0, "ns": 0, "max": 0, "timeouts": 0}
         # 消费端缺口检测（9.2.1）：per-topic 最近 seq + 累计缺失 + 心跳上报基线
         self._gap_last: dict[str, int] = {}
         self._gap_missing: dict[str, int] = {}
@@ -748,6 +776,15 @@ class Client:
         """
         self._validate_worker_callback(
             callback, f"订阅 {topic_pattern!r} 的回调")
+        # 9.2.9：key 拆分（字段名/callable 路由）必须精确 topic 订阅——
+        # key 提取假设该 topic 载荷结构已知，通配符会混入异构载荷。
+        km = self._key_mode
+        if ((callable(km) or (isinstance(km, str) and km != "topic"))
+                and topic_pattern.endswith(".*")):
+            raise ValueError(
+                f"key 拆分路由（key={km!r}）不支持通配符订阅 {topic_pattern!r}："
+                "key 拆分需明确的 topic 语义（该 topic 载荷结构已知），"
+                "请订阅精确 topic，或改用 key=None / key='topic'")
         self._subscriptions[topic_pattern] = callback
         self._sub_header_only[topic_pattern] = header_only
         # 仅在已连接时立即生效；未连接时缓存，start() 末尾会 flush（A3）
@@ -784,6 +821,7 @@ class Client:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_acks[ack_token] = fut
+        t_ack0 = time.perf_counter_ns()
         try:
             frame = frames.encode(topic, data, serializer=serializer,
                                   compression=compression, data_type=data_type,
@@ -792,8 +830,14 @@ class Client:
                 self._transport.send(b"", frame, role="data"),
                 timeout=ack_timeout)
             payload = await asyncio.wait_for(fut, timeout=ack_timeout)
+            d_ns = time.perf_counter_ns() - t_ack0
+            self._confirm["acks"] += 1
+            self._confirm["ns"] += d_ns
+            if d_ns > self._confirm["max"]:
+                self._confirm["max"] = d_ns
             return int(payload.get("seq") or 0)
         except asyncio.TimeoutError:
+            self._confirm["timeouts"] += 1
             raise PublishAckTimeout(
                 f"确认发布超时（{ack_timeout}s）topic={topic} "
                 f"ack_token={ack_token}") from None
@@ -955,13 +999,39 @@ class Client:
                     payload["credit"] = self._pool.free_credit()
                     drops = dict(self._route_drops)
                     self._route_drops.clear()
+                    worker_rows = []
                     for st in self._pool.drain_stats():
                         for t, (total, cnt) in st.get("recv", {}).items():
                             self._proc_stats.merge_recv(t, total, cnt)
                         for t, (total, cnt) in st.get("proc", {}).items():
                             self._proc_stats.merge_proc(t, total, cnt)
+                        for t, (total, cnt, mx) in st.get("e2e", {}).items():
+                            self._proc_stats.merge_e2e(t, total, cnt, mx)
+                        worker_rows.append(st)
                     if drops:
                         payload["drops"] = drops
+                    # key 拆分回退计数（9.2.9）：DataFrame 等不支持载荷
+                    kf = self._pool.take_key_fallback()
+                    if kf:
+                        payload["key_fallback"] = kf
+                    # per-worker 明细（9.2.8）：处理速率/CPU 占用/环积压，
+                    # 供服务端监控观测 worker 均衡度（最短队列路由的效果）
+                    rings = self._pool.ring_snapshots()
+                    per_worker = []
+                    for st in worker_rows:
+                        i = st.get("worker", 0)
+                        r = rings[i] if i < len(rings) else {}
+                        per_worker.append({
+                            "worker": i,
+                            "processed": st.get("processed", 0),
+                            "rows": st.get("rows", 0),
+                            "cpu_cores": round(st.get("cpu_cores", 0.0), 3),
+                            "pending_bytes": r.get("pending_bytes", 0),
+                            "read_cum": r.get("read_n", 0),
+                            "proc_cum": r.get("proc_n", 0),
+                        })
+                    if per_worker:
+                        payload["workers"] = per_worker
                 # 消费端缺口上报（9.2.1）：自上次心跳以来的新增缺失量
                 gaps = self._drain_gap_report()
                 if gaps:
@@ -970,6 +1040,16 @@ class Client:
                 proc = self._proc_stats.drain()
                 if proc:
                     payload["proc"] = proc
+                # 确认发布统计（9.2.8）：窗口内 ack 延迟 + 累计超时
+                c = self._confirm
+                if c["acks"] or c["timeouts"]:
+                    payload["confirm"] = {
+                        "acks": c["acks"], "ack_ns": c["ns"],
+                        "ack_max_ns": c["max"], "timeouts": c["timeouts"],
+                    }
+                    c["acks"] = c["ns"] = c["max"] = 0
+                    # timeouts 为累计值：上报后从窗口清零，服务端累加
+                    c["timeouts"] = 0
                 hb = frames.encode_control(ControlCmd.HEARTBEAT, payload)
                 # 超时保护（9.2.1）：服务端控制管道满时不阻塞心跳循环
                 await asyncio.wait_for(
@@ -1157,14 +1237,21 @@ class ConsumerClient(Client):
       worker 等速时即轮询，慢 worker 自动降载）；"topic" = 同 topic 恒定
       落同 worker 且保序（零解码成本，jump consistent hash——worker 数
       变化时仅 ~1/n 换位）；payload 字段名
-      （如 "symbol"）= 按字段值路由（接收侧需解码 payload，有代价）；
-      或 callable(payload, topic)->str 自定义提取（运行在主进程，lambda 可用）；
+      （如 "symbol"）= 按 dict 字段值路由（接收侧需解码 payload，有代价）；
+      或 callable(payload, topic)->str 自定义提取（运行在主进程，lambda 可用）。
+      key 拆分（字段名/callable）仅支持 dict / str 载荷——str 载荷的消息
+      内容本身即 key；订阅必须是精确 topic（通配符在 subscribe() 时报错）；
+      DataFrame **不支持** key 拆分（整帧路由，帧内不按列拆分）：多股票
+      DataFrame 请在发布端按 key 拆分（groupby 后逐组发布 dict/str 消息），
+      或用 key=None 让 worker 回调内自行 groupby。收到不支持的载荷时
+      客户端显式 WARNING 并回退按 topic 路由（同 topic 保序），计数经
+      心跳上报（服务端 /clients 的 key_fallback 字段）（9.2.9）；
     - 回调（含异步回调）必须是模块级可导入函数：跨进程按引用传递，
       lambda/闭包不支持——worker 内不共享主进程内存，副作用需落到
       进程外介质（文件/队列等）；worker_init(worker_index) 做每 worker 初始化；
     - 心跳上报 credit（全部环空闲量）与丢帧（环满 drop-new 计数）；
     - 9.2.1 默认开启服务端缓冲（buffer_policy="drop_old"）：消费端处理
-      不过来时服务端代为积压（默认上限 10 万条 / 10MB / 30s，任一触发即
+      不过来时服务端代为积压（默认上限 50 万帧 / 64MB / 30s，任一触发即
       开始丢弃最旧），把"静默丢帧"变成"可观测的积压 + 超龄过期"。
       上限可通过 buffer_cfg 调小（不能超过服务端上限）；传
       buffer_policy=None 恢复直发。

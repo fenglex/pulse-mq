@@ -196,7 +196,8 @@ async def test_workers_roundrobin_and_field_key():
             workers=2, key="sym", worker_ring_mb=4,
             worker_init=mp_callbacks.init_recorder)
         await c.start()
-        await c.subscribe("fld.*", mp_callbacks.on_msg_record)
+        # 9.2.9：key 拆分（key="sym"）要求精确 topic 订阅（通配符报错）
+        await c.subscribe("fld.x", mp_callbacks.on_msg_record)
         await asyncio.sleep(0.5)
         p = ProducerClient(
             f"tcp://127.0.0.1:{dp}", f"tcp://127.0.0.1:{cp}", "p", "p")

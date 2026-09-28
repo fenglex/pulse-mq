@@ -72,6 +72,8 @@ class SubscriberBuffer:
         self.expired = 0
         self.conflated = 0
         self.sent = 0
+        # 9.2.8：drain 因信用窗口额度耗尽而保留积压的轮次（数据面线程写）
+        self.starved_rounds = 0
 
     # -- 数据面线程 --
 
@@ -192,7 +194,7 @@ class BufferManager:
     def __init__(self, *, max_messages: int = 100_000,
                  max_bytes: int = 10 * 1024 * 1024,
                  max_age_s: float = 0.0,
-                 on_drop=None) -> None:
+                 on_drop=None, metrics=None) -> None:
         self.max_messages = max(1, int(max_messages))
         self.max_bytes = max(0, int(max_bytes))
         self.max_age_s = max(0.0, float(max_age_s))
@@ -202,6 +204,8 @@ class BufferManager:
         self._buffers: dict[bytes, SubscriberBuffer] = {}
         self._lock = threading.Lock()
         self._last_gc = 0.0
+        # 数据面健康统计（9.2.8，可选）：EAGAIN / 信用拦截计数
+        self._metrics = metrics
         # 信用窗口：ident -> [窗口开始 monotonic, credit 快照, 窗口内已发送]
         self._credit_windows: dict[bytes, list] = {}
 
@@ -313,7 +317,11 @@ class BufferManager:
                     continue  # 尚未收到首个心跳信用，保守等待
                 budget = w[1] - w[2]
                 if budget <= 0:
-                    continue  # 本窗口额度已用尽，帧留在服务端缓冲
+                    # 本窗口额度已用尽，帧留在服务端缓冲（信用拦截）
+                    buf.starved_rounds += 1
+                    if self._metrics is not None:
+                        self._metrics.record_starved()
+                    continue
             n = buf.drain(
                 lambda frame, i=ident: self._send_fn(i, frame), -1, budget)
             if w is not None:
@@ -323,11 +331,25 @@ class BufferManager:
 
     # -- admin 线程 --
 
+    def credit_snapshot(self, ident: bytes) -> dict | None:
+        """单订阅者信用视图（9.2.8）：最近上报 credit 与窗口剩余额度。"""
+        with self._lock:
+            buf = self._buffers.get(ident)
+            w = self._credit_windows.get(ident)
+            if buf is None and w is None:
+                return None
+            return {
+                "credit": w[1] if w else None,
+                "credit_remaining": max(0, w[1] - w[2]) if w else None,
+                "starved_rounds": buf.starved_rounds if buf else 0,
+            }
+
     def snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
             subs = {}
             for ident, b in self._buffers.items():
+                w = self._credit_windows.get(ident)
                 subs[ident.decode("utf-8", "replace")] = {
                     "policy": b.policy,
                     "depth": b.depth(),
@@ -340,6 +362,9 @@ class BufferManager:
                     "max_messages": b.max_messages,
                     "max_bytes": b.max_bytes,
                     "max_age_s": b.max_age_s,
+                    "credit": w[1] if w else None,
+                    "credit_remaining": max(0, w[1] - w[2]) if w else None,
+                    "starved_rounds": b.starved_rounds,
                 }
             return {
                 "defaults": {

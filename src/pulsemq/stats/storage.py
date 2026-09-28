@@ -54,6 +54,23 @@ class StatsStorage:
                     PRIMARY KEY (topic, timestamp)
                 )
             """)
+            # 9.2.8：丢弃/缺口分钟归档（对账与历史曲线，跨进程重启可回溯）
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS minute_drops (
+                    topic TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    drop_count INTEGER DEFAULT 0,
+                    PRIMARY KEY (topic, timestamp)
+                )
+            """)
+            self._conn.execute("""
+                CREATE TABLE IF NOT EXISTS minute_gaps (
+                    topic TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    gap_count INTEGER DEFAULT 0,
+                    PRIMARY KEY (topic, timestamp)
+                )
+            """)
             self._conn.commit()
         logger.info("StatsStorage 连接: {}", self._db_path)
 
@@ -111,6 +128,62 @@ class StatsStorage:
             logger.debug("load_history 失败", exc_info=True)
             return []
 
+    def save_drop_minutes(self, rows: list[tuple[str, int, int]]) -> None:
+        """写入丢弃分钟归档行 [(topic, timestamp, drop_count)]（9.2.8）。"""
+        if self._conn is None or not rows:
+            return
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO minute_drops
+                       (topic, timestamp, drop_count) VALUES (?, ?, ?)""",
+                    rows,
+                )
+                self._conn.commit()
+        except Exception:
+            logger.debug("save_drop_minutes 失败", exc_info=True)
+
+    def save_gap_minutes(self, rows: list[tuple[str, int, int]]) -> None:
+        """写入缺口分钟归档行 [(topic, timestamp, gap_count)]（9.2.8）。"""
+        if self._conn is None or not rows:
+            return
+        try:
+            with self._lock:
+                self._conn.executemany(
+                    """INSERT OR REPLACE INTO minute_gaps
+                       (topic, timestamp, gap_count) VALUES (?, ?, ?)""",
+                    rows,
+                )
+                self._conn.commit()
+        except Exception:
+            logger.debug("save_gap_minutes 失败", exc_info=True)
+
+    def _load_minute_events(self, table: str, count_col: str, topic: str,
+                            since_ts: int) -> list[dict]:
+        """通用：读 minute_drops / minute_gaps 的 (timestamp, count)。"""
+        if self._conn is None:
+            return []
+        try:
+            with self._lock:
+                cursor = self._conn.execute(
+                    f"SELECT timestamp, {count_col} FROM {table} "
+                    "WHERE topic = ? AND timestamp >= ? ORDER BY timestamp",
+                    (topic, since_ts),
+                )
+                rows = cursor.fetchall()
+            return [{"timestamp": r[0], "count": r[1]} for r in rows]
+        except Exception:
+            logger.debug(f"load {table} 失败", exc_info=True)
+            return []
+
+    def load_drop_history(self, topic: str, since_ts: int) -> list[dict]:
+        return self._load_minute_events("minute_drops", "drop_count",
+                                        topic, since_ts)
+
+    def load_gap_history(self, topic: str, since_ts: int) -> list[dict]:
+        return self._load_minute_events("minute_gaps", "gap_count",
+                                        topic, since_ts)
+
     def cleanup(self, retention_days: int = 7) -> int:
         """清理过期数据，返回删除行数。"""
         if self._conn is None:
@@ -118,20 +191,26 @@ class StatsStorage:
         cutoff = int(time.time()) - retention_days * 86400
         try:
             with self._lock:
-                cursor = self._conn.execute(
-                    "DELETE FROM minute_stats WHERE timestamp < ?", (cutoff,)
-                )
+                total = 0
+                for table in ("minute_stats", "minute_drops", "minute_gaps"):
+                    cursor = self._conn.execute(
+                        f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,)
+                    )
+                    total += cursor.rowcount
                 self._conn.commit()
-                return cursor.rowcount
+                return total
         except Exception:
             logger.debug("cleanup 失败", exc_info=True)
             return 0
 
 
 class AsyncArchiveWriter:
-    """分钟归档异步批量写：enqueue 进 queue，consumer 任务批量 save_minutes_batch。
+    """分钟归档异步批量写：enqueue 进 queue，consumer 任务批量落库。
 
     SQLite 写仅在 consumer 任务，数据接收循环不阻塞。
+    队列项为 (kind, payload)：kind="minutes" → dict[str, MinuteSlot]（流量），
+    "drops"/"gaps" → [(topic, ts, count)]。公开 enqueue() 保持旧的
+    dict 签名（自动打 "minutes" 标签），drops/gaps 走 enqueue_rows()。
     """
 
     def __init__(self, storage: "StatsStorage", batch_size: int = 50) -> None:
@@ -147,24 +226,46 @@ class AsyncArchiveWriter:
     async def enqueue(self, archived: dict) -> None:
         if self._queue is None:
             return
-        await self._queue.put(archived)
+        await self._queue.put(("minutes", archived))
+
+    async def enqueue_rows(self, kind: str, rows: list) -> None:
+        """kind ∈ {"drops", "gaps"}；rows 为 [(topic, ts, count)]。"""
+        if self._queue is None or not rows:
+            return
+        await self._queue.put((kind, rows))
 
     async def _consume(self) -> None:
         assert self._queue is not None
         while True:
-            merged: dict = {}
+            minutes: dict = {}
+            drops: list = []
+            gaps: list = []
             try:
                 # 阻塞取第一个，再批量取最多 batch_size-1 个
-                first = await self._queue.get()
-                merged.update(first)
+                kind, payload = await self._queue.get()
+                if kind == "minutes":
+                    minutes.update(payload)
+                elif kind == "drops":
+                    drops.extend(payload)
+                elif kind == "gaps":
+                    gaps.extend(payload)
                 for _ in range(self._batch_size - 1):
                     try:
-                        more = self._queue.get_nowait()
-                        merged.update(more)
+                        kind, payload = self._queue.get_nowait()
+                        if kind == "minutes":
+                            minutes.update(payload)
+                        elif kind == "drops":
+                            drops.extend(payload)
+                        elif kind == "gaps":
+                            gaps.extend(payload)
                     except asyncio.QueueEmpty:
                         break
-                if merged:
-                    self._storage.save_minutes_batch(merged)
+                if minutes:
+                    self._storage.save_minutes_batch(minutes)
+                if drops:
+                    self._storage.save_drop_minutes(drops)
+                if gaps:
+                    self._storage.save_gap_minutes(gaps)
             except asyncio.CancelledError:
                 # 收到停止信号；剩余项由 stop() 统一 drain
                 raise
@@ -174,15 +275,33 @@ class AsyncArchiveWriter:
     def _drain(self) -> None:
         if self._queue is None:
             return
-        merged: dict = {}
+        minutes: dict = {}
+        drops: list = []
+        gaps: list = []
         while True:
             try:
-                merged.update(self._queue.get_nowait())
+                kind, payload = self._queue.get_nowait()
+                if kind == "minutes":
+                    minutes.update(payload)
+                elif kind == "drops":
+                    drops.extend(payload)
+                elif kind == "gaps":
+                    gaps.extend(payload)
             except asyncio.QueueEmpty:
                 break
-        if merged:
+        if minutes:
             try:
-                self._storage.save_minutes_batch(merged)
+                self._storage.save_minutes_batch(minutes)
+            except Exception:
+                pass
+        if drops:
+            try:
+                self._storage.save_drop_minutes(drops)
+            except Exception:
+                pass
+        if gaps:
+            try:
+                self._storage.save_gap_minutes(gaps)
             except Exception:
                 pass
 

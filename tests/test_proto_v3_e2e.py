@@ -117,8 +117,8 @@ async def test_consumer_receives_seq_and_gap_accounting(record_dir):
         assert missing == n_sent - n_recv, (
             f"missing={missing} received={n_recv} sent={n_sent}")
         assert missing > 50  # 极小缓冲下确实发生了大量淘汰
-        # 服务端聚合（心跳 gaps 上报）与客户端累计一致
-        assert srv._gap_stats.get("bench.m1") == missing
+        # 服务端聚合（心跳 gaps 上报）与客户端累计一致（9.2.8 起 GapStats.snapshot()）
+        assert srv._gap_stats.snapshot().get("bench.m1") == missing
         await p.stop()
         await c.stop()
     finally:
@@ -138,9 +138,9 @@ async def test_consumer_default_buffer_negotiated():
         entry = next(iter(subs.values()))
         assert entry["policy"] == "drop_old"
         assert entry["max_age_s"] == 30.0
-        # 9.2.2 默认上限：10 万条 / 10MB
-        assert entry["max_messages"] == 100_000
-        assert entry["max_bytes"] == 10 * 1024 * 1024
+        # 9.2.8 默认上限：50 万帧 / 64MB
+        assert entry["max_messages"] == 500_000
+        assert entry["max_bytes"] == 64 * 1024 * 1024
         # 显式 opt-out：恢复直发行为（不建缓冲）
         await c.stop()
         c2 = _client(ConsumerClient, dp, cp, "c", buffer_policy=None,

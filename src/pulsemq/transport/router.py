@@ -188,7 +188,7 @@ class SyncDataThread:
                  on_auth: AuthCallback | None = None,
                  loop: asyncio.AbstractEventLoop | None = None,
                  sndhwm: int = 10000, rcvhwm: int = 10000,
-                 buffers=None) -> None:
+                 buffers=None, metrics=None) -> None:
         self._ctx = ctx
         self._endpoint = endpoint
         self._auth = auth
@@ -198,6 +198,8 @@ class SyncDataThread:
         self._rcvhwm = rcvhwm
         # 每订阅者缓冲管理器（buffering.BufferManager）；None = 全部直发
         self._buffers = buffers
+        # 数据面健康统计（stats.dataplane.DataPlaneStats，9.2.8 可选）
+        self._metrics = metrics
         self._socket: zmq.Socket | None = None
         self._zap: SyncZAPHandler | None = None
         self._pull: zmq.Socket | None = None
@@ -230,26 +232,32 @@ class SyncDataThread:
         self._thread.start()
 
     def _loop(self) -> None:
+        import time as _time
         poller = zmq.Poller()
         poller.register(self._socket, zmq.POLLIN)
         poller.register(self._pull, zmq.POLLIN)
         while self._running:
+            t0 = _time.perf_counter_ns()
             # 有积压时缩短 poll 超时，让 drain 更频繁地追赶
             timeout = 10 if (self._buffers is not None
                              and self._buffers.has_backlog()) else 100
             events = dict(poller.poll(timeout=timeout))
             if self._socket in events:
                 # 批量 drain：一次 poll 唤醒后连续取完所有可用消息，摊薄 poll 开销
+                got = 0
                 while True:
                     try:
                         parts = self._socket.recv_multipart(zmq.NOBLOCK)
                     except zmq.Again:
                         break
                     if len(parts) >= 2:
+                        got += 1
                         try:
                             self._on_message(parts[0], parts[-1])
                         except Exception:
                             pass
+                if got and self._metrics is not None:
+                    self._metrics.record_in(got)
             if self._pull in events:
                 while True:
                     try:
@@ -265,6 +273,8 @@ class SyncDataThread:
             if self._buffers is not None:
                 self._buffers.drain_all()
                 self._buffers.maybe_gc()
+            if self._metrics is not None:
+                self._metrics.record_loop(_time.perf_counter_ns() - t0)
 
     def send_dontwait(self, ident: bytes, frame_bytes: bytes) -> bool:
         """数据面线程内 DONTWAIT 发送；EAGAIN（对端队列满）返回 False。
@@ -273,8 +283,12 @@ class SyncDataThread:
         """
         try:
             self._socket.send_multipart([ident, frame_bytes], flags=zmq.DONTWAIT)
+            if self._metrics is not None:
+                self._metrics.record_out()
             return True
         except zmq.Again:
+            if self._metrics is not None:
+                self._metrics.record_eagain()
             return False
         except Exception:
             return False
@@ -313,6 +327,9 @@ class SyncDataThread:
                     buffers.enqueue(target, topic, frame_bytes)
                     continue
                 if credits is not None and credits.get(target, -1) == 0:
+                    # 信用窗口拦截（消费端上报容量为 0）：帧不入 zmq 管道
+                    if self._metrics is not None:
+                        self._metrics.record_starved()
                     drops += 1
                     continue
                 try:
@@ -322,6 +339,8 @@ class SyncDataThread:
                     else:
                         sock.send_multipart([target, frame_bytes],
                                             flags=zmq.DONTWAIT)
+                    if self._metrics is not None:
+                        self._metrics.record_out()
                 except Exception:
                     drops += 1
         return drops
@@ -372,19 +391,20 @@ class Transport:
                        on_auth: AuthCallback | None = None,
                        on_message: Callable[[bytes, bytes], None] | None = None,
                        loop: asyncio.AbstractEventLoop | None = None,
-                       buffers=None) -> None:
+                       buffers=None, metrics=None) -> None:
         """启动同步数据面线程（独立 zmq.Context + 独立线程）。
 
         与异步 bind() 完全隔离：使用单独的同步 ctx，ZAP 各自独立。
         on_message 回调在数据面线程中执行，可调用 send_sync_direct() 转发消息。
         buffers：订阅者缓冲管理器；其发送回调注册为本线程的
         send_dontwait（drain 必须在数据面线程内执行）。
+        metrics：数据面健康统计（9.2.8，循环耗时/EAGAIN/信用拦截）。
         """
         sync_ctx = zmq.Context()
         self._sync_data = SyncDataThread(
             ctx=sync_ctx, endpoint=endpoint, auth=auth, on_auth=on_auth,
             loop=loop, sndhwm=self._sndhwm, rcvhwm=self._rcvhwm,
-            buffers=buffers,
+            buffers=buffers, metrics=metrics,
         )
         self._sync_data.start(on_message)
         if buffers is not None:
